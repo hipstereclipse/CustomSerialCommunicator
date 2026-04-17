@@ -1,4 +1,4 @@
-model: VGC40x
+model: VGC50x
 manufacturer: INFICON
 family: inficon_ascii
 protocol: inficon_ascii
@@ -26,6 +26,20 @@ commands:
     data_type: u_expo_new
     unit: mbar
     description: Channel 2 pressure
+  pressure_ch3:
+    pid: 342
+    read: true
+    write: false
+    data_type: u_expo_new
+    unit: mbar
+    description: Channel 3 pressure
+  pressure_ch4:
+    pid: 343
+    read: true
+    write: false
+    data_type: u_expo_new
+    unit: mbar
+    description: Channel 4 pressure
   error_status:
     pid: 303
     read: true

@@ -1,6 +1,7 @@
 model: MPG400
-family: pfeiffer_binary
-protocol: pfeiffer_binary
+manufacturer: INFICON
+family: inficon_binary
+protocol: inficon_binary
 experimental: true
 transport:
   default_baud: 9600

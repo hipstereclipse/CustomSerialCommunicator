@@ -1,6 +1,7 @@
 model: BPG552
-family: pfeiffer_binary
-protocol: pfeiffer_binary
+manufacturer: INFICON
+family: inficon_binary
+protocol: inficon_binary
 transport:
   default_baud: 9600
   parity: N

@@ -1,5 +1,6 @@
 model: PPG550
-family: ppg_ascii
+manufacturer: INFICON
+family: inficon_ppg_ascii
 protocol: ppg_ascii
 transport:
   default_baud: 9600

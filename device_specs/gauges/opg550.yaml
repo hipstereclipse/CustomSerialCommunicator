@@ -1,6 +1,7 @@
 model: OPG550
-family: pfeiffer_ascii
-protocol: pfeiffer_ascii
+manufacturer: INFICON
+family: inficon_ascii
+protocol: inficon_ascii
 experimental: true
 transport:
   default_baud: 9600

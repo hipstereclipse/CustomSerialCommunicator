@@ -82,12 +82,12 @@ class DeviceRegistry:
             param_table = self._build_param_table(spec)
             return PPGProtocol(address=addr, gauge_type=spec.model, param_table=param_table)
 
-        if spec.protocol == "pfeiffer_ascii":
+        if spec.protocol in ("pfeiffer_ascii", "inficon_ascii"):
             from serial_comm.protocols.pfeiffer_ascii import PfeifferAsciiProtocol
             param_table = self._build_param_table(spec)
             return PfeifferAsciiProtocol(address=addr, param_table=param_table)
 
-        if spec.protocol == "pfeiffer_binary":
+        if spec.protocol in ("pfeiffer_binary", "inficon_binary"):
             from serial_comm.protocols.pfeiffer_binary import PfeifferBinaryProtocol
             param_table = self._build_param_table(spec)
             # device_id and pressure_enc are stored in _raw_extra
@@ -153,6 +153,7 @@ class DeviceRegistry:
 
         spec = DeviceSpec(
             model=raw["model"],
+            manufacturer=raw.get("manufacturer", ""),
             family=raw["family"],
             protocol=raw["protocol"],
             default_baud=transport.get("default_baud", 9600),

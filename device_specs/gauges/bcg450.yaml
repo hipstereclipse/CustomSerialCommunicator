@@ -1,6 +1,7 @@
 model: BCG450
-family: pfeiffer_ascii
-protocol: pfeiffer_ascii
+manufacturer: INFICON
+family: inficon_ascii
+protocol: inficon_ascii
 transport:
   default_baud: 9600
   parity: N

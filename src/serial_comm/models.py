@@ -64,6 +64,7 @@ class DeviceSpec:
     default_address: int
     rs485_address_range: tuple[int, int] | None
     commands: dict[str, "CommandSpec"]
+    manufacturer: str = ""
     experimental: bool = False
 
 

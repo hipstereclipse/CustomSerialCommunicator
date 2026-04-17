@@ -1,4 +1,5 @@
 model: CDG025D
+manufacturer: INFICON
 family: cdg_serial
 protocol: cdg_serial
 transport:

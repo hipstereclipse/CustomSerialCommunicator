@@ -16,15 +16,18 @@ class TestSpecLoading:
     def test_ppg550_loaded(self, registry):
         spec = registry.get_spec("PPG550")
         assert spec.model == "PPG550"
-        assert spec.family == "ppg_ascii"
+        assert spec.family == "inficon_ppg_ascii"
+        assert spec.manufacturer == "INFICON"
 
     def test_bcg450_loaded(self, registry):
         spec = registry.get_spec("BCG450")
-        assert spec.family == "pfeiffer_ascii"
+        assert spec.family == "inficon_ascii"
+        assert spec.manufacturer == "INFICON"
 
     def test_pcg550_loaded(self, registry):
         spec = registry.get_spec("PCG550")
-        assert spec.family == "pfeiffer_binary"
+        assert spec.family == "inficon_binary"
+        assert spec.manufacturer == "INFICON"
 
     def test_cdg045d_loaded(self, registry):
         spec = registry.get_spec("CDG045D")
@@ -33,6 +36,13 @@ class TestSpecLoading:
     def test_tc600_loaded(self, registry):
         spec = registry.get_spec("TC600")
         assert spec.model == "TC600"
+
+    def test_vgc_controllers_loaded(self, registry):
+        for model in ("VGC50x", "VGC094", "VGC083"):
+            spec = registry.get_spec(model)
+            assert spec.model == model
+            assert spec.manufacturer == "INFICON"
+            assert spec.protocol == "inficon_ascii"
 
     def test_opg550_is_experimental(self, registry):
         spec = registry.get_spec("OPG550")
