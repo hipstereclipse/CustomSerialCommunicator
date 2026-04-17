@@ -2,7 +2,8 @@
 GaugeTab — one tab in the main window's QTabWidget, per connected gauge.
 
 Contains two sub-tabs:
-  "Live View"  — pyqtgraph multi-plot panel + readings table
+  "Live View"  — pyqtgraph multi-plot panel with interactive crosshair +
+                 per-trace toggle buttons
   "Terminal"   — interactive serial terminal with format selector
 """
 
@@ -16,8 +17,8 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QSizePolicy,
-    QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
+    QComboBox, QHBoxLayout, QLabel, QPushButton, QScrollArea,
+    QSizePolicy, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
@@ -47,11 +48,12 @@ class PlotPanel(QWidget):
     """
     Multi-plot panel backed by a pyqtgraph GraphicsLayoutWidget.
 
-    Layout modes
-    ------------
-    overlay  — all commands share one plot (different coloured traces)
-    stacked  — one plot per command, arranged vertically
-    grid     — one plot per command, two-column grid
+    Features
+    --------
+    - Overlay / Stacked / Grid layout modes
+    - Per-command toggle pill buttons — click to show/hide individual traces
+    - Linked crosshair: hover any plot to show a vertical line across all
+      charts at the same time-axis position, with Y values displayed above
     """
 
     def __init__(self, spec: DeviceSpec, parent: QWidget | None = None) -> None:
@@ -60,33 +62,77 @@ class PlotPanel(QWidget):
         self._layout_mode = "overlay"
 
         self._time_bufs: dict[str, deque] = {}
-        self._val_bufs: dict[str, deque] = {}
+        self._val_bufs:  dict[str, deque] = {}
         self._t0: float | None = None
-        self._commands: list[str] = []  # ordered as first seen
+        self._commands: list[str] = []
 
+        # Crosshair state
+        self._crosshair_lines: list[pg.InfiniteLine] = []
+        self._proxy: pg.SignalProxy | None = None
+
+        # Toggle-button state (persists across layout rebuilds)
+        self._toggle_states: dict[str, bool] = {}
+        self._cmd_toggles: dict[str, QPushButton] = {}
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # Build UI
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(2)
 
-        # Layout selector
+        # ── Control bar (layout selector) ──────────────────────────────
         ctrl = QHBoxLayout()
-        ctrl.addWidget(QLabel("Plot layout:"))
+        ctrl.addWidget(QLabel("Layout:"))
         self._layout_combo = QComboBox()
         self._layout_combo.addItems(["Overlay", "Stacked", "Grid"])
-        self._layout_combo.setFixedWidth(100)
+        self._layout_combo.setFixedWidth(90)
         self._layout_combo.currentTextChanged.connect(self._on_layout_changed)
         ctrl.addWidget(self._layout_combo)
         ctrl.addStretch()
         root.addLayout(ctrl)
 
+        # ── Trace toggle pill buttons (scrollable) ─────────────────────
+        self._toggle_inner = QWidget()
+        self._toggle_layout = QHBoxLayout(self._toggle_inner)
+        self._toggle_layout.setContentsMargins(2, 0, 2, 0)
+        self._toggle_layout.setSpacing(5)
+        self._toggle_layout.addStretch()
+
+        toggle_scroll = QScrollArea()
+        toggle_scroll.setWidget(self._toggle_inner)
+        toggle_scroll.setWidgetResizable(True)
+        toggle_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        toggle_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        toggle_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        toggle_scroll.setFixedHeight(30)
+        root.addWidget(toggle_scroll)
+
+        # ── Crosshair value bar (hidden until mouse hovers) ────────────
+        self._value_bar = QLabel()
+        self._value_bar.setTextFormat(Qt.TextFormat.RichText)
+        self._value_bar.setStyleSheet(
+            "color:#CCCCCC; font-size:11px; padding:1px 6px;"
+            "background:#2A2A2A; border-top:1px solid #3A3A3A;"
+        )
+        self._value_bar.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._value_bar.setFixedHeight(18)
+        self._value_bar.hide()
+        root.addWidget(self._value_bar)
+
+        # ── Plot widget ────────────────────────────────────────────────
         self._glw = pg.GraphicsLayoutWidget(background="#1E1E1E")
         self._glw.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         root.addWidget(self._glw)
 
-        self._plots: dict[str, pg.PlotItem] = {}   # command → PlotItem
-        self._curves: dict[str, pg.PlotDataItem] = {}  # command → curve
+        self._plots:  dict[str, pg.PlotItem]     = {}
+        self._curves: dict[str, pg.PlotDataItem] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -99,7 +145,7 @@ class PlotPanel(QWidget):
 
         if command not in self._time_bufs:
             self._time_bufs[command] = deque(maxlen=_MAX_POINTS)
-            self._val_bufs[command] = deque(maxlen=_MAX_POINTS)
+            self._val_bufs[command]  = deque(maxlen=_MAX_POINTS)
             self._commands.append(command)
             self._rebuild_plots()
 
@@ -114,7 +160,7 @@ class PlotPanel(QWidget):
             vb.popleft()
 
         curve = self._curves.get(command)
-        if curve is None:
+        if curve is None or not curve.isVisible():
             return
 
         t_arr = np.array(tb, dtype=float)
@@ -124,7 +170,7 @@ class PlotPanel(QWidget):
         curve.setData(t_arr, v_arr)
 
     # ------------------------------------------------------------------
-    # Internal
+    # Layout
     # ------------------------------------------------------------------
 
     def _on_layout_changed(self, mode: str) -> None:
@@ -143,9 +189,7 @@ class PlotPanel(QWidget):
         if not cmds:
             pi = self._glw.addPlot(row=0, col=0)
             self._setup_plot_item(pi, "")
-            return
-
-        if mode == "overlay":
+        elif mode == "overlay":
             pi = self._glw.addPlot(row=0, col=0)
             self._setup_plot_item(pi, cmds[0])
             legend = pi.addLegend()
@@ -153,28 +197,29 @@ class PlotPanel(QWidget):
             for i, cmd in enumerate(cmds):
                 colour = _TRACE_COLOURS[i % len(_TRACE_COLOURS)]
                 curve = pi.plot(pen=pg.mkPen(colour, width=2), name=cmd)
-                self._plots[cmd] = pi
+                self._plots[cmd]  = pi
                 self._curves[cmd] = curve
-
         elif mode == "stacked":
             for i, cmd in enumerate(cmds):
                 pi = self._glw.addPlot(row=i, col=0)
                 self._setup_plot_item(pi, cmd)
                 colour = _TRACE_COLOURS[i % len(_TRACE_COLOURS)]
                 curve = pi.plot(pen=pg.mkPen(colour, width=2), name=cmd)
-                self._plots[cmd] = pi
+                self._plots[cmd]  = pi
                 self._curves[cmd] = curve
                 if i < len(cmds) - 1:
                     pi.getAxis("bottom").setStyle(showValues=False)
-
         else:  # grid
             for i, cmd in enumerate(cmds):
                 pi = self._glw.addPlot(row=i // 2, col=i % 2)
                 self._setup_plot_item(pi, cmd)
                 colour = _TRACE_COLOURS[i % len(_TRACE_COLOURS)]
                 curve = pi.plot(pen=pg.mkPen(colour, width=2), name=cmd)
-                self._plots[cmd] = pi
+                self._plots[cmd]  = pi
                 self._curves[cmd] = curve
+
+        self._setup_crosshairs()
+        self._rebuild_toggles()
 
     def _setup_plot_item(self, pi: pg.PlotItem, command: str) -> None:
         pi.showGrid(x=True, y=True, alpha=0.3)
@@ -205,11 +250,186 @@ class PlotPanel(QWidget):
                 v_arr = np.where(v_arr > 0, v_arr, 1e-12)
             curve.setData(t_arr, v_arr)
 
+    # ------------------------------------------------------------------
+    # Crosshair
+    # ------------------------------------------------------------------
+
+    def _setup_crosshairs(self) -> None:
+        """Add an InfiniteLine to each unique PlotItem and wire mouse proxy."""
+        self._crosshair_lines.clear()
+
+        seen_plots: list[pg.PlotItem] = []
+        for pi in self._plots.values():
+            if pi not in seen_plots:
+                seen_plots.append(pi)
+                vline = pg.InfiniteLine(
+                    angle=90, movable=False,
+                    pen=pg.mkPen(color=(220, 220, 220, 160), width=1),
+                )
+                vline.setVisible(False)
+                pi.addItem(vline, ignoreBounds=True)
+                self._crosshair_lines.append(vline)
+
+        # Disconnect old proxy before creating a new one
+        if self._proxy is not None:
+            self._proxy.disconnect()
+            self._proxy = None
+
+        scene = self._glw.scene()
+        if scene is not None:
+            self._proxy = pg.SignalProxy(
+                scene.sigMouseMoved,
+                rateLimit=60,
+                slot=self._on_mouse_moved,
+            )
+
+    def _on_mouse_moved(self, event: tuple) -> None:
+        pos = event[0]
+        x: float | None = None
+
+        seen_plots: list[pg.PlotItem] = []
+        for pi in self._plots.values():
+            if pi in seen_plots:
+                continue
+            seen_plots.append(pi)
+            if pi.vb.sceneBoundingRect().contains(pos):
+                mp = pi.vb.mapSceneToView(pos)
+                x = mp.x()
+                break
+
+        if x is None:
+            for vline in self._crosshair_lines:
+                vline.setVisible(False)
+            self._value_bar.hide()
+            return
+
+        for vline in self._crosshair_lines:
+            vline.setValue(x)
+            vline.setVisible(True)
+
+        self._update_value_bar(x)
+
+    def _update_value_bar(self, x: float) -> None:
+        parts: list[str] = []
+        for i, cmd in enumerate(self._commands):
+            toggle = self._cmd_toggles.get(cmd)
+            if toggle and not toggle.isChecked():
+                continue
+            v = self._value_at_x(cmd, x)
+            if v is None:
+                continue
+            cmd_spec = self._spec.commands.get(cmd)
+            unit = cmd_spec.unit if cmd_spec else ""
+            colour = _TRACE_COLOURS[i % len(_TRACE_COLOURS)]
+            label = cmd.replace("_", " ")
+            if self._is_pressure(cmd):
+                formatted = f"{v:.3E}"
+            else:
+                formatted = f"{v:.4g}"
+            parts.append(
+                f"<span style='color:{colour}'><b>{label}</b></span>: {formatted} {unit}"
+            )
+
+        if parts:
+            self._value_bar.setText("  |  ".join(parts))
+            self._value_bar.show()
+        else:
+            self._value_bar.hide()
+
+    def _value_at_x(self, cmd: str, x: float) -> float | None:
+        tb = self._time_bufs.get(cmd)
+        vb = self._val_bufs.get(cmd)
+        if not tb:
+            return None
+        ta = np.array(tb, dtype=float)
+        idx = int(np.searchsorted(ta, x))
+        idx = min(max(idx, 0), len(ta) - 1)
+        return float(np.array(vb, dtype=float)[idx])
+
+    # ------------------------------------------------------------------
+    # Toggle buttons
+    # ------------------------------------------------------------------
+
+    def _rebuild_toggles(self) -> None:
+        """Sync pill-button row with current command list, preserving states."""
+        # Save existing states before clearing
+        for cmd, btn in self._cmd_toggles.items():
+            self._toggle_states[cmd] = btn.isChecked()
+
+        # Clear layout
+        while self._toggle_layout.count():
+            item = self._toggle_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+
+        self._cmd_toggles.clear()
+
+        for i, cmd in enumerate(self._commands):
+            colour = _TRACE_COLOURS[i % len(_TRACE_COLOURS)]
+            label = cmd.replace("_", " ")
+            checked = self._toggle_states.get(cmd, True)
+
+            btn = QPushButton(f"● {label}")
+            btn.setCheckable(True)
+            btn.setChecked(checked)
+            btn.setFixedHeight(22)
+            btn.setToolTip(f"Show / hide {label} trace")
+            btn.setStyleSheet(self._pill_style(colour))
+            btn.toggled.connect(
+                lambda vis, c=cmd: self._toggle_command(c, vis)
+            )
+            self._cmd_toggles[cmd] = btn
+            self._toggle_layout.addWidget(btn)
+
+        self._toggle_layout.addStretch()
+
+        # Apply current visibility to freshly-created curves
+        for cmd, btn in self._cmd_toggles.items():
+            self._toggle_command(cmd, btn.isChecked())
+
+    @staticmethod
+    def _pill_style(colour: str) -> str:
+        """Return a CSS stylesheet for a pill-shaped toggle button."""
+        r, g, b = (
+            int(colour[1:3], 16),
+            int(colour[3:5], 16),
+            int(colour[5:7], 16),
+        )
+        return f"""
+            QPushButton {{
+                background-color: rgba({r},{g},{b},60);
+                border: 1px solid {colour};
+                border-radius: 10px;
+                color: white;
+                padding: 0px 10px;
+                font-size: 11px;
+                font-weight: bold;
+            }}
+            QPushButton:checked {{
+                background-color: rgba({r},{g},{b},90);
+            }}
+            QPushButton:!checked {{
+                background-color: rgba(50,50,50,180);
+                border-color: #555555;
+                color: #777777;
+            }}
+            QPushButton:hover {{
+                border-width: 2px;
+            }}
+        """
+
+    def _toggle_command(self, cmd: str, visible: bool) -> None:
+        curve = self._curves.get(cmd)
+        if curve is not None:
+            curve.setVisible(visible)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     def _is_pressure(self, command: str) -> bool:
         cmd_spec = self._spec.commands.get(command)
-        if cmd_spec and cmd_spec.unit in _PRESSURE_UNITS:
-            return True
-        return False
+        return bool(cmd_spec and cmd_spec.unit in _PRESSURE_UNITS)
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +470,8 @@ class GaugeTab(QWidget):
         # Header
         header = QHBoxLayout()
         self._title_label = QLabel(
-            f"<b>{self._spec.model}</b>&nbsp;&nbsp;<span style='color:#888'>{self.device_id}</span>"
+            f"<b>{self._spec.model}</b>&nbsp;&nbsp;"
+            f"<span style='color:#888'>{self.device_id}</span>"
         )
         self._title_label.setTextFormat(Qt.TextFormat.RichText)
         header.addWidget(self._title_label)
