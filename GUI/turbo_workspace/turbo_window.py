@@ -286,7 +286,7 @@ class TurboWindow(QMainWindow):
         if "firmware" in r and r["firmware"].success:
             self._fw_label.setText(r["firmware"].formatted.strip())
 
-        now = datetime.now().strftime("%H:%M:%S")
+        now = datetime.now(tz=timezone.utc).strftime("%H:%M:%S UTC")
         self._status_bar.showMessage(f"Last update: {now}")
 
     @pyqtSlot(object)

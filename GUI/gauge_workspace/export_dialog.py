@@ -174,6 +174,8 @@ class ExportDialog(QDialog):
         df.to_parquet(self._export_path, index=False)
 
     def _export_hdf5(self, factor: float, unit: str) -> None:
+        import re
+
         import h5py  # type: ignore[import]
         import numpy as np
 
@@ -184,7 +186,8 @@ class ExportDialog(QDialog):
         with h5py.File(self._export_path, "w") as fh:
             fh.attrs["unit"] = unit
             for dev_id, readings in by_device.items():
-                grp = fh.create_group(dev_id.replace("/", "_"))
+                safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", dev_id)
+                grp = fh.create_group(safe_name)
                 grp.create_dataset(
                     "timestamp",
                     data=np.array([r.timestamp_wall.timestamp() for r in readings]),

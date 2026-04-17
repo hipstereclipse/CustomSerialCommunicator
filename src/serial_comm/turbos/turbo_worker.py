@@ -18,6 +18,7 @@ one polling round.  The GUI thread presents it as a dashboard.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -95,6 +96,8 @@ class TurboWorker(QThread):
         self._poll_commands = list(poll_commands)
         self._poll_interval = poll_interval
         self._device_id = device_id or f"{transport_config.port}:{protocol.address}"
+        self._pending_command: tuple[str, Any] | None = None
+        self._cmd_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public control  (call from GUI thread)
@@ -104,20 +107,19 @@ class TurboWorker(QThread):
         self.requestInterruption()
 
     def send_command(self, command: str, value: Any = None) -> None:
-        """
-        Queue a write command to be sent on the next loop iteration.
+        """Queue a write command to be sent on the next loop iteration.
 
-        Thread-safe: call from GUI thread; the value is stored atomically.
-        The worker picks it up before the next poll cycle and sends it.
+        Thread-safe: latest command wins if several are queued before the worker
+        processes them (e.g. rapid Start → Stop clicks).
         """
-        self._pending_command = (command, value)
+        with self._cmd_lock:
+            self._pending_command = (command, value)
 
     # ------------------------------------------------------------------
     # QThread.run
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        self._pending_command: tuple[str, Any] | None = None
         transport = SerialTransport(self._transport_cfg)
 
         try:
@@ -149,8 +151,9 @@ class TurboWorker(QThread):
             cycle_start = time.monotonic()
 
             # Send any pending write command first
-            pending = self._pending_command
-            self._pending_command = None
+            with self._cmd_lock:
+                pending = self._pending_command
+                self._pending_command = None
             if pending is not None:
                 cmd, val = pending
                 try:

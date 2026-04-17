@@ -28,15 +28,15 @@ dev = [
 ]
 
 [project.scripts]
-serial-comm = "gui.main_app:main"
+serial-comm = "GUI.main_app:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/serial_comm", "gui"]
+packages = ["src/serial_comm", "GUI"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "gui", "tests"]
+src = ["src", "GUI", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "PTH", "SIM"]

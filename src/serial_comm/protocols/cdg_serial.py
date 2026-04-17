@@ -116,10 +116,7 @@ class CDGProtocol(GaugeProtocol):
         if err_byte != 0:
             return self._err(f"Gauge error byte: 0x{err_byte:02X}", raw)
 
-        meas = (raw[4] << 8) | raw[5]
-        # Signed 16-bit interpretation
-        if meas >= 0x8000:
-            meas -= 0x10000
+        meas = int.from_bytes(raw[4:6], byteorder="big", signed=True)
         pressure = meas / 16384.0  # mbar at full scale
 
         sensor_code = raw[7]

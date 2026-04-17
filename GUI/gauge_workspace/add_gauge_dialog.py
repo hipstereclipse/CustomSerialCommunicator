@@ -130,6 +130,7 @@ class AddGaugeDialog(QDialog):
         try:
             self._spec = self._registry.get_spec(model)
         except Exception:
+            logger.exception("Failed to load spec for model %r", model)
             self._spec = None
             return
 

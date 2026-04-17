@@ -475,10 +475,11 @@ class MainWindow(QMainWindow):
         self._settings.setValue("mainwindow/state", self.saveState())
 
         # Stop all workers cleanly
-        for device_id, tab in list(self._gauge_tabs.items()):
-            tab.worker.stop()
         for tab in self._gauge_tabs.values():
-            tab.worker.wait(2000)
+            tab.worker.stop()
+        for device_id, tab in self._gauge_tabs.items():
+            if not tab.worker.wait(3000):
+                logger.warning("Worker %s did not stop within timeout", device_id)
 
         if self._turbo_window:
             self._turbo_window.close()
