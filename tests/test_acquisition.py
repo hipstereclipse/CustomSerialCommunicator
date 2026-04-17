@@ -287,9 +287,8 @@ class TestWorkerTransportErrors:
 
             with qtbot.waitSignal(worker.error_occurred, timeout=3000):
                 worker.start()
-            worker.stop()
             with qtbot.waitSignal(worker.finished, timeout=3000):
-                pass
+                worker.stop()
 
         assert errors[0].recoverable
 

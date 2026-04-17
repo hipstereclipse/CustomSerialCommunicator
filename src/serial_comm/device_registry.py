@@ -79,7 +79,8 @@ class DeviceRegistry:
 
         if spec.protocol == "ppg_ascii":
             from serial_comm.protocols.ppg_ascii import PPGProtocol
-            return PPGProtocol(address=addr, gauge_type=spec.model)
+            param_table = self._build_param_table(spec)
+            return PPGProtocol(address=addr, gauge_type=spec.model, param_table=param_table)
 
         if spec.protocol == "pfeiffer_ascii":
             from serial_comm.protocols.pfeiffer_ascii import PfeifferAsciiProtocol

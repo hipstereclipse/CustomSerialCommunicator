@@ -205,17 +205,20 @@ class MainWindow(QMainWindow):
 
     def _connect_gauge(self, cfg: dict) -> None:
         from serial_comm.acquisition import GaugeWorker
-        from serial_comm.transport import TransportConfig
+        from serial_comm.transport import RS485Config, TransportConfig
 
         spec = cfg["spec"]
         protocol = cfg["protocol"]
+        baud = cfg.get("baud_override", spec.default_baud)
+        rs485 = RS485Config() if cfg.get("rs485_enabled") else None
         transport_cfg = TransportConfig(
             port=cfg["port"],
-            baud=spec.default_baud,
+            baud=baud,
             parity=spec.parity,
             data_bits=spec.data_bits,
             stop_bits=spec.stop_bits,
             timeout=2.0,
+            rs485=rs485,
         )
         device_id = f"{cfg['port']}:{protocol.address}"
 
@@ -395,6 +398,8 @@ class MainWindow(QMainWindow):
             "port": gauge_cfg["port"],
             "commands": gauge_cfg["commands"],
             "poll_interval": gauge_cfg["poll_interval"],
+            "baud_override": gauge_cfg.get("baud_override", spec.default_baud),
+            "rs485_enabled": gauge_cfg.get("rs485_enabled", False),
         })
 
     @pyqtSlot()

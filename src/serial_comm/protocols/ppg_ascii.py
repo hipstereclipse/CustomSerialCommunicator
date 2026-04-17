@@ -3,13 +3,12 @@ PPG ASCII protocol codec — INFICON PPG550 / PPG570.
 
 Wire format:
   Request:  @{addr:03d}{mnemonic}{action}{value}\\
-  Response: @ACK{data}\\  or  @NAK\\
+  Response: @ACK{data}\\  or  @NAK{reason}\\
 
 Where:
   addr      3-digit decimal device address (254 = broadcast / RS-232 default)
   mnemonic  ASCII command string, e.g. "PR3", "T", "FV"
   action    "?" for read, "!" for write
-  value     present only on write; omitted on read
   \\         ASCII backslash (0x5C) — frame terminator, no checksum
 """
 
@@ -27,68 +26,100 @@ TERMINATOR = b"\\"
 ACK_PREFIX = b"@ACK"
 NAK_PREFIX = b"@NAK"
 
-# PPG570 adds atmospheric-sensor commands
-_PPG570_EXTRAS = {"atm_pressure", "atm_zero", "atm_full_scale"}
+# Status strings the gauge returns instead of a numeric pressure value
+_PRESSURE_STATUS = {
+    "UR", "UNDERRANGE",
+    "OR", "OVERRANGE",
+    "NO SENSOR", "NS",
+    "WAIT",
+    "HV OFF",
+    "LO SN",
+    "ATM",
+    "ERR",
+    "PROG",
+}
 
 
 class PPGProtocol(GaugeProtocol):
     """
     Codec for the INFICON PPG-series Pirani/Piezo gauges.
 
-    The command table is driven by the device spec loaded by DeviceRegistry;
-    this class only handles framing, not the command list.
+    The command table is driven by the device spec loaded by DeviceRegistry
+    via *param_table*.  The hardcoded ``_MNEMONIC_DEFAULTS`` are used as a
+    fallback when no table is supplied (e.g. in tests).
     """
 
-    def __init__(self, address: int = 254, gauge_type: str = "PPG550") -> None:
+    # Fallback table: command → (mnemonic, writable, unit)
+    _MNEMONIC_DEFAULTS: dict[str, tuple[str, bool, str]] = {
+        "pressure":          ("PR3", False, "mbar"),
+        "temperature":       ("T",   False, "°C"),
+        "software_version":  ("FV",  False, ""),
+        "serial_number":     ("SN",  False, ""),
+        "unit":              ("U",   True,  ""),
+        "zero_adjust":       ("VAC", True,  ""),
+        "piezo_adjust":      ("FS",  True,  ""),
+        "atm_pressure":      ("PR4", False, "mbar"),
+        "combined_pressure": ("PR1", False, "mbar"),
+        "atm_zero":          ("ATZ", True,  ""),
+        "atm_full_scale":    ("ATD", True,  ""),
+    }
+
+    def __init__(
+        self,
+        address: int = 254,
+        gauge_type: str = "PPG550",
+        param_table: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         super().__init__(address)
         self.gauge_type = gauge_type
-
-    # Mnemonic map: command name → (mnemonic, supports_write)
-    # Keep in sync with device_specs/gauges/ppg550.yaml
-    _MNEMONIC: dict[str, tuple[str, bool]] = {
-        "pressure":         ("PR3", False),
-        "temperature":      ("T",   False),
-        "software_version": ("FV",  False),
-        "serial_number":    ("SN",  False),
-        "unit":             ("U",   True),
-        "zero_adjust":      ("VAC", True),
-        "piezo_adjust":     ("FS",  True),
-        # PPG570 extras
-        "atm_pressure":     ("PR4", False),
-        "combined_pressure":("PR1", False),
-        "atm_zero":         ("ATZ", True),
-        "atm_full_scale":   ("ATD", True),
-    }
+        if param_table:
+            self._cmd_table: dict[str, tuple[str, bool, str]] = {}
+            for name, info in param_table.items():
+                mn = info.get("mnemonic")
+                if mn:
+                    self._cmd_table[name] = (
+                        mn,
+                        bool(info.get("write", False)),
+                        info.get("unit", ""),
+                    )
+        else:
+            self._cmd_table = dict(self._MNEMONIC_DEFAULTS)
 
     # ------------------------------------------------------------------
     # GaugeProtocol interface
     # ------------------------------------------------------------------
 
     def build_request(self, command: str, value: Any = None) -> bytes:
-        entry = self._MNEMONIC.get(command)
+        entry = self._cmd_table.get(command)
         if entry is None:
             raise ValueError(f"PPGProtocol: unknown command '{command}'")
-        mnemonic, writable = entry
+        mnemonic, writable, _ = entry
         if value is not None and not writable:
             raise ValueError(f"PPGProtocol: command '{command}' is read-only")
-
         action = "?" if value is None else "!"
         val_str = "" if value is None else str(value)
         frame = f"@{self.address:03d}{mnemonic}{action}{val_str}\\"
+        logger.debug("TX %r", frame)
         return frame.encode("ascii")
 
     def parse_response(self, raw: bytes, command: str) -> GaugeReading:
         if not raw:
             return self._err("No response received", raw)
-        if not raw.endswith(TERMINATOR):
-            return self._err(f"Missing terminator in response: {raw!r}", raw)
 
-        body = raw[:-1]  # strip backslash
+        # Strip any trailing CR/LF before checking the terminator
+        stripped = raw.rstrip(b"\r\n")
+        if not stripped.endswith(TERMINATOR):
+            return self._err(
+                f"Missing terminator; got {raw!r}", raw
+            )
+
+        body = stripped[:-1]  # remove trailing backslash
 
         if body.startswith(NAK_PREFIX):
-            return self._err(f"NAK from device: {raw!r}", raw)
+            reason = body[len(NAK_PREFIX):].decode("ascii", errors="replace").strip()
+            return self._err(f"NAK: {reason or '(no reason)'}", raw)
         if not body.startswith(ACK_PREFIX):
-            return self._err(f"Unexpected response prefix: {raw!r}", raw)
+            return self._err(f"Unexpected prefix: {raw!r}", raw)
 
         data_str = body[len(ACK_PREFIX):].decode("ascii", errors="replace").strip()
         return self._decode(command, data_str, raw)
@@ -99,39 +130,40 @@ class PPGProtocol(GaugeProtocol):
 
     def _decode(self, command: str, data: str, raw: bytes) -> GaugeReading:
         try:
-            if command in ("pressure", "atm_pressure", "combined_pressure"):
-                return self._decode_pressure(data, raw)
-            if command == "temperature":
+            _, _, unit = self._cmd_table.get(command, ("", False, ""))
+            # Route by unit or command name
+            if unit in ("mbar", "Torr", "Pa", "hPa", "psi"):
+                return self._decode_pressure(data, raw, unit)
+            if unit == "°C":
                 v = float(data)
                 return self._ok(v, "°C", f"{v:.1f} °C", raw)
-            if command == "unit":
-                return GaugeReading(success=True, formatted=data, raw=raw,
-                                    extra={"unit_code": data})
-            if command in ("software_version", "serial_number"):
-                return GaugeReading(success=True, formatted=data, raw=raw,
-                                    extra={"text": data})
-            if command in ("zero_adjust", "piezo_adjust", "atm_zero", "atm_full_scale"):
-                return GaugeReading(success=True, formatted=data or "OK", raw=raw)
-            # Fallback: return raw string
-            return GaugeReading(success=True, formatted=data, raw=raw)
+            # Write-confirm commands return empty data or "OK"
+            if not self._cmd_table.get(command, ("", True, ""))[1] is False:
+                # If writable with no unit — treat as acknowledgement
+                pass
+            return GaugeReading(success=True, formatted=data or "OK", raw=raw,
+                                extra={"text": data})
         except Exception as exc:
             return self._err(f"Parse error for '{command}': {exc}", raw)
 
     @staticmethod
-    def _decode_pressure(data: str, raw: bytes) -> GaugeReading:
-        """
-        PPG pressure data is a float in scientific notation, e.g. "1.23E-3".
-        The device also returns status strings like "UR" (under-range) or
-        "OR" (over-range); these are reported as errors.
-        """
+    def _decode_pressure(data: str, raw: bytes, unit: str = "mbar") -> GaugeReading:
         upper = data.strip().upper()
-        if upper in ("UR", "UNDERRANGE", "NO SENSOR"):
-            return GaugeReading(success=False, error=f"Gauge status: {data}", raw=raw)
-        if upper in ("OR", "OVERRANGE"):
+        if upper in _PRESSURE_STATUS:
             return GaugeReading(success=False, error=f"Gauge status: {data}", raw=raw)
         try:
             v = float(data)
         except ValueError:
-            return GaugeReading(success=False, error=f"Cannot parse pressure: {data!r}", raw=raw)
-        return GaugeReading(success=True, value=v, unit="mbar",
-                            formatted=f"{v:.3E} mbar", raw=raw)
+            # Unknown non-numeric string — report it without crashing
+            return GaugeReading(
+                success=False,
+                error=f"Unexpected response: {data!r}",
+                raw=raw,
+            )
+        return GaugeReading(
+            success=True,
+            value=v,
+            unit=unit,
+            formatted=f"{v:.3E} {unit}",
+            raw=raw,
+        )

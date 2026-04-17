@@ -67,6 +67,17 @@ class DeviceSpec:
     experimental: bool = False
 
 
+@dataclass(frozen=True)
+class TerminalEntry:
+    """One request/response exchange captured by the terminal."""
+
+    request: bytes
+    response: bytes
+    timestamp: datetime
+    command: str = ""        # empty for raw custom frames
+    error: str | None = None
+
+
 @dataclass
 class CommandSpec:
     """Specification for a single command on a device."""

@@ -21,13 +21,14 @@ Signals emitted (all queued across thread boundary):
 from __future__ import annotations
 
 import logging
+import queue as _queue
 import time
 from datetime import datetime, timezone
 from typing import Sequence
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from serial_comm.models import DeviceError, DeviceReading, DeviceSpec
+from serial_comm.models import DeviceError, DeviceReading, DeviceSpec, TerminalEntry
 from serial_comm.protocols.base import GaugeProtocol
 from serial_comm.transport import SerialTransport, TransportConfig, TransportError
 
@@ -59,8 +60,9 @@ class GaugeWorker(QThread):
         Human-readable ID used in DeviceReading/DeviceError (e.g. "COM3:254").
     """
 
-    reading_ready = pyqtSignal(object)   # DeviceReading
-    error_occurred = pyqtSignal(object)  # DeviceError
+    reading_ready = pyqtSignal(object)    # DeviceReading
+    error_occurred = pyqtSignal(object)   # DeviceError
+    terminal_response = pyqtSignal(object)  # TerminalEntry
     connected = pyqtSignal()
     disconnected = pyqtSignal()
 
@@ -81,6 +83,7 @@ class GaugeWorker(QThread):
         self._poll_interval = poll_interval
         self._device_id = device_id or f"{transport_config.port}:{protocol.address}"
         self._transport: SerialTransport | None = None
+        self._terminal_queue: _queue.SimpleQueue = _queue.SimpleQueue()
 
     # ------------------------------------------------------------------
     # Public control API  (call from GUI thread)
@@ -89,6 +92,14 @@ class GaugeWorker(QThread):
     def stop(self) -> None:
         """Request the worker to exit cleanly.  Returns immediately."""
         self.requestInterruption()
+
+    def send_terminal_command(self, frame: bytes, command: str = "") -> None:
+        """Queue a raw frame to be sent on the next poll-cycle gap.
+
+        Thread-safe — call from the GUI thread.  The worker drains the queue
+        between poll cycles; response arrives via ``terminal_response`` signal.
+        """
+        self._terminal_queue.put_nowait((frame, command))
 
     # ------------------------------------------------------------------
     # QThread.run — everything below runs in the worker thread
@@ -125,6 +136,9 @@ class GaugeWorker(QThread):
         consecutive_errors = 0
 
         while not self.isInterruptionRequested():
+            # Drain any terminal commands queued by the GUI thread first
+            self._drain_terminal_queue(transport)
+
             cycle_start = time.monotonic()
 
             for command in self._commands:
@@ -256,6 +270,60 @@ class GaugeWorker(QThread):
                 self._emit_error(f"CDG transport error: {exc}", recoverable=recoverable)
                 if not recoverable:
                     return
+
+    # ------------------------------------------------------------------
+    # Terminal command execution (called from worker thread)
+    # ------------------------------------------------------------------
+
+    def _drain_terminal_queue(self, transport: SerialTransport) -> None:
+        while not self._terminal_queue.empty():
+            try:
+                frame, command = self._terminal_queue.get_nowait()
+            except _queue.Empty:
+                break
+            self._execute_terminal_command(transport, frame, command)
+
+    def _execute_terminal_command(
+        self, transport: SerialTransport, frame: bytes, command: str
+    ) -> None:
+        try:
+            transport.flush_input()
+            transport.write(frame)
+            raw = self._read_terminal_response(transport)
+            entry = TerminalEntry(
+                request=frame,
+                response=raw,
+                timestamp=datetime.now(tz=timezone.utc),
+                command=command,
+            )
+        except TransportError as exc:
+            entry = TerminalEntry(
+                request=frame,
+                response=b"",
+                timestamp=datetime.now(tz=timezone.utc),
+                command=command,
+                error=str(exc),
+            )
+        self.terminal_response.emit(entry)
+
+    def _read_terminal_response(self, transport: SerialTransport) -> bytes:
+        """Read one terminal response using the appropriate protocol framing."""
+        from serial_comm.protocols.ppg_ascii import TERMINATOR as PPG_TERM
+        from serial_comm.protocols.pfeiffer_ascii import TERMINATOR as PA_TERM
+        from serial_comm.protocols.pfeiffer_binary import PfeifferBinaryProtocol
+
+        proto = self._protocol
+        if self._spec.protocol == "ppg_ascii":
+            return transport.read_until(PPG_TERM)
+        if self._spec.protocol == "pfeiffer_ascii":
+            return transport.read_until(PA_TERM)
+        if isinstance(proto, PfeifferBinaryProtocol):
+            header = transport.read_bytes(4)
+            if len(header) < 4:
+                return header
+            msg_len = header[3]
+            return header + transport.read_bytes(msg_len + 2)
+        return transport.read_bytes(64)
 
     # ------------------------------------------------------------------
     # Helpers
