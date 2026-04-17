@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.inficon.com)",
+      "WebFetch(domain:eurovacuum.eu)",
+      "Bash(python -m pytest tests/test_acquisition.py::TestWorkerTransportErrors::test_recoverable_transport_error_is_marked_recoverable -v --tb=short)",
+      "Bash(python -m pytest tests/ --tb=short)",
+      "Bash(python -c \"import pyqtgraph as pg; help\\(pg.InfiniteLine.__init__\\)\")",
+      "Bash(python -c \"import pyqtgraph as pg; print\\(dir\\(pg.SignalProxy\\)\\)\")",
+      "Bash(awk -F/ '{ *)",
+      "Bash(python -m pytest tests/ -x -q)"
+    ]
+  }
+}

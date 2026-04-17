@@ -125,7 +125,7 @@ class PlotPanel(QWidget):
         root.addWidget(self._value_bar)
 
         # ── Plot widget ────────────────────────────────────────────────
-        self._glw = pg.GraphicsLayoutWidget(background="#1E1E1E")
+        self._glw = pg.GraphicsLayoutWidget()
         self._glw.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )

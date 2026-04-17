@@ -40,6 +40,12 @@ _TC600_PARAMS: dict[str, dict[str, Any]] = {
     "vent_freq_pct":    {"pid": 720, "data_type": "u_integer",   "read": True,  "write": True,  "unit": "%"},
     "vent_time_s":      {"pid": 721, "data_type": "u_integer",   "read": True,  "write": True,  "unit": "s"},
     "rs485_address":    {"pid": 797, "data_type": "u_integer",   "read": True,  "write": True,  "unit": ""},
+    # Temperature sensors (read-only, u_short_int = 3-char decimal)
+    "bearing_temp_C":       {"pid": 342, "data_type": "u_short_int", "read": True,  "write": False, "unit": "°C"},
+    "motor_temp_C":         {"pid": 346, "data_type": "u_short_int", "read": True,  "write": False, "unit": "°C"},
+    "electronics_temp_C":   {"pid": 347, "data_type": "u_short_int", "read": True,  "write": False, "unit": "°C"},
+    # Warning code (parallel to error_code, pid 302)
+    "warning_code":         {"pid": 302, "data_type": "string",      "read": True,  "write": False, "unit": ""},
 }
 
 # Human-readable descriptions for error codes from the DCU parameter list

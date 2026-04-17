@@ -77,8 +77,9 @@ class TurboWorker(QThread):
         String identifier for logging and signal payloads.
     """
 
-    status_ready = pyqtSignal(object)    # TurboStatus
-    error_occurred = pyqtSignal(object)  # DeviceError
+    status_ready = pyqtSignal(object)       # TurboStatus
+    error_occurred = pyqtSignal(object)    # DeviceError
+    terminal_response = pyqtSignal(str, object)  # (label, GaugeReading|None)
     connected = pyqtSignal()
     disconnected = pyqtSignal()
 
@@ -97,6 +98,7 @@ class TurboWorker(QThread):
         self._poll_interval = poll_interval
         self._device_id = device_id or f"{transport_config.port}:{protocol.address}"
         self._pending_command: tuple[str, Any] | None = None
+        self._pending_reads: set[str] = set()
         self._cmd_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -105,6 +107,16 @@ class TurboWorker(QThread):
 
     def stop(self) -> None:
         self.requestInterruption()
+
+    def request_read(self, command: str) -> None:
+        """Queue a one-shot read; result is included in the next status_ready and terminal_response."""
+        with self._cmd_lock:
+            self._pending_reads.add(command)
+
+    def set_poll_commands(self, commands: list[str]) -> None:
+        """Replace the cyclic poll list. Pass [] to pause cyclic reading."""
+        with self._cmd_lock:
+            self._poll_commands = list(commands)
 
     def send_command(self, command: str, value: Any = None) -> None:
         """Queue a write command to be sent on the next loop iteration.
@@ -154,6 +166,10 @@ class TurboWorker(QThread):
             with self._cmd_lock:
                 pending = self._pending_command
                 self._pending_command = None
+                one_shots = list(self._pending_reads)
+                self._pending_reads.clear()
+                poll_cmds = list(self._poll_commands)
+
             if pending is not None:
                 cmd, val = pending
                 try:
@@ -162,13 +178,29 @@ class TurboWorker(QThread):
                     transport.write(request)
                     # Read the echo/ACK (TC600 echoes writes)
                     transport.read_until(TERMINATOR)
+                    self.terminal_response.emit(f"SET {cmd} = {val}", None)
                     logger.debug("[%s] sent %s=%s", self._device_id, cmd, val)
                 except (TransportError, ValueError) as exc:
                     self._emit_error(f"Write failed ({cmd}): {exc}", recoverable=True)
 
-            # Read all polled parameters
+            # Execute one-shot reads (from Retrieve buttons / terminal)
             readings: dict[str, Any] = {}
-            for cmd in self._poll_commands:
+            for cmd in one_shots:
+                if self.isInterruptionRequested():
+                    return
+                try:
+                    request = self._protocol.build_request(cmd)
+                    transport.flush_input()
+                    transport.write(request)
+                    raw = transport.read_until(TERMINATOR)
+                    result = self._protocol.parse_response(raw, cmd)
+                    readings[cmd] = result
+                    self.terminal_response.emit(f"READ {cmd}", result)
+                except (TransportError, ValueError) as exc:
+                    logger.debug("[%s] one-shot read failed (%s): %s", self._device_id, cmd, exc)
+
+            # Read all polled parameters
+            for cmd in poll_cmds:
                 if self.isInterruptionRequested():
                     return
                 try:

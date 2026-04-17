@@ -310,10 +310,21 @@ class AddGaugeDialog(QDialog):
 
     @pyqtSlot(QListWidgetItem)
     def _on_scan_result_clicked(self, item: QListWidgetItem) -> None:
+        from PyQt6.QtWidgets import QMessageBox
         data = item.data(Qt.ItemDataRole.UserRole)
         if not data:
             return
         port, model_hint = data
+
+        # TC600 is a Pfeiffer turbo — not a gauge
+        if "TC600" in model_hint.upper() or "(TURBO)" in model_hint.upper():
+            QMessageBox.information(
+                self, "Pfeiffer TC600 Turbo Detected",
+                f"A Pfeiffer TC600 turbo controller was found on {port}.\n\n"
+                "Use Devices → Open Turbo Controller to connect to it.\n"
+                "The turbo controller has its own dedicated window.",
+            )
+            return
 
         # Set the port
         idx = self._port_combo.findText(port)
@@ -323,17 +334,16 @@ class AddGaugeDialog(QDialog):
             self._port_combo.insertItem(0, port)
             self._port_combo.setCurrentIndex(0)
 
-        # Try to match model
-        if "PPG" in model_hint.upper():
+        # Strip "INFICON " prefix, then match by scanning tokens against the model list.
+        # e.g. "INFICON PPG570" → try to match "PPG570" then "PPG" in the combo.
+        hint_clean = model_hint.upper().replace("INFICON", "").strip()
+        tokens = [t for t in hint_clean.split() if t]
+
+        for token in tokens:
             for i in range(self._model_combo.count()):
-                if "PPG" in self._model_combo.itemText(i).upper():
+                if token in self._model_combo.itemText(i).upper():
                     self._model_combo.setCurrentIndex(i)
-                    break
-        elif "PFEIFFER" in model_hint.upper():
-            for i in range(self._model_combo.count()):
-                if "BCG" in self._model_combo.itemText(i).upper():
-                    self._model_combo.setCurrentIndex(i)
-                    break
+                    return
 
     # ------------------------------------------------------------------
     # Result

@@ -2,47 +2,60 @@
 TurboWindow — independent QMainWindow for the Pfeiffer TC600 controller.
 
 Architecturally separate from the gauge workspace: turbos are Pfeiffer products,
-not INFICON gauges.  This window has its own connection management and does not
-share state with the gauge main window.
+not INFICON gauges.  This window has its own connection management.
 
-Layout:
-  ┌─────────────────────────────────────────┐
-  │  Port: [COM??▼]  Addr: [1]  [Connect]  │
-  ├─────────────────────────────────────────┤
-  │  Speed gauge (0 … max)                  │
-  │  Current: 0 A    Power: 0 W             │
-  ├─────────────────────────────────────────┤
-  │  [Start Pump]  [Stop Pump]  [Vent]      │
-  │  [Standby ON]  [Ack Error]              │
-  ├─────────────────────────────────────────┤
-  │  Error code: no Err                     │
-  │  Op hours: 0 h   Firmware: ---          │
-  └─────────────────────────────────────────┘
+Tabs:
+  Dashboard — speed/status overview, per-parameter retrieve buttons with
+              cyclic-enable checkboxes, pump controls.
+  Terminal  — quick-command sender + raw-frame entry with coloured log.
 """
 
 from __future__ import annotations
 
+import html
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 import serial.tools.list_ports
 from PyQt6.QtCore import Qt, QSettings, pyqtSlot
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QSpinBox, QComboBox,
-    QGroupBox, QFormLayout, QStatusBar, QProgressBar,
-    QSizePolicy,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
+    QRadioButton, QScrollArea, QSizePolicy, QSpinBox, QStatusBar,
+    QTabWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
+    QButtonGroup,
 )
 
 from serial_comm.turbos.tc600_protocol import TC600Protocol, ERROR_DESCRIPTIONS
 from serial_comm.turbos.turbo_worker import TurboWorker, TurboStatus
-from serial_comm.models import DeviceError
+from serial_comm.models import DeviceError, GaugeReading
 from serial_comm.transport import TransportConfig
 
 logger = logging.getLogger(__name__)
 
-# TC600 max rated speed varies by pump; 1500 Hz is the TC600 drive unit max
 _MAX_SPEED_HZ = 1500
+
+# (command_name, display_label, unit_suffix, default_cyclic_on)
+_STATUS_ROWS: list[tuple[str, str, str, bool]] = [
+    ("actual_speed_hz",    "Speed",             "Hz",  True),
+    ("motor_current_A",    "Current",           "A",   True),
+    ("motor_power_W",      "Power",             "W",   True),
+    ("motor_temp_C",       "Motor Temp",        "°C",  False),
+    ("electronics_temp_C", "Electronics Temp",  "°C",  False),
+    ("bearing_temp_C",     "Bearing Temp",      "°C",  False),
+    ("pump_on",            "Pump Status",       "",    True),
+    ("error_code",         "Error Code",        "",    True),
+    ("warning_code",       "Warning Code",      "",    False),
+    ("op_hours_TMP",       "Operating Hours",   "h",   False),
+    ("firmware",           "Firmware",          "",    False),
+]
+
+_COL_TX  = "#4C9BE8"
+_COL_RX  = "#4CE87A"
+_COL_ERR = "#E84C4C"
+_COL_TS  = "#888888"
 
 
 class TurboWindow(QMainWindow):
@@ -56,12 +69,15 @@ class TurboWindow(QMainWindow):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Pfeiffer TC600 Turbo Controller")
-        self.resize(520, 460)
+        self.resize(600, 700)
         self._settings = QSettings()
 
         self._worker: TurboWorker | None = None
         self._protocol: TC600Protocol | None = None
         self._connected = False
+
+        # Per-row widgets: cmd → (cyclic_check, value_label, retrieve_btn)
+        self._row_widgets: dict[str, tuple[QCheckBox, QLabel, QPushButton]] = {}
 
         self._build_ui()
         self._populate_ports()
@@ -75,6 +91,7 @@ class TurboWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setSpacing(6)
+        root.setContentsMargins(8, 8, 8, 8)
 
         # --- Connection bar ---
         conn_grp = QGroupBox("Connection")
@@ -83,7 +100,6 @@ class TurboWindow(QMainWindow):
         port_row = QHBoxLayout()
         self._port_combo = QComboBox()
         port_row.addWidget(self._port_combo)
-
         refresh_btn = QPushButton("⟳")
         refresh_btn.setFixedWidth(30)
         refresh_btn.clicked.connect(self._populate_ports)
@@ -100,7 +116,27 @@ class TurboWindow(QMainWindow):
         conn_form.addRow("", self._connect_btn)
         root.addWidget(conn_grp)
 
-        # --- Speed display ---
+        # --- Tabs ---
+        self._tabs = QTabWidget()
+        self._tabs.addTab(self._build_dashboard_tab(), "Dashboard")
+        self._tabs.addTab(self._build_terminal_tab(), "Terminal")
+        root.addWidget(self._tabs)
+
+        # Status bar
+        self._status_bar = QStatusBar()
+        self.setStatusBar(self._status_bar)
+        self._status_bar.showMessage("Not connected")
+
+    # ------------------------------------------------------------------
+    # Dashboard tab
+    # ------------------------------------------------------------------
+
+    def _build_dashboard_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(6)
+
+        # Speed bar + pump indicator
         speed_grp = QGroupBox("Pump Status")
         speed_layout = QVBoxLayout(speed_grp)
 
@@ -111,17 +147,15 @@ class TurboWindow(QMainWindow):
         self._speed_bar.setTextVisible(True)
         speed_layout.addWidget(self._speed_bar)
 
-        metrics_row = QHBoxLayout()
-        self._current_label = QLabel("Current: — A")
-        self._power_label = QLabel("Power: — W")
-        self._pump_on_label = QLabel("Pump: OFF")
-        metrics_row.addWidget(self._pump_on_label)
-        metrics_row.addWidget(self._current_label)
-        metrics_row.addWidget(self._power_label)
-        speed_layout.addLayout(metrics_row)
-        root.addWidget(speed_grp)
+        pump_row = QHBoxLayout()
+        self._pump_label = QLabel("Pump: OFF")
+        self._pump_label.setStyleSheet("color: #E84C4C; font-weight: bold;")
+        pump_row.addWidget(self._pump_label)
+        pump_row.addStretch()
+        speed_layout.addLayout(pump_row)
+        layout.addWidget(speed_grp)
 
-        # --- Controls ---
+        # Controls
         ctrl_grp = QGroupBox("Controls")
         ctrl_layout = QHBoxLayout(ctrl_grp)
 
@@ -150,28 +184,142 @@ class TurboWindow(QMainWindow):
         self._ack_btn.clicked.connect(self._on_ack_error)
         self._ack_btn.setEnabled(False)
         ctrl_layout.addWidget(self._ack_btn)
+        layout.addWidget(ctrl_grp)
 
-        root.addWidget(ctrl_grp)
+        # Per-parameter status table (scrollable)
+        status_grp = QGroupBox("Status")
+        status_inner = QWidget()
+        status_form = QFormLayout(status_inner)
+        status_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        status_form.setVerticalSpacing(4)
 
-        # --- Info ---
-        info_grp = QGroupBox("Info")
-        info_form = QFormLayout(info_grp)
+        for cmd, label, unit, default_cyclic in _STATUS_ROWS:
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
 
-        self._error_label = QLabel("no Err")
-        info_form.addRow("Error code:", self._error_label)
+            cyc_check = QCheckBox()
+            cyc_check.setToolTip("Include in cyclic polling")
+            cyc_check.setChecked(default_cyclic)
+            cyc_check.toggled.connect(self._on_cyclic_toggle)
+            row_layout.addWidget(cyc_check)
 
-        self._hours_label = QLabel("—")
-        info_form.addRow("Op hours:", self._hours_label)
+            val_label = QLabel("—")
+            val_label.setMinimumWidth(140)
+            row_layout.addWidget(val_label)
 
-        self._fw_label = QLabel("—")
-        info_form.addRow("Firmware:", self._fw_label)
+            retrieve_btn = QPushButton("Retrieve")
+            retrieve_btn.setFixedWidth(70)
+            retrieve_btn.setEnabled(False)
+            retrieve_btn.clicked.connect(
+                lambda _checked=False, c=cmd: self._on_retrieve(c)
+            )
+            row_layout.addWidget(retrieve_btn)
+            row_layout.addStretch()
 
-        root.addWidget(info_grp)
+            self._row_widgets[cmd] = (cyc_check, val_label, retrieve_btn)
+            status_form.addRow(f"{label}:", row_widget)
 
-        # Status bar
-        self._status_bar = QStatusBar()
-        self.setStatusBar(self._status_bar)
-        self._status_bar.showMessage("Not connected")
+        scroll = QScrollArea()
+        scroll.setWidget(status_inner)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        grp_layout = QVBoxLayout(status_grp)
+        grp_layout.addWidget(scroll)
+        layout.addWidget(status_grp)
+
+        # Cyclic update controls
+        cyc_grp = QGroupBox("Cyclic Updates")
+        cyc_layout = QHBoxLayout(cyc_grp)
+
+        self._cyclic_check = QCheckBox("Enable")
+        self._cyclic_check.setChecked(True)
+        self._cyclic_check.toggled.connect(self._on_cyclic_master_toggle)
+        cyc_layout.addWidget(self._cyclic_check)
+
+        cyc_layout.addWidget(QLabel("Interval:"))
+        self._interval_spin = QDoubleSpinBox()
+        self._interval_spin.setRange(0.2, 60.0)
+        self._interval_spin.setSingleStep(0.1)
+        self._interval_spin.setDecimals(1)
+        self._interval_spin.setValue(1.0)
+        self._interval_spin.setSuffix(" s")
+        cyc_layout.addWidget(self._interval_spin)
+
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(self._on_apply_interval)
+        cyc_layout.addWidget(apply_btn)
+        cyc_layout.addStretch()
+        layout.addWidget(cyc_grp)
+
+        return tab
+
+    # ------------------------------------------------------------------
+    # Terminal tab
+    # ------------------------------------------------------------------
+
+    def _build_terminal_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(6)
+
+        # Quick command panel
+        quick_grp = QGroupBox("Quick Command")
+        quick_form = QFormLayout(quick_grp)
+        quick_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._term_cmd_combo = QComboBox()
+        self._term_cmd_combo.setMinimumWidth(200)
+        quick_form.addRow("Command:", self._term_cmd_combo)
+
+        type_row = QHBoxLayout()
+        self._query_radio = QRadioButton("Query (read)")
+        self._set_radio = QRadioButton("Set (write)")
+        self._query_radio.setChecked(True)
+        btn_grp = QButtonGroup(self)
+        btn_grp.addButton(self._query_radio, 0)
+        btn_grp.addButton(self._set_radio, 1)
+        self._set_radio.toggled.connect(self._on_term_type_changed)
+        type_row.addWidget(self._query_radio)
+        type_row.addWidget(self._set_radio)
+        type_row.addStretch()
+        quick_form.addRow("Type:", type_row)
+
+        self._term_value = QLineEdit()
+        self._term_value.setPlaceholderText("Value (for Set only)")
+        self._term_value.setEnabled(False)
+        quick_form.addRow("Value:", self._term_value)
+
+        self._term_send_btn = QPushButton("Send")
+        self._term_send_btn.setEnabled(False)
+        self._term_send_btn.clicked.connect(self._on_term_send)
+        quick_form.addRow("", self._term_send_btn)
+        layout.addWidget(quick_grp)
+
+        # Output display
+        self._term_output = QTextEdit()
+        self._term_output.setReadOnly(True)
+        self._term_output.setFont(QFont("Courier New", 9))
+        self._term_output.document().setMaximumBlockCount(2000)
+        self._term_output.setPlaceholderText(
+            "Command log appears here.\nUse Query to read a parameter, Set to write one."
+        )
+        layout.addWidget(self._term_output)
+
+        # Raw frame entry
+        raw_grp = QGroupBox("Raw Frame")
+        raw_layout = QHBoxLayout(raw_grp)
+        self._raw_input = QLineEdit()
+        self._raw_input.setPlaceholderText("Not available while worker is connected")
+        self._raw_input.setEnabled(False)
+        raw_layout.addWidget(self._raw_input)
+        layout.addWidget(raw_grp)
+
+        return tab
 
     # ------------------------------------------------------------------
     # Ports
@@ -184,6 +332,14 @@ class TurboWindow(QMainWindow):
             self._port_combo.addItem(p)
         if not ports:
             self._port_combo.addItem("(none)")
+
+    def _populate_term_commands(self) -> None:
+        """Fill the terminal command combo from the TC600 parameter table."""
+        self._term_cmd_combo.clear()
+        if self._protocol is None:
+            return
+        for cmd in self._protocol.all_commands:
+            self._term_cmd_combo.addItem(cmd)
 
     # ------------------------------------------------------------------
     # Connection
@@ -203,17 +359,16 @@ class TurboWindow(QMainWindow):
         self._protocol = TC600Protocol(address=addr)
         cfg = TransportConfig(port=port, baud=9600)
 
+        initial_poll = self._build_poll_list()
         self._worker = TurboWorker(
             protocol=self._protocol,
             transport_config=cfg,
-            poll_commands=[
-                "pump_on", "actual_speed_hz", "motor_current_A",
-                "motor_power_W", "error_code", "op_hours_TMP", "firmware",
-            ],
-            poll_interval=1.0,
+            poll_commands=initial_poll,
+            poll_interval=self._interval_spin.value(),
             device_id=f"TC600 {port}:{addr}",
         )
         self._worker.status_ready.connect(self._on_status)
+        self._worker.terminal_response.connect(self._on_terminal_response)
         self._worker.error_occurred.connect(self._on_worker_error)
         self._worker.connected.connect(self._on_connected)
         self._worker.disconnected.connect(self._on_disconnected)
@@ -239,6 +394,7 @@ class TurboWindow(QMainWindow):
         self._connected = True
         self._connect_btn.setText("Disconnect")
         self._set_controls_enabled(True)
+        self._populate_term_commands()
         self._status_bar.showMessage("Connected")
 
     @pyqtSlot()
@@ -257,73 +413,164 @@ class TurboWindow(QMainWindow):
             hz = int(r["actual_speed_hz"].value or 0)
             self._speed_bar.setValue(hz)
 
-        # Current / power
-        if "motor_current_A" in r and r["motor_current_A"].success:
-            self._current_label.setText(f"Current: {r['motor_current_A'].value:.2f} A")
-        if "motor_power_W" in r and r["motor_power_W"].success:
-            self._power_label.setText(f"Power: {int(r['motor_power_W'].value or 0)} W")
-
-        # Pump on/off
+        # Pump label
         if "pump_on" in r and r["pump_on"].success:
             on = r["pump_on"].value == 1.0
-            self._pump_on_label.setText("Pump: ON" if on else "Pump: OFF")
+            self._pump_label.setText("Pump: ON" if on else "Pump: OFF")
             colour = "#4CE87A" if on else "#E84C4C"
-            self._pump_on_label.setStyleSheet(f"color: {colour}; font-weight: bold;")
+            self._pump_label.setStyleSheet(f"color: {colour}; font-weight: bold;")
 
-        # Error code
-        if "error_code" in r and r["error_code"].success:
-            code = r["error_code"].formatted.strip()
-            desc = ERROR_DESCRIPTIONS.get(code, code)
-            self._error_label.setText(f"{code} — {desc}")
-            is_err = not code.startswith("no")
-            self._error_label.setStyleSheet("color: red;" if is_err else "")
+        # Per-row status labels
+        for cmd, (_cyc, val_lbl, _btn) in self._row_widgets.items():
+            if cmd not in r:
+                continue
+            reading: GaugeReading = r[cmd]
+            if not reading.success:
+                val_lbl.setText(f"[ERR] {reading.error or ''}")
+                val_lbl.setStyleSheet("color: #E84C4C;")
+                continue
 
-        # Op hours
-        if "op_hours_TMP" in r and r["op_hours_TMP"].success:
-            self._hours_label.setText(f"{int(r['op_hours_TMP'].value or 0)} h")
-
-        # Firmware
-        if "firmware" in r and r["firmware"].success:
-            self._fw_label.setText(r["firmware"].formatted.strip())
+            if cmd == "error_code":
+                code = (reading.formatted or "").strip()
+                desc = ERROR_DESCRIPTIONS.get(code, code)
+                val_lbl.setText(f"{code} — {desc}")
+                val_lbl.setStyleSheet("color: red;" if not code.startswith("no") else "")
+            elif cmd == "warning_code":
+                code = (reading.formatted or "").strip()
+                val_lbl.setText(code)
+                val_lbl.setStyleSheet("color: orange;" if not code.startswith("no") else "")
+            elif cmd == "pump_on":
+                pass  # already handled above
+            else:
+                val_lbl.setText(reading.formatted or str(reading.value or "—"))
+                val_lbl.setStyleSheet("")
 
         now = datetime.now(tz=timezone.utc).strftime("%H:%M:%S UTC")
         self._status_bar.showMessage(f"Last update: {now}")
+
+    @pyqtSlot(str, object)
+    def _on_terminal_response(self, label: str, reading: Any) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        if label.startswith("SET "):
+            self._term_append(f"[{ts}] TX: {label}", _COL_TX)
+        elif label.startswith("READ "):
+            cmd = label[5:]
+            if reading is not None and reading.success:
+                val = reading.formatted or str(reading.value)
+                self._term_append(f"[{ts}] RX: {cmd} = {val}", _COL_RX)
+            elif reading is not None:
+                self._term_append(f"[{ts}] RX: {cmd} [ERR] {reading.error}", _COL_ERR)
 
     @pyqtSlot(object)
     def _on_worker_error(self, error: DeviceError) -> None:
         msg = f"[{'WARN' if error.recoverable else 'ERR'}] {error.message}"
         self._status_bar.showMessage(msg)
+        self._term_append(msg, _COL_ERR)
         logger.warning("TurboWorker: %s", error.message)
 
     # ------------------------------------------------------------------
-    # Control actions (send via TurboWorker)
+    # Control actions
     # ------------------------------------------------------------------
 
     @pyqtSlot()
     def _on_start_pump(self) -> None:
-        self._send("pump_on", True)
+        self._send_write("pump_on", True)
 
     @pyqtSlot()
     def _on_stop_pump(self) -> None:
-        self._send("pump_on", False)
+        self._send_write("pump_on", False)
 
     @pyqtSlot()
     def _on_vent(self) -> None:
-        self._send("vent_enable", True)
+        self._send_write("vent_enable", True)
 
     @pyqtSlot()
     def _on_standby(self) -> None:
         on = self._standby_btn.isChecked()
         self._standby_btn.setText("Standby ON" if not on else "Standby OFF")
-        self._send("standby", on)
+        self._send_write("standby", on)
 
     @pyqtSlot()
     def _on_ack_error(self) -> None:
-        self._send("error_ack", True)
+        self._send_write("error_ack", True)
 
-    def _send(self, command: str, value) -> None:
+    def _send_write(self, command: str, value: Any) -> None:
         if self._worker:
             self._worker.send_command(command, value)
+
+    # ------------------------------------------------------------------
+    # Retrieve buttons
+    # ------------------------------------------------------------------
+
+    def _on_retrieve(self, command: str) -> None:
+        if self._worker:
+            self._worker.request_read(command)
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._term_append(f"[{ts}] TX: READ {command} (→ Retrieve)", _COL_TX)
+
+    # ------------------------------------------------------------------
+    # Cyclic controls
+    # ------------------------------------------------------------------
+
+    def _build_poll_list(self) -> list[str]:
+        """Return the list of commands currently checked for cyclic polling."""
+        if not self._cyclic_check.isChecked():
+            return []
+        return [
+            cmd for cmd, (cyc_check, _, __) in self._row_widgets.items()
+            if cyc_check.isChecked()
+        ]
+
+    @pyqtSlot(bool)
+    def _on_cyclic_toggle(self, _: bool) -> None:
+        if self._worker:
+            self._worker.set_poll_commands(self._build_poll_list())
+
+    @pyqtSlot(bool)
+    def _on_cyclic_master_toggle(self, enabled: bool) -> None:
+        if self._worker:
+            self._worker.set_poll_commands(self._build_poll_list())
+
+    @pyqtSlot()
+    def _on_apply_interval(self) -> None:
+        if self._worker:
+            self._worker._poll_interval = self._interval_spin.value()
+
+    # ------------------------------------------------------------------
+    # Terminal
+    # ------------------------------------------------------------------
+
+    @pyqtSlot(bool)
+    def _on_term_type_changed(self, set_mode: bool) -> None:
+        self._term_value.setEnabled(set_mode)
+
+    @pyqtSlot()
+    def _on_term_send(self) -> None:
+        if not self._worker:
+            return
+        cmd = self._term_cmd_combo.currentText()
+        if not cmd:
+            return
+        if self._set_radio.isChecked():
+            raw_val = self._term_value.text().strip()
+            try:
+                val: Any = float(raw_val) if "." in raw_val else int(raw_val)
+            except ValueError:
+                val = raw_val
+            self._worker.send_command(cmd, val)
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._term_append(f"[{ts}] TX: SET {cmd} = {val}", _COL_TX)
+        else:
+            self._worker.request_read(cmd)
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._term_append(f"[{ts}] TX: READ {cmd}", _COL_TX)
+
+    def _term_append(self, text: str, colour: str = "") -> None:
+        escaped = html.escape(text)
+        frag = f'<span style="color:{colour}">{escaped}</span>' if colour else escaped
+        self._term_output.append(frag)
+        sb = self._term_output.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     # ------------------------------------------------------------------
     # Helpers
@@ -333,6 +580,9 @@ class TurboWindow(QMainWindow):
         for btn in (self._start_btn, self._stop_btn, self._vent_btn,
                     self._standby_btn, self._ack_btn):
             btn.setEnabled(enabled)
+        for _cyc, _val, rtv in self._row_widgets.values():
+            rtv.setEnabled(enabled)
+        self._term_send_btn.setEnabled(enabled)
 
     def closeEvent(self, event) -> None:
         self._do_disconnect()

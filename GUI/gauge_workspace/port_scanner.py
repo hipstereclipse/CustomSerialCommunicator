@@ -156,10 +156,10 @@ class PortScanner(QThread):
     def _guess_ppg_model(firmware: str, serial_num: str) -> str:
         combined = (firmware + serial_num).upper()
         if "570" in combined:
-            return "PPG570"
+            return "INFICON PPG570"
         if "550" in combined:
-            return "PPG550"
-        return "PPG family"
+            return "INFICON PPG550"
+        return "INFICON PPG"
 
     # ------------------------------------------------------------------
     # Pfeiffer identification
@@ -183,16 +183,22 @@ class PortScanner(QThread):
             parts.append(f"HW: {hw_ver}")
         desc = "  |  ".join(parts) if parts else "Pfeiffer device"
 
-        # Try to guess model from firmware string
+        # Identify model — INFICON makes all gauges; Pfeiffer makes the TC600 turbo
         fw_upper = firmware.upper()
-        if "BCG" in fw_upper:
-            model_hint = "BCG450"
-        elif "TC600" in fw_upper or "TC 600" in fw_upper:
-            model_hint = "TC600"
-        elif "PKR" in fw_upper or "IKR" in fw_upper or "TPR" in fw_upper:
-            model_hint = f"Pfeiffer {firmware[:6].strip()}"
+        if "TC600" in fw_upper or "TC 600" in fw_upper:
+            model_hint = "TC600 (Turbo)"
+        elif "BCG550" in fw_upper or "BCG552" in fw_upper:
+            model_hint = "INFICON BCG552"
+        elif "BCG" in fw_upper:
+            model_hint = "INFICON BCG450"
+        elif "BPG" in fw_upper:
+            model_hint = f"INFICON {firmware[:6].strip()}"
+        elif "MPG" in fw_upper or "MAG" in fw_upper:
+            model_hint = f"INFICON {firmware[:6].strip()}"
+        elif "PCG" in fw_upper or "PSG" in fw_upper or "OPG" in fw_upper:
+            model_hint = f"INFICON {firmware[:6].strip()}"
         else:
-            model_hint = "Pfeiffer ASCII"
+            model_hint = f"INFICON Gauge ({firmware[:6].strip()})" if firmware else "Unknown Pfeiffer ASCII"
 
         self.port_found.emit(port, desc, model_hint)
 
