@@ -225,7 +225,7 @@ class AddGaugeDialog(QDialog):
                 )
                 item.setData(Qt.ItemDataRole.UserRole, cmd_name)
                 self._cmd_list.addItem(item)
-                if cmd_name in ("pressure", "temperature", "combined_pressure"):
+                if cmd_name == "pressure":
                     item.setSelected(True)
 
         if spec.experimental:

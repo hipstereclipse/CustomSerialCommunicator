@@ -272,7 +272,10 @@ class PlotPanel(QWidget):
 
         # Disconnect old proxy before creating a new one
         if self._proxy is not None:
-            self._proxy.disconnect()
+            try:
+                self._proxy.disconnect()
+            except (AttributeError, RuntimeError):
+                pass
             self._proxy = None
 
         scene = self._glw.scene()

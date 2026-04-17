@@ -117,22 +117,24 @@ class PortScanner(QThread):
         sn_raw = self._read_until(ser, b"\\", 64)
         serial_num = self._ppg_data(sn_raw) if sn_raw and sn_raw.startswith(b"@ACK") else ""
 
-        # Try combined pressure first (PPG570), fall back to Pirani (PPG550)
+        # Try combined pressure first (PPG570-specific), fall back to Pirani (PPG550)
+        # Track whether PR1 got an ACK — this distinguishes PPG570 from PPG550
         pressure = ""
+        pr1_acked = False
         for probe in (_PPG_PR1, _PPG_PR3):
             ser.reset_input_buffer()
             ser.write(probe)
             pr_raw = self._read_until(ser, b"\\", 64)
             if pr_raw and pr_raw.startswith(b"@ACK"):
+                if probe is _PPG_PR1:
+                    pr1_acked = True
                 val = self._ppg_data(pr_raw)
-                # Accept if it looks numeric (not a status string)
                 try:
                     float(val)
                     pressure = val
-                    break
                 except ValueError:
                     pressure = val  # status like "UR" / "ATM" — still useful
-                    break
+                break
 
         # Build rich description
         parts: list[str] = []
@@ -144,7 +146,7 @@ class PortScanner(QThread):
             parts.append(f"P: {pressure} mbar")
         desc = "  |  ".join(parts) if parts else "PPG gauge"
 
-        model_hint = self._guess_ppg_model(firmware, serial_num)
+        model_hint = self._guess_ppg_model(firmware, serial_num, pr1_acked)
         self.port_found.emit(port, desc, model_hint)
 
     @staticmethod
@@ -153,13 +155,16 @@ class PortScanner(QThread):
         return raw[4:-1].decode("ascii", errors="replace").strip()
 
     @staticmethod
-    def _guess_ppg_model(firmware: str, serial_num: str) -> str:
+    def _guess_ppg_model(firmware: str, serial_num: str, pr1_acked: bool = False) -> str:
         combined = (firmware + serial_num).upper()
         if "570" in combined:
             return "INFICON PPG570"
         if "550" in combined:
             return "INFICON PPG550"
-        return "INFICON PPG"
+        # PR1 (combined Pirani+Piezo pressure) responds on PPG570 but not PPG550
+        if pr1_acked:
+            return "INFICON PPG570"
+        return "INFICON PPG550"
 
     # ------------------------------------------------------------------
     # Pfeiffer identification

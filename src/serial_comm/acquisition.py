@@ -157,6 +157,12 @@ class GaugeWorker(QThread):
                     if not recoverable:
                         return
                     self._sleep_interruptible(_ERROR_RETRY_DELAY)
+                except ValueError as exc:
+                    # build_request raised — command not in protocol table
+                    self._emit_error(f"Protocol error ({command}): {exc}", recoverable=True)
+                except Exception as exc:
+                    logger.exception("[%s] unexpected error polling %s", self._device_id, command)
+                    self._emit_error(f"Unexpected error ({command}): {exc}", recoverable=True)
 
             elapsed = time.monotonic() - cycle_start
             remaining = self._poll_interval - elapsed
@@ -210,7 +216,7 @@ class GaugeWorker(QThread):
             return header + rest
         if self._spec.protocol == "ppg_ascii":
             return transport.read_until(PPG_TERM)
-        if self._spec.protocol in ("pfeiffer_ascii",):
+        if self._spec.protocol in ("pfeiffer_ascii", "inficon_ascii"):
             return transport.read_until(PA_TERM)
         # CDG: fixed-length frame (handled in _run_continuous)
         return transport.read_bytes(RESPONSE_LENGTH)
@@ -315,7 +321,7 @@ class GaugeWorker(QThread):
         proto = self._protocol
         if self._spec.protocol == "ppg_ascii":
             return transport.read_until(PPG_TERM)
-        if self._spec.protocol == "pfeiffer_ascii":
+        if self._spec.protocol in ("pfeiffer_ascii", "inficon_ascii"):
             return transport.read_until(PA_TERM)
         if isinstance(proto, PfeifferBinaryProtocol):
             header = transport.read_bytes(4)
