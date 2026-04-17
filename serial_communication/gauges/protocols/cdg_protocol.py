@@ -34,7 +34,8 @@ class CDGProtocol(GaugeProtocol):
         4: "CDG200D"
     }
 
-    def __init__(self, address: int = 254, logger: Optional[object] = None):
+    def __init__(self, gauge_type: str = "CDG045D", address: int = 254, logger: Optional[object] = None):
+        self.gauge_type = gauge_type  # must be set before super().__init__ calls _initialize_commands
         super().__init__(address, logger)
         self.device_id = 0x00
         self._response_validation_enabled = True
@@ -47,9 +48,6 @@ class CDGProtocol(GaugeProtocol):
         Merges local 'special' commands with config-based commands from GAUGE_PARAMETERS,
         so none produce "Unknown command."
         """
-        if not hasattr(self, 'gauge_type'):
-            self.gauge_type = "CDG045D"
-
         # Load config-based commands
         gauge_params = GAUGE_PARAMETERS.get(self.gauge_type, {})
         config_cmds = gauge_params.get("commands", {})

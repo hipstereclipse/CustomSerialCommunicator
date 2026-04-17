@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional
 
 # Imports the base class for all protocols
 from serial_communication.gauges.protocols.gauge_protocol import GaugeProtocol
-from serial_communication.models import GaugeCommand
+from serial_communication.models import GaugeCommand, GaugeResponse
 from serial_communication.param_types import CommandDefinition, ParamType
 
 
@@ -78,7 +78,7 @@ class PCGProtocol(GaugeProtocol):
 
         return bytes(msg)
 
-    def parse_response(self, response: bytes) -> Dict[str, Any]:
+    def parse_response(self, response: bytes) -> GaugeResponse:
         """
         Verifies length, checks CRC, and interprets the data portion.
         The gauge typically returns a message structured similarly to the command frame.
@@ -106,42 +106,39 @@ class PCGProtocol(GaugeProtocol):
 
         # Extracts the data portion after the first 7 bytes, minus the last 2 for CRC
         data = response[7:-2]
-        return self._parse_data(pid, data)
+        return self._parse_data(pid, data, response)
 
-    def _parse_data(self, pid: int, data: bytes) -> Dict[str, Any]:
+    def _parse_data(self, pid: int, data: bytes, raw: bytes) -> GaugeResponse:
         """
         Interprets the 'data' bytes depending on which PID was used (e.g., read pressure).
         """
-        # Example for PID=221 => Pressure
         if pid == 221:
-            # Fixs32en20 means it's a 32-bit signed int, fraction is 2^20
+            # Fixs32en20: 32-bit signed fixed-point, fraction = 2^20
             value = int.from_bytes(data, byteorder='big', signed=True)
-            pressure = 10 ** (value / (2 ** 20))  # or other formula
-            return {"success": True, "pressure": pressure, "unit": "mbar"}
+            pressure = 10 ** (value / (2 ** 20))
+            return GaugeResponse(raw_data=raw, formatted_data=f"{pressure:.3E} mbar", success=True)
 
         elif pid == 222:
-            # Temperature, possibly stored as a float
             if len(data) == 4:
                 temp = struct.unpack('>f', data)[0]
-                return {"success": True, "temperature": temp, "unit": "C"}
+                return GaugeResponse(raw_data=raw, formatted_data=f"{temp:.1f} °C", success=True)
             else:
-                return {"success": True, "raw_data": data.hex()}
+                return GaugeResponse(raw_data=raw, formatted_data=data.hex(), success=True)
 
         elif pid == 228:
             error_flags = int.from_bytes(data, byteorder='big')
-            return {"success": True, "errors": self._parse_error_flags(error_flags)}
+            flags = self._parse_error_flags(error_flags)
+            active = [k for k, v in flags.items() if v] or ["none"]
+            return GaugeResponse(raw_data=raw, formatted_data=f"Errors: {', '.join(active)}", success=True)
 
-        return {"success": True, "raw_data": data.hex()}
+        return GaugeResponse(raw_data=raw, formatted_data=data.hex(), success=True)
 
     def _parse_error_flags(self, flags: int) -> Dict[str, bool]:
-        """
-        Decomposes error flags (bits) into a dictionary for interpretability.
-        """
         return {
             "sensor_error": bool(flags & 0x01),
             "electronics_error": bool(flags & 0x02),
             "calibration_error": bool(flags & 0x04),
-            "memory_error": bool(flags & 0x08)
+            "memory_error": bool(flags & 0x08),
         }
 
     def _encode_param(self, value: Any, param_type: Optional[ParamType]) -> bytes:
@@ -156,6 +153,6 @@ class PCGProtocol(GaugeProtocol):
             return struct.pack('>f', float(value))
         return bytes()
 
-    def _error_response(self, message: str) -> Dict[str, Any]:
+    def _error_response(self, message: str) -> GaugeResponse:
         self.logger.error(message)
-        return {"success": False, "error": message}
+        return GaugeResponse(raw_data=b"", formatted_data=f"Error: {message}", success=False, error_message=message)

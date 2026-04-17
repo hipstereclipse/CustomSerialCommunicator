@@ -42,7 +42,7 @@ def get_protocol(gauge_type: str, params: dict):
 
     # Capacitive
     elif gauge_type in ["CDG045D", "CDG025D"]:
-        return CDGProtocol()
+        return CDGProtocol(gauge_type=gauge_type)
 
     # Hot cathode
     elif gauge_type == "BPG40x":

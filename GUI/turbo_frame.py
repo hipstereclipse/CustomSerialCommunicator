@@ -133,7 +133,7 @@ class TurboFrame(ttk.Frame):
         refresh_btn.pack(side=tk.LEFT, padx=5)
 
         ttk.Label(row1, text="Turbo:").pack(side=tk.LEFT, padx=5)
-        turbo_list = ["TC600", "TC1200", "TC700"]
+        turbo_list = ["TC600"]  # TC1200/TC700 not yet supported; add to GAUGE_PARAMETERS before enabling
         self.turbo_combo = ttk.Combobox(
             row1,
             textvariable=self.selected_turbo,

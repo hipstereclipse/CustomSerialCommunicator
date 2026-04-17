@@ -9,6 +9,7 @@ Provides debugging controls:
 We preserve all existing methods, calling parent.set_show_debug(...) for toggling.
 """
 
+import ast
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable
@@ -118,7 +119,7 @@ class DebugFrame(ttk.LabelFrame):
             prefix, data = message.split(':', 1)
             data = data.strip()
             if data.startswith("b'") or data.startswith('b\"'):
-                data_bytes = eval(data)
+                data_bytes = ast.literal_eval(data)
             elif all(c in '0123456789ABCDEFabcdef ' for c in data):
                 data_bytes = bytes.fromhex(data.replace(' ', ''))
             else:
