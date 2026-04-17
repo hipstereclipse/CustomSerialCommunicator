@@ -1,0 +1,71 @@
+model: PPG570
+family: ppg_ascii
+protocol: ppg_ascii
+transport:
+  default_baud: 9600
+  parity: N
+  data_bits: 8
+  stop_bits: 1
+  rs_modes: [RS232, RS485]
+  default_address: 254
+  rs485_address_range: [1, 253]
+commands:
+  pressure:
+    mnemonic: PR3
+    read: true
+    write: false
+    unit: mbar
+    description: Pirani pressure measurement
+  atm_pressure:
+    mnemonic: PR4
+    read: true
+    write: false
+    unit: mbar
+    description: Atmospheric (piezo) pressure measurement
+  combined_pressure:
+    mnemonic: PR1
+    read: true
+    write: false
+    unit: mbar
+    description: Combined (best-sensor) pressure measurement
+  temperature:
+    mnemonic: T
+    read: true
+    write: false
+    unit: "°C"
+    description: Sensor temperature
+  software_version:
+    mnemonic: FV
+    read: true
+    write: false
+    description: Firmware version string
+  serial_number:
+    mnemonic: SN
+    read: true
+    write: false
+    description: Device serial number
+  unit:
+    mnemonic: U
+    read: true
+    write: true
+    description: Pressure unit selection
+  zero_adjust:
+    mnemonic: VAC
+    read: false
+    write: true
+    description: Execute Pirani zero adjustment (gauge at vacuum)
+  piezo_adjust:
+    mnemonic: FS
+    read: false
+    write: true
+    description: Execute piezo full-scale adjustment
+  atm_zero:
+    mnemonic: ATZ
+    read: false
+    write: true
+    description: Execute atmospheric zero adjustment
+  atm_full_scale:
+    mnemonic: ATD
+    read: false
+    write: true
+    description: Execute atmospheric full-scale adjustment

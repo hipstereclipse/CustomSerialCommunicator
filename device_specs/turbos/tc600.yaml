@@ -1,0 +1,175 @@
+model: TC600
+manufacturer: Pfeiffer Vacuum
+family: pfeiffer_ascii
+protocol: pfeiffer_ascii
+transport:
+  default_baud: 9600
+  parity: N
+  data_bits: 8
+  stop_bits: 1
+  rs_modes: [RS232, RS485]
+  default_address: 1
+  rs485_address_range: [1, 255]
+  rs485_group_address: 960
+commands:
+  standby:
+    pid: 2
+    read: true
+    write: true
+    data_type: boolean_old
+    description: Standby mode on/off
+  error_ack:
+    pid: 9
+    read: false
+    write: true
+    data_type: boolean_old
+    description: Acknowledge active error
+  pump_on:
+    pid: 10
+    read: true
+    write: true
+    data_type: boolean_old
+    description: Pumping station on/off
+  vent_enable:
+    pid: 12
+    read: true
+    write: true
+    data_type: boolean_old
+    description: Venting enable on/off
+  motor_on:
+    pid: 23
+    read: true
+    write: true
+    data_type: boolean_old
+    description: Turbopump motor on/off (TC600 only)
+  op_mode:
+    pid: 26
+    read: true
+    write: true
+    data_type: u_short_int
+    description: TMP operating mode
+    options:
+      - value: 0
+        label: Final speed
+      - value: 1
+        label: Speed setting
+  vent_mode:
+    pid: 30
+    read: true
+    write: true
+    data_type: u_short_int
+    description: Venting mode
+    options:
+      - value: 0
+        label: Automatic
+      - value: 1
+        label: No venting
+      - value: 2
+        label: Venting ON
+  error_code:
+    pid: 303
+    read: true
+    write: false
+    data_type: string
+    description: Current error/warning code (e.g. "Err001", "Wrn007", "no Err")
+  set_speed_hz:
+    pid: 308
+    read: true
+    write: false
+    data_type: u_integer
+    unit: Hz
+    description: Set rotation speed
+  actual_speed_hz:
+    pid: 309
+    read: true
+    write: false
+    data_type: u_integer
+    unit: Hz
+    description: Actual rotation speed
+  motor_current_A:
+    pid: 310
+    read: true
+    write: false
+    data_type: u_real
+    unit: A
+    description: Motor current
+  op_hours_TMP:
+    pid: 311
+    read: true
+    write: false
+    data_type: u_integer
+    unit: h
+    description: Turbopump operating hours
+  firmware:
+    pid: 312
+    read: true
+    write: false
+    data_type: string
+    description: Drive unit firmware version
+  final_speed_hz:
+    pid: 315
+    read: true
+    write: false
+    data_type: u_integer
+    unit: Hz
+    description: Nominal final rotation speed
+  motor_power_W:
+    pid: 316
+    read: true
+    write: false
+    data_type: u_integer
+    unit: W
+    description: Motor power consumption
+  runup_time_min:
+    pid: 700
+    read: true
+    write: true
+    data_type: u_integer
+    unit: min
+    min_value: 1
+    max_value: 120
+    description: Maximum run-up time
+  speed_setpoint_pct:
+    pid: 707
+    read: true
+    write: true
+    data_type: u_real
+    unit: "%"
+    min_value: 20.0
+    max_value: 100.0
+    description: Speed set value in speed-setting mode
+  standby_speed_pct:
+    pid: 717
+    read: true
+    write: true
+    data_type: u_integer
+    unit: "%"
+    min_value: 20
+    max_value: 100
+    description: Standby rotation speed set value
+  vent_freq_pct:
+    pid: 720
+    read: true
+    write: true
+    data_type: u_integer
+    unit: "%"
+    min_value: 40
+    max_value: 98
+    description: Venting frequency (% of final speed)
+  vent_time_s:
+    pid: 721
+    read: true
+    write: true
+    data_type: u_integer
+    unit: s
+    min_value: 6
+    max_value: 3600
+    description: Venting duration
+  rs485_address:
+    pid: 797
+    read: true
+    write: true
+    data_type: u_integer
+    min_value: 1
+    max_value: 255
+    description: RS-485 unit address

@@ -1,0 +1,45 @@
+model: OPG550
+family: pfeiffer_ascii
+protocol: pfeiffer_ascii
+experimental: true
+transport:
+  default_baud: 9600
+  parity: N
+  data_bits: 8
+  stop_bits: 1
+  rs_modes: [RS232, RS485]
+  default_address: 1
+  rs485_address_range: [1, 253]
+commands:
+  pressure:
+    pid: 340
+    read: true
+    write: false
+    data_type: u_expo_new
+    unit: mbar
+    description: Optical Pirani pressure measurement
+  software_version:
+    pid: 312
+    read: true
+    write: false
+    data_type: string
+    description: Firmware version
+  serial_number:
+    pid: 349
+    read: true
+    write: false
+    data_type: string
+    description: Device serial number
+  error_status:
+    pid: 303
+    read: true
+    write: false
+    data_type: string
+    description: Error code
+  temperature:
+    pid: 216
+    read: true
+    write: false
+    data_type: u_real
+    unit: "°C"
+    description: Sensor temperature

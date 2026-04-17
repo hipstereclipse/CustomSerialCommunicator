@@ -1,0 +1,52 @@
+model: BCG552
+family: pfeiffer_binary
+protocol: pfeiffer_binary
+transport:
+  default_baud: 9600
+  parity: N
+  data_bits: 8
+  stop_bits: 1
+  rs_modes: [RS232, RS485]
+  default_address: 0
+  rs485_address_range: [1, 255]
+device_id: 0x02
+pressure_enc: logfixs32en26
+commands:
+  pressure:
+    pid: 340
+    read: true
+    write: false
+    measurement: pressure
+    unit: mbar
+    description: Combination gauge pressure (BA + Pirani)
+  temperature:
+    pid: 216
+    read: true
+    write: false
+    measurement: temperature
+    unit: "°C"
+    description: Electronics temperature
+  emission_control:
+    pid: 10
+    read: true
+    write: true
+    data_type: boolean_old
+    description: BA emission on/off
+  software_version:
+    pid: 312
+    read: true
+    write: false
+    data_type: string
+    description: Firmware version
+  serial_number:
+    pid: 349
+    read: true
+    write: false
+    data_type: string
+    description: Device serial number
+  error_status:
+    pid: 303
+    read: true
+    write: false
+    data_type: string
+    description: Error code

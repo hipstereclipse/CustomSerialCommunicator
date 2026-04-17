@@ -1,0 +1,28 @@
+model: CDG045D
+family: cdg_serial
+protocol: cdg_serial
+transport:
+  default_baud: 9600
+  parity: N
+  data_bits: 8
+  stop_bits: 1
+  rs_modes: [RS232]
+  default_address: 0
+commands:
+  pressure:
+    read: true
+    write: false
+    unit: mbar
+    description: Capacitance diaphragm pressure (continuous output)
+  zero_adjust:
+    read: false
+    write: true
+    description: Execute zero offset adjustment
+  reset:
+    read: false
+    write: true
+    description: Power-cycle reset
+  factory_reset:
+    read: false
+    write: true
+    description: Restore factory defaults

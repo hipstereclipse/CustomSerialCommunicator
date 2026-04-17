@@ -1,0 +1,45 @@
+model: VGC40x
+family: pfeiffer_ascii
+protocol: pfeiffer_ascii
+experimental: true
+transport:
+  default_baud: 9600
+  parity: N
+  data_bits: 8
+  stop_bits: 1
+  rs_modes: [RS232, RS485]
+  default_address: 1
+  rs485_address_range: [1, 253]
+commands:
+  pressure_ch1:
+    pid: 340
+    read: true
+    write: false
+    data_type: u_expo_new
+    unit: mbar
+    description: Channel 1 pressure
+  pressure_ch2:
+    pid: 341
+    read: true
+    write: false
+    data_type: u_expo_new
+    unit: mbar
+    description: Channel 2 pressure
+  error_status:
+    pid: 303
+    read: true
+    write: false
+    data_type: string
+    description: Error code
+  software_version:
+    pid: 312
+    read: true
+    write: false
+    data_type: string
+    description: Firmware version
+  serial_number:
+    pid: 349
+    read: true
+    write: false
+    data_type: string
+    description: Device serial number

@@ -1,0 +1,47 @@
+model: PSG550
+family: pfeiffer_binary
+protocol: pfeiffer_binary
+transport:
+  default_baud: 9600
+  parity: N
+  data_bits: 8
+  stop_bits: 1
+  rs_modes: [RS232, RS485]
+  default_address: 0
+  rs485_address_range: [1, 255]
+device_id: 0x02
+pressure_enc: fixs32en20
+commands:
+  pressure:
+    pid: 221
+    read: true
+    write: false
+    measurement: pressure
+    unit: mbar
+    description: Pirani/Capacitive combined pressure
+  temperature:
+    pid: 222
+    read: true
+    write: false
+    measurement: temperature
+    unit: "°C"
+    description: Sensor temperature
+  software_version:
+    pid: 218
+    read: true
+    write: false
+    data_type: string
+    description: Firmware version
+  serial_number:
+    pid: 207
+    read: true
+    write: false
+    data_type: string
+    description: Device serial number
+  error_status:
+    pid: 228
+    read: true
+    write: false
+    measurement: error_flags
+    flag_names: [sensor_error, electronics_error, calibration_error, memory_error]
+    description: Error status bitmap

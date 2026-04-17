@@ -1,0 +1,106 @@
+model: BCG450
+family: pfeiffer_ascii
+protocol: pfeiffer_ascii
+transport:
+  default_baud: 9600
+  parity: N
+  data_bits: 8
+  stop_bits: 1
+  rs_modes: [RS232, RS485]
+  default_address: 1
+  rs485_address_range: [1, 253]
+commands:
+  pressure:
+    pid: 340
+    read: true
+    write: false
+    data_type: u_expo_new
+    unit: mbar
+    description: Active sensor pressure reading
+  gauge_factor:
+    pid: 342
+    read: true
+    write: true
+    data_type: u_real
+    description: Gas correction factor
+  sensor_status:
+    pid: 223
+    read: true
+    write: false
+    data_type: u_short_int
+    description: Active sensor status bitmap
+  emission_control:
+    pid: 10
+    read: true
+    write: true
+    data_type: boolean_old
+    description: BA emission on/off
+  emission_current:
+    pid: 222
+    read: true
+    write: true
+    data_type: u_expo
+    unit: mA
+    description: BA emission current
+  degas:
+    pid: 17
+    read: false
+    write: true
+    data_type: boolean_old
+    description: BA degas on/off
+  pressure_units:
+    pid: 130
+    read: true
+    write: true
+    data_type: u_short_int
+    description: Display pressure unit
+    options:
+      - value: 0
+        label: mbar
+      - value: 1
+        label: Torr
+      - value: 2
+        label: Pa
+  zero_adjust:
+    pid: 96
+    read: false
+    write: true
+    data_type: boolean_old
+    description: Execute CDG zero adjustment
+  gas_correction:
+    pid: 150
+    read: true
+    write: true
+    data_type: u_real
+    description: Pirani gas correction factor
+  error_status:
+    pid: 303
+    read: true
+    write: false
+    data_type: string
+    description: Error code string
+  temperature:
+    pid: 216
+    read: true
+    write: false
+    data_type: u_real
+    unit: "°C"
+    description: Sensor temperature
+  software_version:
+    pid: 312
+    read: true
+    write: false
+    data_type: string
+    description: Firmware version
+  serial_number:
+    pid: 349
+    read: true
+    write: false
+    data_type: string
+    description: Device serial number
+  rs485_address:
+    pid: 797
+    read: true
+    write: true
+    data_type: u_integer
+    description: RS-485 address

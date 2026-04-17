@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "serial-communicator"
+version = "2.0.0"
+description = "INFICON vacuum gauge and Pfeiffer turbo-pump serial communication suite"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial>=3.5",
+    "PyQt6>=6.6",
+    "pyqtgraph>=0.13",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "h5py>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-qt>=4.4",
+    "ruff>=0.4",
+    "mypy>=1.9",
+    "types-PyYAML",
+]
+
+[project.scripts]
+serial-comm = "gui.main_app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/serial_comm", "gui"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "gui", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "PTH", "SIM"]
+ignore = [
+    "B008",   # do not perform function calls in argument defaults
+    "SIM108", # ternary operators hurt readability in complex cases
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["serial_comm"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+exclude = ["tests/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
