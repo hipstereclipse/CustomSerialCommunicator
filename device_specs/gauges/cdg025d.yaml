@@ -2,6 +2,15 @@ model: CDG025D
 manufacturer: INFICON
 family: cdg_serial
 protocol: cdg_serial
+# Factory full-scale of the installed head in mbar.  CDG025D is offered in both
+# Torr-native heads (0.1, 1, 10, 100, 1000 Torr) and mbar-native heads
+# (0.1, 1, 10, 100, 1100 mbar) — these are distinct calibrations.
+# Change full_scale_mbar to match the actual head installed in your unit.
+full_scale_mbar: 1.333  # default: 1 Torr head (≈1.333 mbar)
+# Keep full_scale_options_mbar in sync with the heads actually available;
+# the simulation dialog uses cdg_full_scale_options() from simulation_models.py
+# for the canonical list, so this YAML field is used only by the CDG serial protocol driver.
+full_scale_options_mbar: [0.1, 0.13332, 1.0, 1.3332, 10.0, 13.332, 100.0, 133.32, 1100.0, 1333.22]
 transport:
   default_baud: 9600
   parity: N
@@ -14,11 +23,59 @@ commands:
     read: true
     write: false
     unit: mbar
-    description: Capacitance diaphragm pressure (continuous output)
+    description: Continuous pressure measurement (streamed)
+  cdg_type:
+    read: true
+    write: false
+    description: Query gauge full-scale / type code (byte 7 of response)
+  firmware:
+    read: true
+    write: false
+    description: Query firmware revision
+  serial_number:
+    read: true
+    write: false
+    description: Query gauge serial number
+  unit:
+    read: false
+    write: true
+    description: Set pressure unit (0=mbar, 1=Torr, 2=Pa)
+  setpoint_1_low:
+    read: false
+    write: true
+    description: Set Setpoint 1 lower threshold
+  setpoint_1_high:
+    read: false
+    write: true
+    description: Set Setpoint 1 upper threshold
+  setpoint_2_low:
+    read: false
+    write: true
+    description: Set Setpoint 2 lower threshold
+  setpoint_2_high:
+    read: false
+    write: true
+    description: Set Setpoint 2 upper threshold
+  setpoint_1_read:
+    read: true
+    write: false
+    description: Read Setpoint 1 thresholds
+  setpoint_2_read:
+    read: true
+    write: false
+    description: Read Setpoint 2 thresholds
   zero_adjust:
     read: false
     write: true
-    description: Execute zero offset adjustment
+    description: Execute zero-offset adjustment
+  fs_adjust:
+    read: false
+    write: true
+    description: Execute full-scale adjustment
+  clear_zero:
+    read: false
+    write: true
+    description: Clear user zero adjustment
   reset:
     read: false
     write: true

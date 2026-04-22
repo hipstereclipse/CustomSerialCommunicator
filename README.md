@@ -95,13 +95,8 @@ That guide includes:
 - The worker never raises protocol parse exceptions to the GUI; failures are emitted as `DeviceError` and retries continue until fatal thresholds are reached.
 - Some models are intentionally marked `experimental: true` while command coverage is still being validated against device firmware variants.
 - If a model connects but echoes request frames back unchanged, verify the instrument address, RS mode, baud/parity, and protocol selection in the spec.
-
-### CDG Full-Scale Heads (Important)
-
-- CDG models such as `CDG025D` and `CDG045D` can be sold in both Torr-native and mbar-native full-scale heads.
-- A head labeled `10 mbar` is a different calibration from `10 Torr` (about `13.33 mbar`). They are not interchangeable.
-- In simulation and YAML specs, always use the true installed head full-scale value (in mbar) for realistic saturation and analog scaling behavior.
-- The add-simulated-gauge dialog shows labeled choices so users can pick the exact native head calibration (for example `10 mbar` vs `10 Torr`).
+- CDG full-scale handling supports both Torr-native and mbar-native heads. Example: `10 mbar` and `10 Torr` are distinct factory calibrations, so keep `full_scale_mbar` set to the exact installed head.
+- Simulated pumpdown now uses a slower two-stage model (roughing then high-vac) and includes humidity (`Low`, `Medium`, `High`) as a multiplier on pumpdown time.
 
 ## Contributing
 

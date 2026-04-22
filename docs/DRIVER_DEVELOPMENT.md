@@ -74,14 +74,6 @@ commands:
 - `unit`, `description`: UI and diagnostics metadata.
 - `experimental`: optional, for incomplete/early support.
 
-### 3.4 CDG full-scale modeling notes
-
-- For CDG gauges, treat full-scale as a factory calibration property of the installed head.
-- Do not assume Torr-only conversion points. Some product lines are offered as both Torr-native and mbar-native heads.
-- Example: `10 mbar` and `10 Torr` are distinct options (`10 Torr` is about `13.33 mbar`).
-- Keep `full_scale_mbar` set to the actual installed head value.
-- If `full_scale_options_mbar` is present, include all supported native options for that model to avoid incorrect simulation saturation and scaling.
-
 ## 4. Add A New Protocol Codec (When Needed)
 
 ### 4.1 Create new codec module
@@ -196,6 +188,20 @@ Mitigation:
 
 - Ensure UI catches setup exceptions before worker startup.
 - Use graceful stop and wait in disconnect path.
+
+### 8.4 CDG full-scale mismatch (Torr vs mbar)
+
+Symptom: CDG readings are scaled incorrectly by about 1.333x or 0.75x.
+
+Likely cause:
+
+- `full_scale_mbar` does not match the installed CDG head calibration.
+- Assuming `10 Torr` and `10 mbar` are equivalent (they are not).
+
+Mitigation:
+
+- Set YAML `full_scale_mbar` to the exact factory full-scale of the installed head.
+- Keep option lists explicit about units when presenting choices in UI.
 
 ## 9. Versioning New Drivers Safely
 
