@@ -96,6 +96,13 @@ That guide includes:
 - Some models are intentionally marked `experimental: true` while command coverage is still being validated against device firmware variants.
 - If a model connects but echoes request frames back unchanged, verify the instrument address, RS mode, baud/parity, and protocol selection in the spec.
 
+### CDG Full-Scale Heads (Important)
+
+- CDG models such as `CDG025D` and `CDG045D` can be sold in both Torr-native and mbar-native full-scale heads.
+- A head labeled `10 mbar` is a different calibration from `10 Torr` (about `13.33 mbar`). They are not interchangeable.
+- In simulation and YAML specs, always use the true installed head full-scale value (in mbar) for realistic saturation and analog scaling behavior.
+- The add-simulated-gauge dialog shows labeled choices so users can pick the exact native head calibration (for example `10 mbar` vs `10 Torr`).
+
 ## Contributing
 
 1. Create a branch from your working branch.
