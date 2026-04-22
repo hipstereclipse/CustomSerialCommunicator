@@ -105,7 +105,13 @@ class DeviceRegistry:
 
         if spec.protocol == "cdg_serial":
             from serial_comm.protocols.cdg_serial import CDGProtocol
-            return CDGProtocol(gauge_type=spec.model, address=addr)
+            raw_extra = spec.__dict__.get("_raw_extra", {})
+            full_scale = raw_extra.get("full_scale_mbar", 1.0)
+            return CDGProtocol(
+                gauge_type=spec.model,
+                address=addr,
+                full_scale_mbar=float(full_scale),
+            )
 
         raise ValueError(f"Unknown protocol '{spec.protocol}' for model '{spec.model}'")
 

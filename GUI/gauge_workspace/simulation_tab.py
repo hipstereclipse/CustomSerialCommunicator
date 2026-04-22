@@ -32,6 +32,7 @@ from serial_comm.simulation_models import (
     SimulatedGaugeConfig,
     SimulationPattern,
 )
+from serial_comm.simulation_scenarios import SCENARIOS, scenario_by_key
 from serial_comm.units import convert_pressure, format_pressure
 
 from GUI.gauge_workspace.recipe_editor import RecipeEditorWidget
@@ -123,6 +124,20 @@ class SimulationControlTab(QWidget):
         self._pattern_combo.addItems([p.value for p in SimulationPattern])
         ctrl_layout.addWidget(self._pattern_combo)
 
+        ctrl_layout.addWidget(QLabel("Profile:"))
+        self._scenario_combo = QComboBox()
+        self._scenario_combo.addItem("Manual", "")
+        for scenario in SCENARIOS:
+            self._scenario_combo.addItem(scenario.title, scenario.key)
+        self._scenario_combo.setToolTip(
+            "Apply a realistic simulation envelope preset for common vacuum operations"
+        )
+        ctrl_layout.addWidget(self._scenario_combo)
+
+        self._apply_profile_btn = QPushButton("Apply")
+        self._apply_profile_btn.setStyleSheet(_button_style())
+        ctrl_layout.addWidget(self._apply_profile_btn)
+
         self._restart_btn = QPushButton("Restart")
         self._pause_btn = QPushButton("Pause")
         for b in (self._restart_btn, self._pause_btn):
@@ -187,6 +202,7 @@ class SimulationControlTab(QWidget):
 
     def _wire(self) -> None:
         self._pattern_combo.currentTextChanged.connect(self._on_pattern_changed)
+        self._apply_profile_btn.clicked.connect(self._on_apply_profile)
         self._restart_btn.clicked.connect(self._on_restart)
         self._pause_btn.clicked.connect(self._on_pause_toggle)
         self._gas_combo.currentIndexChanged.connect(self._on_gas_changed)
@@ -199,6 +215,10 @@ class SimulationControlTab(QWidget):
 
     def _on_pattern_changed(self, text: str) -> None:
         pattern = SimulationPattern(text)
+        if self._scenario_combo.currentIndex() != 0:
+            self._scenario_combo.blockSignals(True)
+            self._scenario_combo.setCurrentIndex(0)
+            self._scenario_combo.blockSignals(False)
         if pattern is SimulationPattern.CUSTOM:
             self._engine.set_pattern(
                 pattern,
@@ -211,6 +231,30 @@ class SimulationControlTab(QWidget):
 
     def _on_restart(self) -> None:
         self._engine.restart()
+        self.refresh()
+
+    def _on_apply_profile(self) -> None:
+        key = str(self._scenario_combo.currentData() or "")
+        scenario = scenario_by_key(key)
+        if scenario is None:
+            return
+
+        self._engine.set_pattern(
+            scenario.pattern,
+            base_pressure_mbar=scenario.base_pressure_mbar,
+            leak_rate_mbar_l_s=scenario.leak_rate_mbar_l_s,
+            recipe_steps=list(scenario.recipe_steps) if scenario.recipe_steps else None,
+            reset_clock=True,
+        )
+        self._engine.set_gas(scenario.gas)
+        self._engine.set_humidity(scenario.humidity)
+
+        if scenario.recipe_steps:
+            self._recipe_editor.blockSignals(True)
+            try:
+                self._recipe_editor.set_steps(list(scenario.recipe_steps))
+            finally:
+                self._recipe_editor.blockSignals(False)
         self.refresh()
 
     def _on_pause_toggle(self) -> None:

@@ -1,0 +1,33 @@
+model: HPG400
+manufacturer: INFICON
+family: cdg_serial
+protocol: cdg_serial
+experimental: true
+# HPG400 uses the same 9-byte SKY serial frame structure (sync 0x07, checksum)
+# as CDG-series gauges. Adjust full_scale_mbar to match the installed head.
+full_scale_mbar: 1333.22
+transport:
+  default_baud: 9600
+  parity: N
+  data_bits: 8
+  stop_bits: 1
+  rs_modes: [RS232]
+  default_address: 0
+commands:
+  pressure:
+    read: true
+    write: false
+    unit: mbar
+    description: Continuous pressure measurement (streamed)
+  cdg_type:
+    read: true
+    write: false
+    description: Query gauge type / range code
+  firmware:
+    read: true
+    write: false
+    description: Query firmware revision
+  serial_number:
+    read: true
+    write: false
+    description: Query gauge serial number

@@ -1,40 +1,162 @@
 # Custom Serial Communicator
 
-Desktop application and Python library for connecting to vacuum instruments over serial links (RS-232 / RS-485), polling measurements, and visualizing data in real time.
+Custom Serial Communicator is a desktop application and Python runtime for interacting with vacuum gauges and turbo controllers over serial transport. It is designed for lab and production environments where users need consistent device configuration, live monitoring, protocol-level visibility, and repeatable data capture.
 
-## What This Project Does
+The project combines:
 
-- Connects to supported gauges and turbo controllers through a serial COM port.
-- Uses protocol codecs to build request frames and parse responses.
-- Loads instrument capabilities from YAML specs (model-specific commands, transport defaults, address ranges).
-- Streams measurements to a PyQt-based GUI with live plots and terminal-style diagnostics.
+- A PyQt GUI for day-to-day operation.
+- A registry-driven driver layer (YAML specs + protocol codecs).
+- Real and simulated acquisition workers for testing and training.
+- Session persistence and data export tooling.
 
-## Current Device Coverage
+## Core Capabilities
 
-- Gauge and controller specs: [device_specs/gauges](device_specs/gauges)
+- Connect to serial devices over RS-232 and RS-485.
+- Auto-scan COM ports and identify responsive instruments.
+- Select one or many scanned gauges and add them in a single action.
+- Automatically map scanned gauges to the right model configuration.
+- Poll one or multiple commands per device on a configurable interval.
+- Display data in per-device tabs and combined multi-gauge dashboards.
+- Open a dedicated turbo controller workspace for TC600-family workflows.
+- Run realistic simulation scenarios with configurable leak/humidity/recipes.
+- Save and restore sessions, including real and simulated devices.
+- Export captured readings for external analysis.
+
+## High-Level Architecture
+
+### Application Entry
+
+- GUI startup: [main.py](main.py)
+- Main window orchestration: [GUI/main_window.py](GUI/main_window.py)
+- App bootstrap and Qt wiring: [GUI/main_app.py](GUI/main_app.py)
+
+### Device Description and Driver Resolution
+
+- Gauge specs: [device_specs/gauges](device_specs/gauges)
 - Turbo specs: [device_specs/turbos](device_specs/turbos)
-- Runtime protocol implementations: [src/serial_comm/protocols](src/serial_comm/protocols)
-- Turbo worker/protocol layer: [src/serial_comm/turbos](src/serial_comm/turbos)
+- Spec loader and protocol factory: [src/serial_comm/device_registry.py](src/serial_comm/device_registry.py)
 
-INFICON gauge/controller labels are represented in specs via `manufacturer`, `family`, and `protocol` fields. Turbo controllers such as TC600 remain under Pfeiffer protocol handling.
+Specs define transport defaults, command metadata, protocol family, address constraints, and whether support is experimental.
 
-## Architecture Overview
+### Runtime Protocol Layer
 
-- Registry and spec loading: [src/serial_comm/device_registry.py](src/serial_comm/device_registry.py)
-- Worker/polling loop and frame read strategy: [src/serial_comm/acquisition.py](src/serial_comm/acquisition.py)
-- Protocol contract: [src/serial_comm/protocols/base.py](src/serial_comm/protocols/base.py)
-- GUI entrypoint: [main.py](main.py)
+- Protocol interface contract: [src/serial_comm/protocols/base.py](src/serial_comm/protocols/base.py)
+- PPG ASCII protocol: [src/serial_comm/protocols/ppg_ascii.py](src/serial_comm/protocols/ppg_ascii.py)
+- Pfeiffer ASCII protocol: [src/serial_comm/protocols/pfeiffer_ascii.py](src/serial_comm/protocols/pfeiffer_ascii.py)
+- Pfeiffer binary protocol: [src/serial_comm/protocols/pfeiffer_binary.py](src/serial_comm/protocols/pfeiffer_binary.py)
+- CDG serial protocol: [src/serial_comm/protocols/cdg_serial.py](src/serial_comm/protocols/cdg_serial.py)
 
-Flow:
+### Acquisition and Transport
 
-1. A YAML model spec is selected.
-2. `DeviceRegistry` resolves the spec and instantiates the protocol codec.
-3. `GaugeWorker` opens serial transport and polls configured commands.
-4. Parsed readings are emitted as Qt signals to GUI tabs.
+- Worker lifecycle and polling loop: [src/serial_comm/acquisition.py](src/serial_comm/acquisition.py)
+- Serial transport configuration: [src/serial_comm/transport.py](src/serial_comm/transport.py)
+- Shared runtime models: [src/serial_comm/models.py](src/serial_comm/models.py)
 
-## Quick Start
+### Simulation Subsystem
 
-### 1) Create and activate virtual environment
+- Simulation engine: [src/serial_comm/simulation_engine.py](src/serial_comm/simulation_engine.py)
+- Simulation worker: [src/serial_comm/simulated_worker.py](src/serial_comm/simulated_worker.py)
+- Simulation data models: [src/serial_comm/simulation_models.py](src/serial_comm/simulation_models.py)
+- Scenario catalog: [src/serial_comm/simulation_scenarios.py](src/serial_comm/simulation_scenarios.py)
+
+## How the Program Works
+
+At runtime, the application follows this path:
+
+1. You add a gauge manually or via COM scan.
+2. The selected model resolves to a YAML spec in the registry.
+3. The registry creates the matching protocol codec.
+4. A worker opens the serial transport using spec/override settings.
+5. The worker polls configured commands and parses responses.
+6. Parsed `GaugeReading` values are emitted to GUI tabs and combined plots.
+7. Errors are reported as `DeviceError` events without crashing UI threads.
+
+This separation keeps model-specific behavior in specs/codecs, while GUI code remains focused on visualization and operator workflow.
+
+## GUI Workspaces and Workflow
+
+### Main Workspace
+
+The main workspace is managed by [GUI/main_window.py](GUI/main_window.py) and includes:
+
+- Device list panel.
+- Add gauge / simulate / turbo actions.
+- Per-gauge tabs with values and terminal output.
+- Combined real-gauge plot tab.
+
+### Add Gauge Dialog
+
+The add dialog in [GUI/gauge_workspace/add_gauge_dialog.py](GUI/gauge_workspace/add_gauge_dialog.py) supports:
+
+- Model selection (stable + experimental).
+- COM port selection with refresh.
+- Background COM scan using [GUI/gauge_workspace/port_scanner.py](GUI/gauge_workspace/port_scanner.py).
+- Multi-select scan results so multiple gauges can be connected at once.
+- Automatic model/port alignment when selecting scanned items.
+- Advanced transport settings (baud, RS mode, address).
+- Command selection for polling and interval tuning.
+
+### Scan Intelligence
+
+The scanner actively probes protocols and emits structured metadata (not just a display string). This enables smarter model/config resolution:
+
+- CDG family devices use explicit type/range probing and frame validation.
+- CDG model mapping avoids unsafe assumptions from sensor code alone.
+- Full-scale hints are propagated to configuration when confidence is sufficient.
+- PPG550 and PPG570 are offered as a combined selection to avoid false split-identification while preserving compatibility.
+- TC600 detections are routed to the dedicated turbo workflow.
+
+## Device Families and Protocol Notes
+
+### PPG Series
+
+- Supports ASCII command/response workflows with ACK/NAK handling.
+- Handles both `@ACK...` and address-prefixed ACK variants.
+- Includes pressure mnemonic fallback behavior for firmware variants.
+
+### CDG/HPG Serial Family
+
+- Uses fixed-length binary frames with checksums.
+- Pressure values are interpreted via full-scale calibration metadata.
+- Distinguishes model hinting from range/type encoding to reduce misidentification.
+
+### Pfeiffer ASCII/Binary Families
+
+- Uses frame validation and checksum parsing per protocol family.
+- Supports model-specific parameter tables from YAML specs.
+
+### Turbo Controllers
+
+- TC600 workflows are separated under turbo workspace components in [GUI/turbo_workspace](GUI/turbo_workspace) and runtime support in [src/serial_comm/turbos](src/serial_comm/turbos).
+
+## Simulation Functionality
+
+Simulation is first-class and designed for realistic operator practice and UI testing:
+
+- Add simulated gauges from [GUI/gauge_workspace/add_simulated_gauge_dialog.py](GUI/gauge_workspace/add_simulated_gauge_dialog.py).
+- Control and monitor simulated systems in [GUI/gauge_workspace/simulation_tab.py](GUI/gauge_workspace/simulation_tab.py).
+- Run recipe-driven and scenario-driven pressure dynamics.
+- Use humidity, gas type, leak-rate, and base-pressure inputs.
+- Plot simulated gauges in a dedicated combined simulation view.
+
+## Data Views and Plotting
+
+- Per-gauge live views: [GUI/gauge_workspace/gauge_tab.py](GUI/gauge_workspace/gauge_tab.py)
+- Combined plotting controls: [GUI/gauge_workspace/combined_tab.py](GUI/gauge_workspace/combined_tab.py)
+- In-app terminal traffic viewer: [GUI/gauge_workspace/terminal_widget.py](GUI/gauge_workspace/terminal_widget.py)
+
+Combined plotting supports overlay/stacked/grid layouts, visibility toggles, per-device color assignment, and synchronized chart navigation.
+
+## Session and Export
+
+- Session save/load model: [src/serial_comm/session.py](src/serial_comm/session.py)
+- Export UI: [GUI/gauge_workspace/export_dialog.py](GUI/gauge_workspace/export_dialog.py)
+
+Sessions preserve model/port/protocol settings and can restore multiple gauges and simulated devices in one operation.
+
+## Installation and Quick Start
+
+### 1) Create and activate a virtual environment
 
 Windows PowerShell:
 
@@ -56,52 +178,75 @@ source .venv/Scripts/activate
 pip install -e .
 ```
 
-### 3) Run application
+### 3) Launch the app
 
 ```bash
 python main.py
 ```
 
-## Test Suite
+## Testing
 
-Run all tests:
+Run full tests:
 
 ```bash
 python -m pytest -q
 ```
 
-Run focused registry/protocol tests:
+Run focused protocol and registry tests:
 
 ```bash
-python -m pytest tests/test_device_registry.py -q
+python -m pytest tests/test_cdg_serial.py tests/test_ppg_ascii.py tests/test_device_registry.py -q
 ```
 
-## Add New Instrument Drivers
+## Driver Development
 
-See the full developer guide:
+For adding or extending drivers, use:
 
 - [docs/DRIVER_DEVELOPMENT.md](docs/DRIVER_DEVELOPMENT.md)
 
-That guide includes:
+That guide covers:
 
-- Decision tree for adding a model with no code vs new protocol codec.
-- End-to-end steps to add gauge, controller, or turbo models.
-- YAML schema and protocol field reference.
-- Validation checklist and common failure patterns.
-- Example templates for ASCII and binary protocols.
+- When to add YAML only vs new codec code.
+- Spec schema fields and command metadata.
+- Protocol-specific implementation patterns.
+- Validation strategy and troubleshooting checklists.
 
-## Practical Notes
+## Troubleshooting Guide
 
-- The worker never raises protocol parse exceptions to the GUI; failures are emitted as `DeviceError` and retries continue until fatal thresholds are reached.
-- Some models are intentionally marked `experimental: true` while command coverage is still being validated against device firmware variants.
-- If a model connects but echoes request frames back unchanged, verify the instrument address, RS mode, baud/parity, and protocol selection in the spec.
-- CDG full-scale handling supports both Torr-native and mbar-native heads. Example: `10 mbar` and `10 Torr` are distinct factory calibrations, so keep `full_scale_mbar` set to the exact installed head.
-- Simulated pumpdown now uses a slower two-stage model (roughing then high-vac) and includes humidity (`Low`, `Medium`, `High`) as a multiplier on pumpdown time.
+### Device is found but values are wrong
+
+- Verify selected model and protocol family.
+- For CDG/HPG class devices, verify configured full-scale exactly matches installed head calibration.
+- Confirm units and command selection in the add dialog.
+
+### Device echoes requests but does not respond
+
+- Check RS mode and address assumptions.
+- Validate baud/parity/data bits/stop bits.
+- Verify physical wiring and half-duplex bus behavior for RS-485.
+
+### Scan identifies model family but not exact variant
+
+- This can happen with protocol-compatible or range-encoded families.
+- Use scan result metadata and manually select exact model if needed.
+- Keep specs updated as firmware-specific distinctions are confirmed.
+
+### Intermittent parse errors
+
+- Review terminal traffic for framing/terminator mismatches.
+- Increase timeout cautiously for slower devices.
+- Validate that command mnemonics align with device firmware revision.
+
+## Practical Engineering Notes
+
+- Worker threads isolate transport/protocol failures from UI threads.
+- Experimental models remain available but visually marked for caution.
+- Protocol parsing is defensive and returns structured error readings rather than hard-failing acquisition loops.
+- The design intentionally favors robust long-running sessions over strict fail-fast behavior.
 
 ## Contributing
 
-1. Create a branch from your working branch.
-2. Add or update specs/protocol code.
-3. Add tests for new behavior.
-4. Run the test suite.
-5. Open a pull request with serial log samples if available.
+1. Create a branch from your current working branch.
+2. Implement feature or fix with tests.
+3. Run target and full test suites.
+4. Include protocol logs or reproduction notes in PRs when behavior is device/firmware-dependent.

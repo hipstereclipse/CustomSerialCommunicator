@@ -16,6 +16,7 @@ Features:
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 
 import serial.tools.list_ports
 from PyQt6.QtCore import Qt, pyqtSlot
@@ -33,6 +34,9 @@ from GUI.gauge_workspace.port_scanner import PortScanner
 logger = logging.getLogger(__name__)
 
 _BAUD_RATES = ["1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200"]
+_MODEL_ALIASES = {
+    "PPG550/570": "PPG570",
+}
 
 
 class AddGaugeDialog(QDialog):
@@ -91,9 +95,10 @@ class AddGaugeDialog(QDialog):
         layout.addWidget(self._scan_status)
 
         self._scan_list = QListWidget()
+        self._scan_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._scan_list.setMaximumHeight(90)
         self._scan_list.hide()
-        self._scan_list.itemClicked.connect(self._on_scan_result_clicked)
+        self._scan_list.itemSelectionChanged.connect(self._on_scan_selection_changed)
         layout.addWidget(self._scan_list)
 
         # ── Advanced settings (collapsible) ──
@@ -180,8 +185,10 @@ class AddGaugeDialog(QDialog):
         self._model_combo.clear()
         for m in models:
             self._model_combo.addItem(m)
+        # Combined selector for protocol-compatible PPG models.
+        self._model_combo.addItem("PPG550/570")
         if exp:
-            self._model_combo.insertSeparator(len(models))
+            self._model_combo.insertSeparator(self._model_combo.count())
             for m in exp:
                 self._model_combo.addItem(f"{m} (experimental)")
         if models:
@@ -197,6 +204,7 @@ class AddGaugeDialog(QDialog):
 
     def _on_model_changed(self, text: str) -> None:
         model = text.replace(" (experimental)", "")
+        model = _MODEL_ALIASES.get(model, model)
         try:
             self._spec = self._registry.get_spec(model)
         except Exception:
@@ -225,7 +233,7 @@ class AddGaugeDialog(QDialog):
                 )
                 item.setData(Qt.ItemDataRole.UserRole, cmd_name)
                 self._cmd_list.addItem(item)
-                if cmd_name == "pressure":
+                if cmd_name == "pressure" or spec.model.upper() == "OPG550":
                     item.setSelected(True)
 
         if spec.experimental:
@@ -267,10 +275,9 @@ class AddGaugeDialog(QDialog):
 
     @pyqtSlot()
     def _on_scan(self) -> None:
-        # Stop any previous scan
-        if self._scanner and self._scanner.isRunning():
-            self._scanner.requestInterruption()
-            self._scanner.wait(2000)
+        # Stop any previous scan (and disconnect its signals so stale
+        # 'scan_complete' events don't race with a new scan).
+        self._stop_scanner()
 
         ports = [p.device for p in serial.tools.list_ports.comports()]
         if not ports:
@@ -289,11 +296,16 @@ class AddGaugeDialog(QDialog):
         self._scanner.scan_complete.connect(self._on_scan_complete)
         self._scanner.start()
 
-    @pyqtSlot(str, str, str)
-    def _on_port_found(self, port: str, description: str, model_hint: str) -> None:
+    @pyqtSlot(str, str, str, object)
+    def _on_port_found(self, port: str, description: str, model_hint: str, metadata: object) -> None:
         short_desc = description[:50].strip()
         item = QListWidgetItem(f"{port}  [{model_hint}]  {short_desc}")
-        item.setData(Qt.ItemDataRole.UserRole, (port, model_hint))
+        payload = {
+            "port": port,
+            "model_hint": model_hint,
+            "metadata": metadata if isinstance(metadata, dict) else {},
+        }
+        item.setData(Qt.ItemDataRole.UserRole, payload)
         self._scan_list.addItem(item)
 
     @pyqtSlot()
@@ -306,15 +318,57 @@ class AddGaugeDialog(QDialog):
             self._scan_status.setText("Scan complete — no devices found.")
         else:
             n = self._scan_list.count()
-            self._scan_status.setText(f"Scan complete — {n} device(s) found. Click to select.")
+            self._scan_status.setText(
+                f"Scan complete — {n} device(s) found. Select one or more, then click OK."
+            )
+
+    @pyqtSlot()
+    def _on_scan_selection_changed(self) -> None:
+        selected = self._scan_list.selectedItems()
+        if not selected:
+            return
+        self._apply_scan_item(selected[0])
+
+    def _resolve_model_hint(self, model_hint: str, metadata: dict | None = None) -> str | None:
+        hint_upper = (model_hint or "").upper().replace("INFICON", "").strip()
+        metadata = metadata or {}
+        explicit = str(metadata.get("model", "")).strip().upper()
+        if explicit == "PPG550/570" or "PPG550/570" in hint_upper:
+            return "PPG550/570"
+
+        for i in range(self._model_combo.count()):
+            item_text = self._model_combo.itemText(i)
+            item_upper = item_text.upper()
+            if not item_text or "---" in item_text:
+                continue
+            if explicit and explicit in item_upper:
+                return item_text
+            if hint_upper and hint_upper in item_upper:
+                return item_text
+
+        tokens = [t for t in hint_upper.replace("/", " ").split() if t]
+        for token in tokens:
+            for i in range(self._model_combo.count()):
+                item_text = self._model_combo.itemText(i)
+                if token and token in item_text.upper():
+                    return item_text
+        return None
 
     @pyqtSlot(QListWidgetItem)
-    def _on_scan_result_clicked(self, item: QListWidgetItem) -> None:
+    def _apply_scan_item(self, item: QListWidgetItem) -> None:
         from PyQt6.QtWidgets import QMessageBox
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if not data:
+        try:
+            data = item.data(Qt.ItemDataRole.UserRole)
+        except Exception:
+            logger.exception("Failed to read scan-result data")
             return
-        port, model_hint = data
+        if not data or not isinstance(data, dict):
+            return
+        port = str(data.get("port", ""))
+        model_hint = str(data.get("model_hint", ""))
+        metadata = data.get("metadata", {}) if isinstance(data.get("metadata", {}), dict) else {}
+        if not port:
+            return
 
         # TC600 is a Pfeiffer turbo — not a gauge
         if "TC600" in model_hint.upper() or "(TURBO)" in model_hint.upper():
@@ -334,45 +388,159 @@ class AddGaugeDialog(QDialog):
             self._port_combo.insertItem(0, port)
             self._port_combo.setCurrentIndex(0)
 
-        # Strip "INFICON " prefix, then match by scanning tokens against the model list.
-        # e.g. "INFICON PPG570" → try to match "PPG570" then "PPG" in the combo.
-        hint_clean = model_hint.upper().replace("INFICON", "").strip()
-        tokens = [t for t in hint_clean.split() if t]
+        matched = self._resolve_model_hint(model_hint, metadata)
+        if matched:
+            idx = self._model_combo.findText(matched)
+            if idx >= 0:
+                self._model_combo.setCurrentIndex(idx)
 
-        for token in tokens:
-            for i in range(self._model_combo.count()):
-                if token in self._model_combo.itemText(i).upper():
-                    self._model_combo.setCurrentIndex(i)
-                    return
+    def _clone_spec_with_scan_overrides(self, spec: DeviceSpec, metadata: dict) -> DeviceSpec:
+        full_scale = metadata.get("full_scale_mbar")
+        if full_scale is None:
+            return spec
+        try:
+            fs = float(full_scale)
+        except (TypeError, ValueError):
+            return spec
+        if fs <= 0:
+            return spec
+
+        spec_copy = deepcopy(spec)
+        raw_extra = dict(spec_copy.__dict__.get("_raw_extra", {}))
+        raw_extra["full_scale_mbar"] = fs
+        spec_copy.__dict__["_raw_extra"] = raw_extra
+        return spec_copy
+
+    def _build_config_for(
+        self,
+        model_display: str,
+        port: str,
+        metadata: dict | None = None,
+    ) -> dict | None:
+        metadata = metadata or {}
+        model_name = _MODEL_ALIASES.get(model_display, model_display)
+        try:
+            spec = self._registry.get_spec(model_name)
+        except Exception:
+            logger.exception("Unknown model in scanned selection: %s", model_display)
+            return None
+
+        spec = self._clone_spec_with_scan_overrides(spec, metadata)
+
+        selected_cmds = [
+            item.data(Qt.ItemDataRole.UserRole)
+            for item in self._cmd_list.selectedItems()
+        ]
+        selected_cmds = [c for c in selected_cmds if c and c in spec.commands and spec.commands[c].read]
+        if not selected_cmds:
+            selected_cmds = [name for name, cmd in spec.commands.items() if cmd.read]
+
+        try:
+            baud = int(self._baud_combo.currentText())
+        except (TypeError, ValueError):
+            baud = spec.default_baud
+
+        address = self._address_spin.value()
+        protocol = self._registry.make_protocol(spec, address=address)
+        return {
+            "spec": spec,
+            "protocol": protocol,
+            "port": port,
+            "commands": selected_cmds,
+            "poll_interval": float(self._interval_spin.value()),
+            "baud_override": baud,
+            "rs485_enabled": self._rs485_radio.isChecked(),
+        }
+
+    def result_configs(self) -> list[dict]:
+        configs: list[dict] = []
+
+        selected = self._scan_list.selectedItems()
+        if selected:
+            seen_ports: set[str] = set()
+            for item in selected:
+                data = item.data(Qt.ItemDataRole.UserRole)
+                if not isinstance(data, dict):
+                    continue
+                port = str(data.get("port", "")).strip()
+                if not port or port in seen_ports:
+                    continue
+                seen_ports.add(port)
+
+                model_hint = str(data.get("model_hint", "")).strip()
+                metadata = data.get("metadata", {}) if isinstance(data.get("metadata", {}), dict) else {}
+                model_display = self._resolve_model_hint(model_hint, metadata)
+                if not model_display:
+                    model_display = self._model_combo.currentText().replace(" (experimental)", "")
+
+                cfg = self._build_config_for(model_display, port, metadata)
+                if cfg:
+                    configs.append(cfg)
+
+            if configs:
+                return configs
+
+        # Fallback: single manual config from combo selections.
+        model_display = self._model_combo.currentText().replace(" (experimental)", "")
+        port = self._port_combo.currentText().strip()
+        if not port or port.startswith("("):
+            return []
+        cfg = self._build_config_for(model_display, port)
+        return [cfg] if cfg else []
 
     # ------------------------------------------------------------------
     # Result
     # ------------------------------------------------------------------
 
     def result_config(self) -> dict | None:
-        if self._spec is None:
+        try:
+            configs = self.result_configs()
+            return configs[0] if configs else None
+        except Exception:
+            logger.exception("Failed to build gauge connection config")
             return None
 
-        model_text = self._model_combo.currentText()
-        model = model_text.replace(" (experimental)", "")
-        spec = self._spec
+    # ------------------------------------------------------------------
+    # Cleanup: make sure the scanner QThread is fully stopped before the
+    # dialog is destroyed.  Without this, closing the dialog while a scan is
+    # still running produces  "QThread: Destroyed while thread is still
+    # running"  and can crash the process on Windows.
+    # ------------------------------------------------------------------
 
-        selected_cmds = [
-            item.data(Qt.ItemDataRole.UserRole)
-            for item in self._cmd_list.selectedItems()
-        ]
-        if not selected_cmds:
-            selected_cmds = [n for n, c in spec.commands.items() if c.read]
+    def _stop_scanner(self) -> None:
+        sc = self._scanner
+        if sc is None:
+            return
+        # Disconnect signals first so queued 'scan_complete' / 'port_found'
+        # events that are in flight cannot touch slots on a dialog that may
+        # be in the middle of closing.
+        try:
+            sc.port_found.disconnect(self._on_port_found)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            sc.scan_complete.disconnect(self._on_scan_complete)
+        except (TypeError, RuntimeError):
+            pass
+        try:
+            if sc.isRunning():
+                sc.requestInterruption()
+                # Some serial drivers can block a probe for several seconds.
+                # Wait generously, then force-stop as a last resort so the
+                # dialog cannot be destroyed while the thread is still alive.
+                if not sc.wait(8000):
+                    logger.warning("PortScanner did not stop in time; forcing thread termination")
+                    sc.terminate()
+                    sc.wait(1000)
+        except RuntimeError:
+            # scanner may have already been destroyed by Qt
+            pass
+        self._scanner = None
 
-        address = self._address_spin.value()
-        protocol = self._registry.make_protocol(spec, address=address)
+    def done(self, result) -> None:  # type: ignore[override]
+        self._stop_scanner()
+        super().done(result)
 
-        return {
-            "spec": spec,
-            "protocol": protocol,
-            "port": self._port_combo.currentText(),
-            "commands": selected_cmds,
-            "poll_interval": self._interval_spin.value(),
-            "baud_override": int(self._baud_combo.currentText()),
-            "rs485_enabled": self._rs485_radio.isChecked(),
-        }
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._stop_scanner()
+        super().closeEvent(event)

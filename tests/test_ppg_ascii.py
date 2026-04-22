@@ -134,3 +134,15 @@ class TestParseResponseErrors:
         raw = b"@ACKnotanumber\\"
         reading = ppg.parse_response(raw, "pressure")
         assert not reading.success
+
+    def test_pressure_unknown_command_switches_to_ppg570_mnemonic(self, ppg):
+        assert ppg.build_request("pressure") == b"@254PR3?\\"
+        reading = ppg.parse_response(b"@NAKUNKNOWNCOMMAND\\", "pressure")
+        assert not reading.success
+        assert ppg.build_request("pressure") == b"@254P?\\"
+
+    def test_non_unknown_nak_does_not_switch_mnemonic(self, ppg):
+        assert ppg.build_request("pressure") == b"@254PR3?\\"
+        reading = ppg.parse_response(b"@NAKWAIT\\", "pressure")
+        assert not reading.success
+        assert ppg.build_request("pressure") == b"@254PR3?\\"

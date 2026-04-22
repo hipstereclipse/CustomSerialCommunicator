@@ -118,11 +118,19 @@ class TestParseResponse:
         reading = cdg025.parse_continuous(bytes(frame))
         assert not reading.success
 
-    def test_error_byte_nonzero(self, cdg025):
-        frame = make_cdg_response(0, err=0x80)
+    def test_error_byte_fatal(self, cdg025):
+        # 0x40 = sensor fault bit → fatal
+        frame = make_cdg_response(0, err=0x40)
         reading = cdg025.parse_continuous(frame)
         assert not reading.success
-        assert "0x80" in reading.error.lower() or "error" in reading.error.lower()
+        assert "fault" in reading.error.lower() or "0x40" in reading.error
+
+    def test_error_byte_warmup_still_valid(self, cdg025):
+        # 0x80 = sensor-not-ready (heating) → reading is still usable
+        frame = make_cdg_response(8192, err=0x80)
+        reading = cdg025.parse_continuous(frame)
+        assert reading.success
+        assert "sensor not ready" in reading.extra["warnings"]
 
     def test_bad_checksum(self, cdg025):
         frame = bytearray(make_cdg_response(0))
@@ -154,6 +162,10 @@ class TestDetectGaugeType:
     def test_detects_cdg025d(self, cdg025):
         frame = make_cdg_response(0, sensor_type=0)
         assert cdg025.detect_gauge_type(frame) == "CDG025D"
+
+    def test_detects_hpg400(self, cdg025):
+        frame = make_cdg_response(0, sensor_type=0x0B)
+        assert cdg025.detect_gauge_type(frame) == "HPG400"
 
     def test_unknown_sensor_type(self, cdg025):
         frame = make_cdg_response(0, sensor_type=99)

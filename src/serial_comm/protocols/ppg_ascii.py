@@ -49,7 +49,7 @@ class PPGProtocol(GaugeProtocol):
     fallback when no table is supplied (e.g. in tests).
     """
 
-    # Fallback table: command → (mnemonic, writable, unit)
+    # Fallback table: command -> (mnemonic, writable, unit)
     _MNEMONIC_DEFAULTS: dict[str, tuple[str, bool, str]] = {
         "pressure":          ("PR3", False, "mbar"),
         "temperature":       ("T",   False, "°C"),
@@ -72,8 +72,12 @@ class PPGProtocol(GaugeProtocol):
     ) -> None:
         super().__init__(address)
         self.gauge_type = gauge_type
+        # _cmd_table entries: (mnemonic, writable, unit, query_param)
+        # query_param is appended after '?' on a read, e.g. "P?CMB\" or "Q?CONFIG\"
+        self._cmd_table: dict[str, tuple[str, bool, str, str]] = {}
+        self._runtime_mnemonic_override: dict[str, str] = {}
+        self._pressure_fallback_tried: set[str] = set()
         if param_table:
-            self._cmd_table: dict[str, tuple[str, bool, str]] = {}
             for name, info in param_table.items():
                 mn = info.get("mnemonic")
                 if mn:
@@ -81,9 +85,11 @@ class PPGProtocol(GaugeProtocol):
                         mn,
                         bool(info.get("write", False)),
                         info.get("unit", ""),
+                        str(info.get("query_param", "") or ""),
                     )
         else:
-            self._cmd_table = dict(self._MNEMONIC_DEFAULTS)
+            for name, (mn, wr, un) in self._MNEMONIC_DEFAULTS.items():
+                self._cmd_table[name] = (mn, wr, un, "")
 
     # ------------------------------------------------------------------
     # GaugeProtocol interface
@@ -93,12 +99,17 @@ class PPGProtocol(GaugeProtocol):
         entry = self._cmd_table.get(command)
         if entry is None:
             raise ValueError(f"PPGProtocol: unknown command '{command}'")
-        mnemonic, writable, _ = entry
+        mnemonic, writable, _, query_param = entry
+        mnemonic = self._runtime_mnemonic_override.get(command, mnemonic)
         if value is not None and not writable:
             raise ValueError(f"PPGProtocol: command '{command}' is read-only")
-        action = "?" if value is None else "!"
-        val_str = "" if value is None else str(value)
-        frame = f"@{self.address:03d}{mnemonic}{action}{val_str}\\"
+        if value is None:
+            action = "?"
+            suffix = query_param
+        else:
+            action = "!"
+            suffix = str(value)
+        frame = f"@{self.address:03d}{mnemonic}{action}{suffix}\\"
         logger.debug("TX %r", frame)
         return frame.encode("ascii")
 
@@ -115,8 +126,19 @@ class PPGProtocol(GaugeProtocol):
 
         body = stripped[:-1]  # remove trailing backslash
 
+        # Some PPG firmware variants include the address in responses,
+        # e.g. "@253ACK...\\". Normalize to "@ACK..." / "@NAK...".
+        if (
+            len(body) >= 7
+            and body.startswith(b"@")
+            and body[1:4].isdigit()
+            and body[4:7] in (b"ACK", b"NAK")
+        ):
+            body = b"@" + body[4:]
+
         if body.startswith(NAK_PREFIX):
             reason = body[len(NAK_PREFIX):].decode("ascii", errors="replace").strip()
+            self._maybe_adapt_on_unknown_command(command, reason)
             return self._err(f"NAK: {reason or '(no reason)'}", raw)
         if not body.startswith(ACK_PREFIX):
             return self._err(f"Unexpected prefix: {raw!r}", raw)
@@ -130,17 +152,14 @@ class PPGProtocol(GaugeProtocol):
 
     def _decode(self, command: str, data: str, raw: bytes) -> GaugeReading:
         try:
-            _, _, unit = self._cmd_table.get(command, ("", False, ""))
+            entry = self._cmd_table.get(command, ("", False, "", ""))
+            unit = entry[2]
             # Route by unit or command name
             if unit in ("mbar", "Torr", "Pa", "hPa", "psi"):
                 return self._decode_pressure(data, raw, unit)
-            if unit == "°C":
+            if unit in ("°C", "degC"):
                 v = float(data)
-                return self._ok(v, "°C", f"{v:.1f} °C", raw)
-            # Write-confirm commands return empty data or "OK"
-            if not self._cmd_table.get(command, ("", True, ""))[1] is False:
-                # If writable with no unit — treat as acknowledgement
-                pass
+                return self._ok(v, unit, f"{v:.1f} {unit}", raw)
             return GaugeReading(success=True, formatted=data or "OK", raw=raw,
                                 extra={"text": data})
         except Exception as exc:
@@ -167,3 +186,31 @@ class PPGProtocol(GaugeProtocol):
             formatted=f"{v:.3E} {unit}",
             raw=raw,
         )
+
+    def _maybe_adapt_on_unknown_command(self, command: str, reason: str) -> None:
+        """
+        Auto-recover between PPG550 and PPG570 pressure mnemonics.
+
+        If a pressure read fails with UNKNOWNCOMMAND, try the alternate mnemonic
+        on subsequent polls (PR3 <-> P).
+        """
+        if command != "pressure":
+            return
+        normalized = reason.replace(" ", "").upper()
+        if "UNKNOWNCOMMAND" not in normalized:
+            return
+
+        base = self._cmd_table.get("pressure")
+        if base is None:
+            return
+        current = self._runtime_mnemonic_override.get("pressure", base[0]).upper()
+
+        if current == "PR3" and "P" not in self._pressure_fallback_tried:
+            self._runtime_mnemonic_override["pressure"] = "P"
+            self._pressure_fallback_tried.add("P")
+            logger.warning("PPGProtocol switched pressure mnemonic to 'P' after UNKNOWNCOMMAND")
+            return
+        if current == "P" and "PR3" not in self._pressure_fallback_tried:
+            self._runtime_mnemonic_override["pressure"] = "PR3"
+            self._pressure_fallback_tried.add("PR3")
+            logger.warning("PPGProtocol switched pressure mnemonic to 'PR3' after UNKNOWNCOMMAND")

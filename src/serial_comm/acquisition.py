@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 _ERROR_RETRY_DELAY = 2.0
 # Maximum consecutive errors before treating the connection as dead
 _MAX_CONSECUTIVE_ERRORS = 5
+# Consecutive poll cycles with *no* response bytes from the gauge before we
+# declare the link dead (echo only / loopback / unpowered gauge).
+_LOOPBACK_CYCLES = 5
 
 
 class GaugeWorker(QThread):
@@ -84,6 +87,7 @@ class GaugeWorker(QThread):
         self._device_id = device_id or f"{transport_config.port}:{protocol.address}"
         self._transport: SerialTransport | None = None
         self._terminal_queue: _queue.SimpleQueue = _queue.SimpleQueue()
+        self._polling_enabled = True
 
     # ------------------------------------------------------------------
     # Public control API  (call from GUI thread)
@@ -100,6 +104,10 @@ class GaugeWorker(QThread):
         between poll cycles; response arrives via ``terminal_response`` signal.
         """
         self._terminal_queue.put_nowait((frame, command))
+
+    def set_polling_enabled(self, enabled: bool) -> None:
+        """Enable/disable automatic worker polling (terminal commands still run)."""
+        self._polling_enabled = bool(enabled)
 
     # ------------------------------------------------------------------
     # QThread.run — everything below runs in the worker thread
@@ -134,18 +142,26 @@ class GaugeWorker(QThread):
 
     def _run_polled(self, transport: SerialTransport) -> None:
         consecutive_errors = 0
+        silent_cycles = 0  # full cycles where every command got only an echo or no data
 
         while not self.isInterruptionRequested():
             # Drain any terminal commands queued by the GUI thread first
             self._drain_terminal_queue(transport)
 
+            if not self._polling_enabled:
+                self._sleep_interruptible(0.05)
+                continue
+
             cycle_start = time.monotonic()
+            cycle_saw_response = False
 
             for command in self._commands:
                 if self.isInterruptionRequested():
                     break
                 try:
-                    reading = self._poll_one(transport, command)
+                    reading, saw_any_bytes = self._poll_one(transport, command)
+                    if saw_any_bytes:
+                        cycle_saw_response = True
                     if reading is not None:
                         self.reading_ready.emit(reading)
                         consecutive_errors = 0
@@ -164,6 +180,22 @@ class GaugeWorker(QThread):
                     logger.exception("[%s] unexpected error polling %s", self._device_id, command)
                     self._emit_error(f"Unexpected error ({command}): {exc}", recoverable=True)
 
+            # Loopback / silent-gauge detection: if several full cycles in a row
+            # return nothing but our own echo, stop and surface a useful message
+            # rather than spamming "Parse error" every second forever.
+            if cycle_saw_response:
+                silent_cycles = 0
+            else:
+                silent_cycles += 1
+                if silent_cycles == _LOOPBACK_CYCLES:
+                    self._emit_error(
+                        "No reply from gauge — TX is echoing without response. "
+                        "Check cable pinout, power, and that no loopback plug "
+                        "is installed on this COM port.",
+                        recoverable=False,
+                    )
+                    return
+
             elapsed = time.monotonic() - cycle_start
             remaining = self._poll_interval - elapsed
             if remaining > 0:
@@ -171,24 +203,37 @@ class GaugeWorker(QThread):
 
     def _poll_one(
         self, transport: SerialTransport, command: str
-    ) -> DeviceReading | None:
-        """Send one request–response pair. Returns a DeviceReading or None on parse error."""
+    ) -> tuple[DeviceReading | None, bool]:
+        """Send one request–response pair.
+
+        Returns ``(reading, saw_any_bytes)`` where *saw_any_bytes* is ``True`` if
+        the gauge returned any data beyond our own echoed request. The caller
+        uses it to distinguish a real-but-malformed response from a silent line
+        (loopback / unpowered gauge / wrong pinout).
+        """
         request = self._protocol.build_request(command)
         transport.flush_input()
         transport.write(request)
 
         raw = self._read_response(transport, command)
+        saw_any_bytes = bool(raw) and raw != request
+        # If the device echoed our command back (RS-485 half-duplex), read
+        # again to get the actual response.
+        if raw == request:
+            raw = self._read_response(transport, command)
+            if raw:
+                saw_any_bytes = True
         result = self._protocol.parse_response(raw, command)
 
         if not result.success:
             self._emit_error(f"Parse error ({command}): {result.error}", recoverable=True)
-            return None
+            return None, saw_any_bytes
 
         if result.value is None:
-            return None
+            return None, saw_any_bytes
 
         now_mono = time.monotonic()
-        return DeviceReading(
+        reading = DeviceReading(
             device_id=self._device_id,
             timestamp_mono=now_mono,
             timestamp_wall=datetime.now(tz=timezone.utc),
@@ -197,6 +242,7 @@ class GaugeWorker(QThread):
             command=command,
             raw=result.raw,
         )
+        return reading, saw_any_bytes
 
     def _read_response(self, transport: SerialTransport, command: str) -> bytes:
         """Read one response frame from the transport."""
@@ -244,6 +290,15 @@ class GaugeWorker(QThread):
         consecutive_errors = 0
 
         while not self.isInterruptionRequested():
+            self._drain_terminal_queue(transport)
+
+            if not self._polling_enabled:
+                # Keep the line quiet when paused so ad-hoc commands are less likely
+                # to collide with stale streamed frames.
+                transport.flush_input()
+                self._sleep_interruptible(0.05)
+                continue
+
             try:
                 raw = transport.read_frame(RESPONSE_SYNC, RESPONSE_LENGTH)
                 if not raw:
@@ -296,6 +351,9 @@ class GaugeWorker(QThread):
             transport.flush_input()
             transport.write(frame)
             raw = self._read_terminal_response(transport)
+            # Discard echo if the device reflected our command back
+            if raw == frame:
+                raw = self._read_terminal_response(transport)
             entry = TerminalEntry(
                 request=frame,
                 response=raw,
@@ -317,6 +375,7 @@ class GaugeWorker(QThread):
         from serial_comm.protocols.ppg_ascii import TERMINATOR as PPG_TERM
         from serial_comm.protocols.pfeiffer_ascii import TERMINATOR as PA_TERM
         from serial_comm.protocols.pfeiffer_binary import PfeifferBinaryProtocol
+        from serial_comm.protocols.cdg_serial import RESPONSE_LENGTH, RESPONSE_SYNC
 
         proto = self._protocol
         if self._spec.protocol == "ppg_ascii":
@@ -329,6 +388,8 @@ class GaugeWorker(QThread):
                 return header
             msg_len = header[3]
             return header + transport.read_bytes(msg_len + 2)
+        if self._spec.protocol == "cdg_serial":
+            return transport.read_frame(RESPONSE_SYNC, RESPONSE_LENGTH)
         return transport.read_bytes(64)
 
     # ------------------------------------------------------------------

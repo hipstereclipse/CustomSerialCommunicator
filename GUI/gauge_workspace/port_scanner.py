@@ -25,6 +25,11 @@ _PPG_SN  = b"@254SN?\\"    # serial number
 _PPG_PR3 = b"@254PR3?\\"   # Pirani pressure
 _PPG_PR1 = b"@254PR1?\\"   # combined (piezo+Pirani) pressure — PPG570 only
 
+# ── CDG/HPG serial probe (INFICON SKY binary family) ───────────────────────
+# Use an explicit read command so scanner classification is based on an active
+# protocol probe, not only passive observation of a byte pattern.
+_CDG_PRESSURE_READ = b"\x03\x00\x00\x00\x00"
+
 # ── Pfeiffer ASCII probes ───────────────────────────────────────────────────
 # Frame format: addr(3) + action(2) + param(3) + len(2) + data + chk(3) + CR
 # Checksum = sum(all chars before the 3-char checksum) % 256
@@ -58,7 +63,7 @@ class PortScanner(QThread):
         Emitted when all ports have been probed.
     """
 
-    port_found   = pyqtSignal(str, str, str)  # port, description, model_hint
+    port_found   = pyqtSignal(str, str, str, object)  # port, description, model_hint, metadata
     scan_complete = pyqtSignal()
 
     def __init__(self, ports: list[str], parent=None) -> None:
@@ -87,8 +92,17 @@ class PortScanner(QThread):
                 ser.reset_input_buffer()
                 ser.write(_PPG_FV)
                 raw = self._read_until(ser, b"\\", 64)
+                # Discard RS-485 echo (device reflects our command back before
+                # sending the actual response on half-duplex buses).
+                if raw == _PPG_FV:
+                    raw = self._read_until(ser, b"\\", 64)
+                    # If *nothing* follows the echo, the port is likely in
+                    # hardware loopback — no point in other protocol probes.
+                    if not raw:
+                        logger.info("Scanner: %s shows echo but no response — likely loopback/no gauge", port)
+                        return
 
-                if raw and raw.startswith(b"@ACK"):
+                if raw and self._ppg_is_ack(raw):
                     self._identify_ppg(ser, port, raw)
                     return
 
@@ -96,13 +110,143 @@ class PortScanner(QThread):
                 ser.reset_input_buffer()
                 ser.write(_PFA_FW)
                 raw = self._read_until(ser, b"\r", 64)
+                # Reject an exact echo of our request (loopback)
+                if raw == _PFA_FW:
+                    logger.info("Scanner: %s echoed Pfeiffer probe — likely loopback/no gauge", port)
+                    return
 
                 if raw and self._valid_pfeiffer_frame(raw):
                     self._identify_pfeiffer(ser, port, raw)
                     return
 
+                # ── CDG/HPG binary probe (active command verification) ──
+                ser.reset_input_buffer()
+                ser.write(_CDG_PRESSURE_READ)
+                stream = ser.read(96)
+                if self._looks_like_cdg(stream):
+                    # Query type/range register to improve full-scale identification.
+                    ser.reset_input_buffer()
+                    ser.write(self._cdg_type_request())
+                    type_stream = ser.read(96)
+                    self._identify_cdg(port, stream, type_stream)
+                    return
+
         except serial.SerialException as exc:
             logger.debug("Scanner: %s — %s", port, exc)
+
+    # ------------------------------------------------------------------
+    # CDG identification (continuous output — no probe required)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _looks_like_cdg(stream: bytes) -> bool:
+        """Return True if *stream* contains a valid 9-byte CDG frame."""
+        from serial_comm.protocols.cdg_serial import CDGProtocol, RESPONSE_LENGTH
+        if len(stream) < RESPONSE_LENGTH:
+            return False
+        for i in range(len(stream) - RESPONSE_LENGTH + 1):
+            frame = stream[i : i + RESPONSE_LENGTH]
+            if CDGProtocol.is_cdg_frame(frame):
+                return True
+        return False
+
+    @staticmethod
+    def _cdg_type_request() -> bytes:
+        # service=0x00, addr=0x3B, data=0x00, checksum=sum([0x00,0x3B,0x00])=0x3B
+        return b"\x03\x00\x3B\x00\x3B"
+
+    @staticmethod
+    def _first_cdg_frame(stream: bytes, read_echo: int | None = None) -> bytes:
+        from serial_comm.protocols.cdg_serial import CDGProtocol, RESPONSE_LENGTH
+        for i in range(len(stream) - RESPONSE_LENGTH + 1):
+            candidate = stream[i : i + RESPONSE_LENGTH]
+            if not CDGProtocol.is_cdg_frame(candidate):
+                continue
+            if read_echo is not None and candidate[6] != read_echo:
+                continue
+            return candidate
+        return b""
+
+    @staticmethod
+    def _infer_cdg_full_scale_mbar(sensor_code: int, type_word: int | None) -> float | None:
+        # Canonical CDG full-scale options across mbar-native and Torr-native heads.
+        options = (0.1, 0.13332, 0.25, 0.3333, 1.0, 1.3332, 2.0, 2.6664,
+                   10.0, 13.332, 20.0, 26.664, 100.0, 133.32, 200.0, 266.64,
+                   500.0, 666.6, 1000.0, 1100.0, 1333.22)
+        if type_word is None:
+            return None
+
+        candidates: list[float] = []
+        base = float(type_word)
+        for scale in (1.0, 0.1, 0.01, 0.001, 10.0):
+            candidates.append(base * scale)
+        for scale in (1.33322, 0.133322, 0.0133322):
+            candidates.append(base * scale)
+
+        best_val: float | None = None
+        best_rel_err = 1.0
+        for cand in candidates:
+            if cand <= 0:
+                continue
+            nearest = min(options, key=lambda opt: abs(opt - cand))
+            rel_err = abs(nearest - cand) / max(nearest, 1e-12)
+            if rel_err < best_rel_err:
+                best_rel_err = rel_err
+                best_val = float(nearest)
+
+        # Require a reasonably close match; otherwise avoid forcing a wrong scale.
+        if best_val is not None and best_rel_err <= 0.05:
+            return best_val
+
+        logger.debug(
+            "Scanner: could not confidently infer CDG full scale (sensor_code=0x%02X, type_word=%s)",
+            sensor_code,
+            type_word,
+        )
+        return None
+
+    def _identify_cdg(self, port: str, stream: bytes, type_stream: bytes | None = None) -> None:
+        """Emit a port_found signal for a detected CDG gauge."""
+        frame = self._first_cdg_frame(stream)
+
+        sensor_code = frame[7] if frame else 0
+        raw_ratio = 0.0
+        if frame:
+            meas = int.from_bytes(frame[4:6], "big", signed=True)
+            raw_ratio = meas / 16384.0
+
+        type_frame = self._first_cdg_frame(type_stream or b"", read_echo=0x3B)
+        type_word = int.from_bytes(type_frame[4:6], "big", signed=False) if type_frame else None
+        full_scale_mbar = self._infer_cdg_full_scale_mbar(sensor_code, type_word)
+
+        # Sensor-code byte is not a reliable model identifier on CDG025D
+        # (it encodes the factory full-scale range, not the model).
+        # Default to CDG025D and only special-case HPG400.
+        if sensor_code == 0x0B:
+            model_hint = "INFICON HPG400"
+        else:
+            model_hint = "INFICON CDG025D"
+        parts = [f"ratio {raw_ratio:+.3f}", f"code 0x{sensor_code:02X}"]
+        if full_scale_mbar is not None:
+            parts.append(f"FS≈{full_scale_mbar:g} mbar")
+        if type_word is not None:
+            parts.append(f"type=0x{type_word:04X}")
+        desc = "  |  ".join(parts)
+        metadata = {
+            "family": "cdg_serial",
+            "sensor_code": sensor_code,
+            "type_word": type_word,
+            "full_scale_mbar": full_scale_mbar,
+            "model": model_hint.replace("INFICON ", ""),
+        }
+        self.port_found.emit(port, desc, model_hint, metadata)
+        logger.info(
+            "Scanner: %s — detected SKY-binary gauge (code 0x%02X, model=%s, fs=%s)",
+            port,
+            sensor_code,
+            metadata["model"],
+            full_scale_mbar,
+        )
 
     # ------------------------------------------------------------------
     # PPG identification
@@ -115,7 +259,7 @@ class PortScanner(QThread):
         ser.reset_input_buffer()
         ser.write(_PPG_SN)
         sn_raw = self._read_until(ser, b"\\", 64)
-        serial_num = self._ppg_data(sn_raw) if sn_raw and sn_raw.startswith(b"@ACK") else ""
+        serial_num = self._ppg_data(sn_raw) if sn_raw and self._ppg_is_ack(sn_raw) else ""
 
         # Try combined pressure first (PPG570-specific), fall back to Pirani (PPG550)
         # Track whether PR1 got an ACK — this distinguishes PPG570 from PPG550
@@ -125,7 +269,7 @@ class PortScanner(QThread):
             ser.reset_input_buffer()
             ser.write(probe)
             pr_raw = self._read_until(ser, b"\\", 64)
-            if pr_raw and pr_raw.startswith(b"@ACK"):
+            if pr_raw and self._ppg_is_ack(pr_raw):
                 if probe is _PPG_PR1:
                     pr1_acked = True
                 val = self._ppg_data(pr_raw)
@@ -147,24 +291,49 @@ class PortScanner(QThread):
         desc = "  |  ".join(parts) if parts else "PPG gauge"
 
         model_hint = self._guess_ppg_model(firmware, serial_num, pr1_acked)
-        self.port_found.emit(port, desc, model_hint)
+        metadata = {
+            "family": "ppg_ascii",
+            "firmware": firmware,
+            "serial_number": serial_num,
+            "pr1_acked": pr1_acked,
+            "model": "PPG550/570",
+        }
+        self.port_found.emit(port, desc, model_hint, metadata)
+
+    @staticmethod
+    def _ppg_is_ack(raw: bytes) -> bool:
+        """True for '@ACK...\\' and address-prefixed '@253ACK...\\' variants."""
+        if raw.startswith(b"@ACK"):
+            return True
+        return (
+            len(raw) >= 8
+            and raw.startswith(b"@")
+            and raw[1:4].isdigit()
+            and raw[4:7] == b"ACK"
+        )
 
     @staticmethod
     def _ppg_data(raw: bytes) -> str:
-        """Extract the data payload from a ``@ACK{data}\\`` frame."""
-        return raw[4:-1].decode("ascii", errors="replace").strip()
+        """Extract data from '@ACK...\\' or '@dddACK...\\' frames."""
+        if raw.startswith(b"@ACK"):
+            payload = raw[4:-1]
+        elif (
+            len(raw) >= 8
+            and raw.startswith(b"@")
+            and raw[1:4].isdigit()
+            and raw[4:7] == b"ACK"
+        ):
+            payload = raw[7:-1]
+        else:
+            payload = b""
+        return payload.decode("ascii", errors="replace").strip()
 
     @staticmethod
     def _guess_ppg_model(firmware: str, serial_num: str, pr1_acked: bool = False) -> str:
-        combined = (firmware + serial_num).upper()
-        if "570" in combined:
-            return "INFICON PPG570"
-        if "550" in combined:
-            return "INFICON PPG550"
-        # PR1 (combined Pirani+Piezo pressure) responds on PPG570 but not PPG550
-        if pr1_acked:
-            return "INFICON PPG570"
-        return "INFICON PPG550"
+        _ = (firmware, serial_num, pr1_acked)
+        # PPG550/PPG570 are protocol-compatible for the common read path; use
+        # a combined selector to avoid false model splits from limited probes.
+        return "INFICON PPG550/570"
 
     # ------------------------------------------------------------------
     # Pfeiffer identification
@@ -205,7 +374,13 @@ class PortScanner(QThread):
         else:
             model_hint = f"INFICON Gauge ({firmware[:6].strip()})" if firmware else "Unknown Pfeiffer ASCII"
 
-        self.port_found.emit(port, desc, model_hint)
+        metadata = {
+            "family": "pfeiffer_ascii",
+            "firmware": firmware,
+            "hardware": hw_ver,
+            "model": model_hint.replace("INFICON ", ""),
+        }
+        self.port_found.emit(port, desc, model_hint, metadata)
 
     # ------------------------------------------------------------------
     # Pfeiffer frame validation
@@ -214,10 +389,14 @@ class PortScanner(QThread):
     @staticmethod
     def _valid_pfeiffer_frame(raw: bytes) -> bool:
         """
-        Return True only for a well-formed Pfeiffer ASCII response frame.
+        Return True only for a well-formed Pfeiffer ASCII *response* frame.
 
         Format: addr(3) action(2) param(3) len(2) data(len) chk(3) CR
         Total minimum length = 3+2+3+2+0+3+1 = 14 bytes (data_len = 0).
+
+        Action codes: "00" = read request (host→device), "10" = read response
+        (device→host), "20"/"30" = write variants. Only responses are valid
+        here — this prevents an echoed TX (action "00") from validating.
         """
         if len(raw) < 14:
             return False
@@ -227,6 +406,9 @@ class PortScanner(QThread):
             return False
         # First 3 chars must be the numeric address
         if not text[:3].isdigit():
+            return False
+        # Action code: must be a device→host response, not our own request
+        if text[3:5] not in ("10", "11"):
             return False
         # Chars 8:10 encode the data length
         if not text[8:10].isdigit():

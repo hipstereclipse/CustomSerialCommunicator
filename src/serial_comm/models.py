@@ -77,6 +77,7 @@ class TerminalEntry:
     timestamp: datetime
     command: str = ""        # empty for raw custom frames
     error: str | None = None
+    auto_poll: bool = False  # True for automatic background-poll entries (show request inline)
 
 
 @dataclass

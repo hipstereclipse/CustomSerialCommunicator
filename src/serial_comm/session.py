@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from serial_comm.models import DeviceReading
+from serial_comm.simulation_models import SimulatedGaugeConfig
 
 if TYPE_CHECKING:
     pass
@@ -56,6 +57,7 @@ def save_session(
     path: str | Path,
     gauge_configs: list[dict[str, Any]],
     readings: list[DeviceReading] | None = None,
+    simulated_configs: list[SimulatedGaugeConfig] | None = None,
 ) -> None:
     """Write a session file.
 
@@ -64,12 +66,16 @@ def save_session(
     path:
         Destination path.  Extension must be ``.scj`` or ``.scd``.
     gauge_configs:
-        List of dicts, each describing one gauge's connection:
+        List of dicts, each describing one real gauge's connection:
         ``{"model": str, "port": str, "address": int,
            "commands": list[str], "poll_interval": float}``.
     readings:
         If provided, included in the file (use for ``.scd``).
         If *None* or empty, no ``"data"`` key is written (for ``.scj``).
+    simulated_configs:
+        Optional list of :class:`SimulatedGaugeConfig`.  Stored under a
+        separate ``"simulated_gauges"`` section so the existing real-gauge
+        schema is unaffected.
     """
     path = Path(path)
     payload: dict[str, Any] = {
@@ -77,6 +83,8 @@ def save_session(
         "saved_at": datetime.now(tz=timezone.utc).isoformat(),
         "gauges": [_serialise_gauge_config(g) for g in gauge_configs],
     }
+    if simulated_configs:
+        payload["simulated_gauges"] = [c.to_dict() for c in simulated_configs]
     if readings:
         payload["data"] = [_serialise_reading(r) for r in readings]
 
@@ -126,6 +134,12 @@ def load_session(path: str | Path) -> dict[str, Any]:
         "saved_at": saved_at,
         "gauges": gauges,
     }
+
+    sim_raw = raw.get("simulated_gauges", [])
+    if sim_raw:
+        result["simulated_gauges"] = [
+            SimulatedGaugeConfig.from_dict(s) for s in sim_raw
+        ]
 
     if "data" in raw:
         result["data"] = [_deserialise_reading(d) for d in raw["data"]]

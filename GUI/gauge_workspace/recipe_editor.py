@@ -57,6 +57,17 @@ _RECIPE_PRESETS: dict[str, list[RecipeStep]] = {
     ],
 }
 
+_OPERATION_SNIPPETS: dict[str, RecipeStep] = {
+    "Roughing Pump Stage": RecipeStep("Roughing Pump", 120.0, 1013.0, 4e-1, "exponential"),
+    "Turbo Pump Stage": RecipeStep("Turbo Pump", 180.0, 4e-1, 8e-6, "exponential"),
+    "Semiconductor Cleaning Hold": RecipeStep("Cleaning Hold", 180.0, 2e-2, 1.8e-2, "linear"),
+    "PVD Argon Backfill": RecipeStep("Argon Backfill", 18.0, 8e-6, 4.5e-3, "linear"),
+    "PVD Process Hold": RecipeStep("Deposition Hold", 240.0, 3.4e-3, 3.8e-3, "linear"),
+    "RAC Isolation Hold": RecipeStep("Isolation Hold", 180.0, 2e-2, 2.6e-2, "linear"),
+    "RAC Leak Spike": RecipeStep("Leak Spike", 15.0, 2.6e-2, 7.5e-2, "linear"),
+    "Recovery Stage": RecipeStep("Recovery", 120.0, 5e-4, 1.5e-5, "exponential"),
+}
+
 
 class RecipeEditorWidget(QWidget):
     """Editable step table for a CUSTOM simulation pattern."""
@@ -87,8 +98,15 @@ class RecipeEditorWidget(QWidget):
         self._preset_combo.addItems(_RECIPE_PRESETS.keys())
         self._preset_apply_btn = QPushButton("Load Preset")
         self._preset_apply_btn.clicked.connect(self._on_apply_preset)
+        self._snippet_combo = QComboBox(self)
+        self._snippet_combo.addItems(_OPERATION_SNIPPETS.keys())
+        self._snippet_btn = QPushButton("Insert Operation")
+        self._snippet_btn.clicked.connect(self._on_insert_snippet)
         preset_row.addWidget(self._preset_combo)
         preset_row.addWidget(self._preset_apply_btn)
+        preset_row.addSpacing(8)
+        preset_row.addWidget(self._snippet_combo)
+        preset_row.addWidget(self._snippet_btn)
         preset_row.addStretch()
         root.addLayout(preset_row)
 
@@ -236,6 +254,15 @@ class RecipeEditorWidget(QWidget):
         if not preset:
             return
         self.set_steps([RecipeStep(**step.__dict__) for step in preset])
+        self._emit_changed()
+
+    def _on_insert_snippet(self) -> None:
+        name = self._snippet_combo.currentText()
+        snippet = _OPERATION_SNIPPETS.get(name)
+        if snippet is None:
+            return
+        self._append_row(RecipeStep(**snippet.__dict__))
+        self._table.selectRow(self._table.rowCount() - 1)
         self._emit_changed()
 
 

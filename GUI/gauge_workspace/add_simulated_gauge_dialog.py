@@ -17,11 +17,14 @@ from PyQt6.QtWidgets import (
 
 from serial_comm.device_registry import DeviceRegistry
 from serial_comm.simulation_models import (
+    GasType,
+    HumidityLevel,
     CDGFullScaleOption,
     SimulatedGaugeConfig,
     SimulationPattern,
     cdg_full_scale_options,
 )
+from serial_comm.simulation_scenarios import SCENARIOS, scenario_by_key
 
 from GUI.gauge_workspace.recipe_editor import RecipeEditorWidget
 
@@ -105,10 +108,33 @@ class AddSimulatedGaugeDialog(QDialog):
         pattern_grp = QGroupBox("Simulation Pattern")
         p_layout = QVBoxLayout(pattern_grp)
         combo_form = QFormLayout()
+
+        self._scenario_combo = QComboBox()
+        for scenario in SCENARIOS:
+            self._scenario_combo.addItem(scenario.title, scenario.key)
+        self._scenario_combo.currentIndexChanged.connect(self._on_scenario_changed)
+        combo_form.addRow("Behavior profile:", self._scenario_combo)
+
+        self._scenario_hint = QLabel("")
+        self._scenario_hint.setWordWrap(True)
+        self._scenario_hint.setStyleSheet("color:#7a7a7a; font-size:11px;")
+        combo_form.addRow("", self._scenario_hint)
+
         self._pattern_combo = QComboBox()
         self._pattern_combo.addItems([p.value for p in SimulationPattern])
         self._pattern_combo.currentTextChanged.connect(self._on_pattern_changed)
         combo_form.addRow("Pattern:", self._pattern_combo)
+
+        self._gas_combo = QComboBox()
+        for gas in (GasType.N2, GasType.AR, GasType.HE, GasType.CO2):
+            self._gas_combo.addItem(gas.value, gas.value)
+        combo_form.addRow("Gas:", self._gas_combo)
+
+        self._humidity_combo = QComboBox()
+        for hum in (HumidityLevel.LOW, HumidityLevel.MEDIUM, HumidityLevel.HIGH):
+            self._humidity_combo.addItem(hum.value, hum.value)
+        combo_form.addRow("Humidity:", self._humidity_combo)
+
         p_layout.addLayout(combo_form)
 
         # Parameter widgets — each is shown/hidden per pattern.
@@ -149,6 +175,9 @@ class AddSimulatedGaugeDialog(QDialog):
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+        # Seed with the first scenario so the form starts meaningful.
+        self._on_scenario_changed(0)
 
     # ------------------------------------------------------------------
     # Population helpers
@@ -203,6 +232,33 @@ class AddSimulatedGaugeDialog(QDialog):
         self._leak_spin.setVisible(show_leak)
         self._recipe_editor.setVisible(show_recipe)
 
+    def _on_scenario_changed(self, _index: int) -> None:
+        key = str(self._scenario_combo.currentData() or "")
+        scenario = scenario_by_key(key)
+        if scenario is None:
+            return
+
+        self._scenario_hint.setText(scenario.description)
+
+        # Apply scenario defaults but keep room for user tweaks afterwards.
+        self._pattern_combo.blockSignals(True)
+        self._pattern_combo.setCurrentText(scenario.pattern.value)
+        self._pattern_combo.blockSignals(False)
+        self._on_pattern_changed(scenario.pattern.value)
+
+        self._base_spin.setValue(float(scenario.base_pressure_mbar))
+        self._leak_spin.setValue(float(scenario.leak_rate_mbar_l_s))
+
+        gas_idx = self._gas_combo.findData(scenario.gas.value)
+        if gas_idx >= 0:
+            self._gas_combo.setCurrentIndex(gas_idx)
+        hum_idx = self._humidity_combo.findData(scenario.humidity.value)
+        if hum_idx >= 0:
+            self._humidity_combo.setCurrentIndex(hum_idx)
+
+        if scenario.recipe_steps:
+            self._recipe_editor.set_steps(list(scenario.recipe_steps))
+
     # ------------------------------------------------------------------
     # Accept / result
     # ------------------------------------------------------------------
@@ -231,6 +287,8 @@ class AddSimulatedGaugeDialog(QDialog):
                 if model.upper().startswith("CDG")
                 else None
             ),
+            humidity_level=HumidityLevel(str(self._humidity_combo.currentData())),
+            gas_type=GasType(str(self._gas_combo.currentData())),
         )
         self.accept()
 

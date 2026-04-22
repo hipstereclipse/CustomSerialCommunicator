@@ -8,65 +8,231 @@ transport:
   data_bits: 8
   stop_bits: 1
   rs_modes: [RS232, RS485]
-  default_address: 254
+  default_address: 254  # global address — always responds regardless of ADR
   rs485_address_range: [1, 253]
+
+# Command set per INFICON PPG570 Operating Manual (TINB86E1, 2022-07)
+#   frame: @<addr>{mnemonic}{?|!}{param}\
+#   reply: @ACK<data>\  or  @NAK<reason>\
+#
+# For commands that accept a query parameter (P?MP, Q?CONFIG, U?T, STAT?T, …)
+# use the `query_param` field. For writable commands pass the value through
+# `send_terminal_command` with a custom frame, or via the worker's value arg.
 commands:
-  pressure:
-    mnemonic: PR3
+  # ── Pressure readings ────────────────────────────────────────────────
+  pressure:                 # Combined (best-sensor) pressure
+    mnemonic: P
     read: true
     write: false
     unit: mbar
-    description: Pirani pressure measurement
-  atm_pressure:
-    mnemonic: PR4
+    description: Combined pressure measurement (P?)
+  pressure_combined:
+    mnemonic: P
+    query_param: CMB
     read: true
     write: false
     unit: mbar
-    description: Atmospheric (piezo) pressure measurement
-  combined_pressure:
-    mnemonic: PR1
+    description: Combined pressure (P?CMB)
+  pressure_pirani:          # MEMS Pirani
+    mnemonic: P
+    query_param: MP
     read: true
     write: false
     unit: mbar
-    description: Combined (best-sensor) pressure measurement
+    description: MEMS Pirani pressure (P?MP)
+  pressure_piezo_vac:
+    mnemonic: P
+    query_param: PZV
+    read: true
+    write: false
+    unit: mbar
+    description: Piezo vacuum pressure (P?PZV)
+  pressure_piezo_atm:
+    mnemonic: P
+    query_param: PZA
+    read: true
+    write: false
+    unit: mbar
+    description: Ambient Piezo pressure (P?PZA)
+  pressure_differential:
+    mnemonic: P
+    query_param: DIFF
+    read: true
+    write: false
+    unit: mbar
+    description: Differential pressure PZV-PZA (P?DIFF)
+
+  # ── Temperature ──────────────────────────────────────────────────────
   temperature:
     mnemonic: T
     read: true
     write: false
     unit: "°C"
-    description: Sensor temperature
-  software_version:
-    mnemonic: FV
+    description: Vacuum-gas temperature (T?)
+
+  # ── Quick data acquisition ───────────────────────────────────────────
+  quick_data:
+    mnemonic: Q
     read: true
     write: false
-    description: Firmware version string
+    description: Quick multi-value query (Q?)
+  quick_config:
+    mnemonic: Q
+    query_param: CONFIG
+    read: true
+    write: false
+    description: Read quick-query configuration (Q?CONFIG)
+
+  # ── Statistics ───────────────────────────────────────────────────────
+  statistics:
+    mnemonic: STAT
+    read: true
+    write: true
+    description: Min/max/hours (STAT?)  — write CLEAR to reset
+  statistics_temp:
+    mnemonic: STAT
+    query_param: T
+    read: true
+    write: false
+    description: Temperature statistics (STAT?T)
+
+  # ── Identification ───────────────────────────────────────────────────
   serial_number:
     mnemonic: SN
     read: true
     write: false
-    description: Device serial number
+    description: Serial number (SN?)
+  part_number:
+    mnemonic: PN
+    read: true
+    write: false
+    description: Part number (PN?)
+  manufacturer:
+    mnemonic: MF
+    read: true
+    write: false
+    description: Manufacturer identity (MF?)
+  model_name:
+    mnemonic: MD
+    read: true
+    write: false
+    description: Model name (MD?)
+  software_version:
+    mnemonic: FV
+    read: true
+    write: false
+    description: Firmware version (FV?)
+
+  # ── Unit ─────────────────────────────────────────────────────────────
   unit:
     mnemonic: U
     read: true
     write: true
-    description: Pressure unit selection
+    description: Pressure/temperature unit (U? / U!MBAR|PASCAL|TORR / U!T,CELSIUS|FAHRENHEIT|KELVIN)
+  unit_temperature:
+    mnemonic: U
+    query_param: T
+    read: true
+    write: false
+    description: Currently configured temperature unit (U?T)
+
+  # ── Zero / span adjustments ──────────────────────────────────────────
   zero_adjust:
     mnemonic: VAC
-    read: false
+    read: true
     write: true
-    description: Execute Pirani zero adjustment (gauge at vacuum)
-  piezo_adjust:
-    mnemonic: FS
-    read: false
-    write: true
-    description: Execute piezo full-scale adjustment
+    description: Pirani zero adjustment (VAC! or VAC!<pressure>)
   atm_zero:
     mnemonic: ATZ
-    read: false
+    read: true
     write: true
-    description: Execute atmospheric zero adjustment
+    description: Differential Piezo zero adjustment (ATZ!)
+  full_scale:
+    mnemonic: FS
+    read: true
+    write: true
+    description: Pirani / Piezo full-scale adjustment (FS!PZ,<P> or FS!MP,<P>)
   atm_full_scale:
     mnemonic: ATD
+    read: true
+    write: true
+    description: Atmospheric piezo full-scale adjustment (ATD!)
+
+  # ── Configuration ────────────────────────────────────────────────────
+  address:
+    mnemonic: ADR
+    read: true
+    write: true
+    description: Device address (ADR? / ADR!<1-253>)
+  baud:
+    mnemonic: BAUD
+    read: true
+    write: true
+    description: Baud rate (BAUD? / BAUD!<4800|9600|19200|38400|57600|115200>)
+  button:
+    mnemonic: BTN
+    read: true
+    write: true
+    description: Push-button enable (BTN?/BTN!ON|OFF)
+  led_mode:
+    mnemonic: LED
+    read: true
+    write: true
+    description: LED behaviour (LED? / LED!SOLID|DYNAMIC|ANALOG)
+  fail_mode:
+    mnemonic: FAIL
+    read: true
+    write: true
+    description: Sensor-failure handling (FAIL? / FAIL!WORKING|ZERO)
+  gas_type:
+    mnemonic: GT
+    read: true
+    write: true
+    description: Gas correction (GT? / GT!NITROGEN|HELIUM|ARGON|AIR)
+  analog_output:
+    mnemonic: AOUT
+    read: true
+    write: true
+    description: Analog-output emulation (AOUT? / AOUT!<STD|0-39>, or AOUT!2,<n> for secondary)
+  factory_default:
+    mnemonic: FD
     read: false
     write: true
-    description: Execute atmospheric full-scale adjustment
+    description: Factory-default subset (FD!ADR|ATD|ATZ|AO|BAUD|FS|GT|SP|U|VAC|NONE)
+
+  # ── Setpoints ────────────────────────────────────────────────────────
+  setpoints_overview:
+    mnemonic: SP
+    read: true
+    write: false
+    description: Overview of all setpoint settings (SP?)
+  setpoint_direction:
+    mnemonic: SPD
+    read: true
+    write: true
+    description: Setpoint direction (SPD?<n> / SPD!<n>,ABOVE|BELOW)
+  setpoint_enable:
+    mnemonic: SPE
+    read: true
+    write: true
+    description: Setpoint enable (SPE?<n> / SPE!<n>,ON|OFF|PZD)
+  setpoint_hysteresis:
+    mnemonic: SPH
+    read: true
+    write: true
+    description: Setpoint hysteresis (SPH?<n> / SPH!<n>,<pressure>)
+  setpoint_value:
+    mnemonic: SPV
+    read: true
+    write: true
+    description: Setpoint value (SPV?<n> / SPV!<n>,<pressure>)
+  setpoint_relay_status:
+    mnemonic: SPR
+    read: true
+    write: false
+    description: Setpoint relay status (SPR?<n>)
+  setpoint_source:
+    mnemonic: SPS
+    read: true
+    write: true
+    description: Setpoint source (SPS?<n> / SPS!<n>,P|T|CMB|VAC|ATM|DIFF|PIR)

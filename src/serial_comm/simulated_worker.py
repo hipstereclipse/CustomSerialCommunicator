@@ -102,6 +102,10 @@ class SimulatedGaugeWorker(QThread):
         self._rng = random.Random(hash(config.sim_id) & 0xFFFFFFFF)
         self._last_emit_mono: float | None = None
         self._last_modelled: float | None = None
+        # Auto-poll mock terminal: emit one exchange every this many polls.
+        # Keeps the terminal readable without flooding it at high poll rates.
+        self._mock_terminal_every: int = max(1, round(2.0 / max(self._poll_interval, 0.05)))
+        self._poll_count: int = 0
 
         # Fixed per-sensor calibration-like bias for realism.
         self._cal_bias_rel = self._rng.gauss(0.0, self._sim_spec.accuracy_rel / 3.0)
@@ -175,6 +179,11 @@ class SimulatedGaugeWorker(QThread):
                         reading = self._build_reading()
                         if reading is not None:
                             self.reading_ready.emit(reading)
+                            self._poll_count += 1
+                            if self._poll_count % self._mock_terminal_every == 0:
+                                self._emit_auto_poll_entry(
+                                    reading.raw, self._primary_command
+                                )
                     except Exception as exc:                       # pragma: no cover
                         logger.exception("[%s] simulation error", self._device_id)
                         self._emit_error(f"Simulation error: {exc}", recoverable=True)
@@ -396,6 +405,54 @@ class SimulatedGaugeWorker(QThread):
     def _fake_response_bytes(self, value: float) -> bytes:
         """Short generic text representation attached to :class:`DeviceReading`."""
         return f"SIM:{value:.4E}".encode("ascii")
+
+    def _fake_request_bytes(self, command: str) -> bytes:
+        """Synthesise a protocol-plausible request frame for *command*.
+
+        Mirrors the real protocol ``build_request`` framing so the terminal
+        displays convincing TX bytes without needing a live serial port.
+        """
+        protocol = (self._spec.protocol or "").lower()
+        addr = self._spec.default_address
+
+        if protocol == "ppg_ascii":
+            # @{addr:03d}{mnemonic}?\
+            cmds = self._spec.commands
+            cs = cmds.get(command)
+            mnemonic = (getattr(cs, "mnemonic", None) or command.upper())[:6]
+            return f"@{addr:03d}{mnemonic}?\\".encode("ascii")
+
+        if protocol in ("pfeiffer_ascii", "inficon_ascii"):
+            # {addr:03d}00{pid:03d}02=?{chk:03d}\r
+            cmds = self._spec.commands
+            cs = cmds.get(command)
+            pid = getattr(cs, "pid", None) or 0
+            core = f"{addr:03d}00{pid:03d}02=?"
+            chk = sum(core.encode("ascii")) % 256
+            return f"{core}{chk:03d}\r".encode("ascii")
+
+        if protocol in ("pfeiffer_binary", "inficon_binary"):
+            # Minimal 6-byte read request: addr + action(0x01) + param(0) + len(0)
+            return bytes([addr & 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00])
+
+        if protocol == "cdg_serial":
+            # Start byte only (device responds after any master byte)
+            return bytes([0x05])
+
+        return f"READ:{command}".encode("ascii")
+
+    def _emit_auto_poll_entry(self, response_bytes: bytes, command: str) -> None:
+        """Emit a synthetic TX+RX terminal entry representing an automatic poll."""
+        request = self._fake_request_bytes(command)
+        self.terminal_response.emit(
+            TerminalEntry(
+                request=request,
+                response=response_bytes,
+                timestamp=datetime.now(tz=timezone.utc),
+                command=command,
+                auto_poll=True,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Helpers

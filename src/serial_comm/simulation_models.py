@@ -47,8 +47,8 @@ class HumidityLevel(str, Enum):
 #: adsorbed water vapour on chamber walls, which out-gasses during pumping.
 HUMIDITY_TIME_FACTOR: dict[HumidityLevel, float] = {
     HumidityLevel.LOW: 1.0,
-    HumidityLevel.MEDIUM: 1.5,
-    HumidityLevel.HIGH: 2.5,
+    HumidityLevel.MEDIUM: 1.9,
+    HumidityLevel.HIGH: 3.2,
 }
 
 
@@ -177,6 +177,8 @@ class SimulatedGaugeConfig:
     leak_rate_mbar_l_s: float = 0.0
     poll_interval_s: float = 1.0
     cdg_full_scale_mbar: float | None = None
+    humidity_level: HumidityLevel = HumidityLevel.MEDIUM
+    gas_type: GasType = GasType.N2
     sim_id: str = field(default_factory=_new_sim_id)
 
     def to_dict(self) -> dict:
@@ -200,6 +202,8 @@ class SimulatedGaugeConfig:
             "leak_rate_mbar_l_s": self.leak_rate_mbar_l_s,
             "poll_interval_s": self.poll_interval_s,
             "cdg_full_scale_mbar": self.cdg_full_scale_mbar,
+            "humidity_level": self.humidity_level.value,
+            "gas_type": self.gas_type.value,
         }
 
     @classmethod
@@ -229,6 +233,8 @@ class SimulatedGaugeConfig:
                 if data.get("cdg_full_scale_mbar") is not None
                 else None
             ),
+            humidity_level=HumidityLevel(data.get("humidity_level", HumidityLevel.MEDIUM.value)),
+            gas_type=GasType(data.get("gas_type", GasType.N2.value)),
         )
 
 

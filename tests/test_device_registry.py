@@ -33,6 +33,12 @@ class TestSpecLoading:
         spec = registry.get_spec("CDG045D")
         assert spec.family == "cdg_serial"
 
+    def test_hpg400_loaded(self, registry):
+        spec = registry.get_spec("HPG400")
+        assert spec.family == "cdg_serial"
+        assert spec.protocol == "cdg_serial"
+        assert spec.experimental is True
+
     def test_tc600_loaded(self, registry):
         spec = registry.get_spec("TC600")
         assert spec.model == "TC600"

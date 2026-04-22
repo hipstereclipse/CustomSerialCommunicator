@@ -1,4 +1,5 @@
 model: PPG550
+model: PPG550
 manufacturer: INFICON
 family: inficon_ppg_ascii
 protocol: ppg_ascii
@@ -8,21 +9,37 @@ transport:
   data_bits: 8
   stop_bits: 1
   rs_modes: [RS232, RS485]
+  # RS-232 uses address 254 (global address, always accepted).
+  # RS-485 point-to-point uses device address 1-253; factory default is 253.
   default_address: 254
   rs485_address_range: [1, 253]
 commands:
+  # ── Pressure measurements ─────────────────────────────────────────
   pressure:
     mnemonic: PR3
     read: true
     write: false
     unit: mbar
-    description: Pirani pressure measurement
-  temperature:
-    mnemonic: T
+    description: Combined pressure (Pirani + Piezo crossover) — primary reading
+  pirani_pressure:
+    mnemonic: PR1
     read: true
     write: false
-    unit: "°C"
-    description: Sensor temperature
+    unit: mbar
+    description: MEMS Pirani sensor pressure measurement
+  piezo_pressure:
+    mnemonic: PR2
+    read: true
+    write: false
+    unit: mbar
+    description: MEMS Piezo diaphragm sensor pressure measurement
+  combined_pressure_hires:
+    mnemonic: PR4
+    read: true
+    write: false
+    unit: mbar
+    description: Combined pressure with 4-digit resolution
+  # ── Identification ────────────────────────────────────────────────
   software_version:
     mnemonic: FV
     read: true
@@ -33,18 +50,147 @@ commands:
     read: true
     write: false
     description: Device serial number
+  part_number:
+    mnemonic: PN
+    read: true
+    write: false
+    description: Part number
+  manufacturer:
+    mnemonic: MF
+    read: true
+    write: false
+    description: Manufacturer name
+  model_name:
+    mnemonic: MD
+    read: true
+    write: false
+    description: Model name
+  # ── Sensor / environment ──────────────────────────────────────────
+  temperature:
+    mnemonic: T
+    read: true
+    write: false
+    unit: "°C"
+    description: Pirani sensor temperature
+  # ── Communications ────────────────────────────────────────────────
+  address:
+    mnemonic: ADR
+    read: true
+    write: true
+    description: Device address (1-253); 254 = global read-only alias
+  baud_rate:
+    mnemonic: BR
+    read: true
+    write: true
+    description: "Serial baud rate: 4800, 9600, 19200, 38400, 57600, 115200 (default 9600)"
+  # ── Pressure unit ────────────────────────────────────────────────
   unit:
     mnemonic: U
     read: true
     write: true
-    description: "Pressure unit selection: mbar, Torr, Pa, psi"
+    description: "Pressure unit: MBAR, PASCAL, TORR"
+  # ── Adjustments ──────────────────────────────────────────────────
   zero_adjust:
     mnemonic: VAC
     read: false
     write: true
-    description: Execute zero adjustment (gauge at vacuum)
+    description: "Pirani zero adjustment (send empty or <pressure value>)"
   piezo_adjust:
     mnemonic: FS
+    read: true
+    write: true
+    description: "Pirani/Piezo full-scale adjustment (<pressure value> or CLEAR)"
+  atm_adjust:
+    mnemonic: ATD
+    read: true
+    write: true
+    description: "Atmospheric Piezo full-scale adjustment (<pressure value> or CLEAR)"
+  atm_zero:
+    mnemonic: ATZ
+    read: true
+    write: true
+    description: Differential Piezo zero adjustment
+  factory_default:
+    mnemonic: FD
     read: false
     write: true
-    description: Execute piezo full-scale adjustment
+    description: "Reset to factory default (ADR, AO, FS, GT, SP, U, VAC, ATD, ATZ, or NONE)"
+  # ── Gas correction ────────────────────────────────────────────────
+  gas_type:
+    mnemonic: GT
+    read: true
+    write: true
+    description: "Gas type correction: NITROGEN, HELIUM, ARGON, AIR"
+  # ── Analog output ────────────────────────────────────────────────
+  analog_output:
+    mnemonic: AO
+    read: true
+    write: true
+    description: Analog output configuration (STD or 0-39)
+  # ── Setpoints (SP1–SP3 optional relay outputs) ───────────────────
+  setpoint_1:
+    mnemonic: SP1
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 1 pressure value
+  setpoint_1_direction:
+    mnemonic: SD1
+    read: true
+    write: true
+    description: "Setpoint 1 direction: ABOVE or BELOW"
+  setpoint_1_enable:
+    mnemonic: EN1
+    read: true
+    write: true
+    description: "Setpoint 1 enable: OFF or ON"
+  setpoint_1_hysteresis:
+    mnemonic: SH1
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 1 hysteresis band (pressure value)
+  setpoint_2:
+    mnemonic: SP2
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 2 pressure value
+  setpoint_2_direction:
+    mnemonic: SD2
+    read: true
+    write: true
+    description: "Setpoint 2 direction: ABOVE or BELOW"
+  setpoint_2_enable:
+    mnemonic: EN2
+    read: true
+    write: true
+    description: "Setpoint 2 enable: OFF or ON"
+  setpoint_2_hysteresis:
+    mnemonic: SH2
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 2 hysteresis band (pressure value)
+  setpoint_3:
+    mnemonic: SP3
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 3 pressure value
+  setpoint_3_direction:
+    mnemonic: SD3
+    read: true
+    write: true
+    description: "Setpoint 3 direction: ABOVE or BELOW"
+  setpoint_3_enable:
+    mnemonic: EN3
+    read: true
+    write: true
+    description: "Setpoint 3 enable: OFF or ON"
+  setpoint_3_hysteresis:
+    mnemonic: SH3
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 3 hysteresis band (pressure value)

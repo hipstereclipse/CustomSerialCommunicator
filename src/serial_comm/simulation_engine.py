@@ -52,6 +52,20 @@ _ROUGHING_TAU_S: float = 60.0    # e-folding time, roughing stage
 _HIGHVAC_TAU_S: float = 150.0    # e-folding time, high-vac stage
 _CROSSOVER_MBAR: float = 1.0     # pressure where high-vac pump takes over
 
+# Moisture-loaded surfaces outgas after pump start. This adds a long tail that
+# is especially visible at medium/high humidity and keeps real pumpdowns from
+# unrealistically reaching deep vacuum too quickly.
+_OUTGASSING_TAU_S: dict[HumidityLevel, float] = {
+    HumidityLevel.LOW: 420.0,
+    HumidityLevel.MEDIUM: 780.0,
+    HumidityLevel.HIGH: 1200.0,
+}
+_OUTGASSING_START_FRACTION: dict[HumidityLevel, float] = {
+    HumidityLevel.LOW: 0.01,
+    HumidityLevel.MEDIUM: 0.03,
+    HumidityLevel.HIGH: 0.07,
+}
+
 
 class SimulationEngine:
     """Process-wide shared clock/pressure source for simulated gauges.
@@ -263,8 +277,12 @@ class SimulationEngine:
           P₂(t′) = P_cross · exp(-t′ / (τ₂ · h))
           where t′ is the time elapsed since reaching crossover.
 
-        Both stages run simultaneously from t=0 using the joint expression
-        that smoothly transitions at the crossover pressure.
+                Moisture outgassing tail:
+                    P_out(t) = (P_atm * f_humidity) · exp(-t / τ_out)
+
+                where ``f_humidity`` and ``τ_out`` depend on selected humidity. This
+                keeps medium/high humidity pumpdowns slower in the 1e-2 to 1e-5 mbar
+                region, matching common chamber behavior.
         """
         base = self._base_pressure_mbar
         if base >= P_ATM_MBAR:
@@ -290,8 +308,14 @@ class SimulationEngine:
         # Stage 2: high-vac exponential from crossover pressure toward base.
         t2 = t - t_cross
         p_hv = _CROSSOVER_MBAR * math.exp(-t2 / tau2)
-        # Blend both contributions; high-vac term dominates below crossover.
-        pressure = max(p_rough, p_hv, base)
+
+        out_tau = _OUTGASSING_TAU_S.get(self._humidity, 780.0)
+        out_frac = _OUTGASSING_START_FRACTION.get(self._humidity, 0.03)
+        p_out = (P_ATM_MBAR * out_frac) * math.exp(-t / out_tau)
+
+        # Blend contributions; high-vac term dominates below crossover and
+        # outgassing limits ultimate speed in humid environments.
+        pressure = max(p_rough, p_hv, p_out, base)
         # Clamp to base once we’re close enough.
         if pressure <= base * 1.0001:
             return base

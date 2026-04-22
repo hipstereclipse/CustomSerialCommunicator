@@ -60,6 +60,21 @@ _SIM_SETTINGS_TITLE: str = "⊕ Simulation"
 logger = logging.getLogger(__name__)
 
 
+def _spec_full_scale_mbar(spec) -> float | None:
+    """Extract the declared full-scale pressure (mbar) from a DeviceSpec, if any.
+
+    Reads ``_raw_extra.full_scale_mbar`` — currently set by CDG specs. Returns
+    ``None`` for gauges without a declared factory range so the combined plot
+    can decide on a sensible fallback.
+    """
+    raw = getattr(spec, "__dict__", {}).get("_raw_extra", {}) or {}
+    fs = raw.get("full_scale_mbar")
+    try:
+        return float(fs) if fs else None
+    except (TypeError, ValueError):
+        return None
+
+
 class MainWindow(QMainWindow):
     """Main application window."""
 
@@ -257,7 +272,7 @@ class MainWindow(QMainWindow):
             dlg = AddGaugeDialog(self._registry, self)
             if not dlg.exec():
                 return
-            cfg = dlg.result_config()
+            cfgs = dlg.result_configs()
         except Exception as exc:
             logger.exception("Add-gauge dialog crashed")
             QMessageBox.critical(
@@ -266,7 +281,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if cfg is None:
+        if not cfgs:
             QMessageBox.warning(
                 self, "Incomplete configuration",
                 "No valid gauge configuration was produced. "
@@ -274,13 +289,21 @@ class MainWindow(QMainWindow):
             )
             return
 
-        try:
-            self._connect_gauge(cfg)
-        except Exception as exc:
-            logger.exception("Failed to connect gauge")
+        failures: list[str] = []
+        for cfg in cfgs:
+            try:
+                self._connect_gauge(cfg)
+            except Exception as exc:
+                logger.exception("Failed to connect gauge")
+                model = getattr(cfg.get("spec"), "model", "Unknown")
+                port = cfg.get("port", "?")
+                failures.append(f"{model} on {port}: {exc}")
+
+        if failures:
             QMessageBox.critical(
-                self, "Connection failed",
-                f"Could not start gauge worker:\n\n{exc}",
+                self,
+                "Connection failed",
+                "Some gauges could not be connected:\n\n" + "\n".join(failures),
             )
 
     def _connect_gauge(self, cfg: dict) -> None:
@@ -336,7 +359,10 @@ class MainWindow(QMainWindow):
 
         # Register in Main combined tab
         display_name = f"{spec.model} {cfg['port']}"
-        self._main_tab.add_gauge(device_id, display_name, color)
+        self._main_tab.add_gauge(
+            device_id, display_name, color,
+            full_scale_mbar=_spec_full_scale_mbar(spec),
+        )
         # Forward pressure readings to the combined view
         worker.reading_ready.connect(
             lambda reading, did=device_id: self._feed_main_tab(did, reading)
@@ -431,6 +457,8 @@ class MainWindow(QMainWindow):
                 if config.pattern is SimulationPattern.CUSTOM else None,
                 reset_clock=True,
             )
+            engine.set_humidity(config.humidity_level)
+            engine.set_gas(config.gas_type)
 
         engine.register(config)
         worker = SimulatedGaugeWorker(spec=spec, config=config)
@@ -462,7 +490,17 @@ class MainWindow(QMainWindow):
         # 3. Register in tracking dicts and Combined Simulation tab
         self._gauge_tabs[config.sim_id] = tab
         self._sim_ids.add(config.sim_id)
-        self._combined_sim_tab.add_gauge(config.sim_id, config.display_name, color)
+        # Simulated gauges can supply an explicit CDG full-scale; fall back to the
+        # spec default otherwise.
+        sim_full_scale = (
+            float(config.cdg_full_scale_mbar)
+            if config.cdg_full_scale_mbar is not None
+            else _spec_full_scale_mbar(spec)
+        )
+        self._combined_sim_tab.add_gauge(
+            config.sim_id, config.display_name, color,
+            full_scale_mbar=sim_full_scale,
+        )
         worker.reading_ready.connect(
             lambda reading, did=config.sim_id: self._feed_combined_sim_tab(did, reading)
         )
@@ -833,7 +871,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, str)
     def _on_gauge_color_changed(self, device_id: str, color: str) -> None:
-        """The colour swatch in an individual GaugeTab was clicked → propagate."""
+        """Colour changed for a gauge (list-panel dot or GaugeTab swatch) → propagate everywhere."""
         self._gauge_colors[device_id] = color
         # Update the matching combined tab
         if device_id in self._sim_ids:
@@ -844,6 +882,9 @@ class MainWindow(QMainWindow):
                 self._main_tab.set_gauge_color(device_id, color)
         # Update the tab-bar label colour
         tab = self._gauge_tabs.get(device_id)
+        # Update the individual GaugeTab's plot traces and terminal highlight
+        if tab is not None:
+            tab.set_gauge_color(color)
         self._set_tab_label_color(tab, color)
         self._set_list_entry_color(device_id, color)
 
