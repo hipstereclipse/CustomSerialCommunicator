@@ -19,6 +19,7 @@ from PyQt6.QtGui import QColor, QDoubleValidator
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QColorDialog,
+    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
@@ -81,6 +82,8 @@ class CombinedTab(QWidget):
 
         self._chart_layout: str = "overlay"  # overlay | stacked | grid
         self._sync_hover: bool = True
+        self._comparison_enabled: bool = False
+        self._plot_paused: bool = False
 
         self._plots: list[pg.PlotItem] = []
         self._plot_to_devices: dict[pg.PlotItem, list[str]] = {}
@@ -137,7 +140,15 @@ class CombinedTab(QWidget):
         plot_col.addWidget(self._value_bar)
 
         middle.addLayout(plot_col, 1)
-        middle.addWidget(self._build_controls_panel(), 0)
+        self._controls_panel = self._build_controls_panel()
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        controls_scroll.setWidget(self._controls_panel)
+        self._controls_scroll = controls_scroll
+        middle.addWidget(self._controls_scroll, 0)
         root.addLayout(middle, 1)
 
         self._gauge_row_inner = QWidget()
@@ -153,6 +164,7 @@ class CombinedTab(QWidget):
         gauge_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         gauge_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         gauge_scroll.setFixedHeight(46)
+        self._gauge_scroll = gauge_scroll
         root.addWidget(gauge_scroll)
 
         kind = "simulated" if self._is_simulation else "real"
@@ -171,7 +183,8 @@ class CombinedTab(QWidget):
         panel = QFrame()
         panel.setObjectName("CombinedPlotControls")
         panel.setFrameShape(QFrame.Shape.StyledPanel)
-        panel.setFixedWidth(228)
+        panel.setMinimumWidth(210)
+        panel.setMaximumWidth(360)
         panel.setStyleSheet(
             "QFrame#CombinedPlotControls {"
             "  background: #252525;"
@@ -216,10 +229,20 @@ class CombinedTab(QWidget):
         title.setStyleSheet("color:#FFFFFF; font-weight:600; font-size:13px;")
         v.addWidget(title)
 
+        plot_btn_row = QHBoxLayout()
+        plot_btn_row.setSpacing(6)
+
         self._clear_btn = QPushButton("Clear Plot")
         self._clear_btn.setObjectName("ClearBtn")
         self._clear_btn.clicked.connect(self.clear_data)
-        v.addWidget(self._clear_btn)
+        plot_btn_row.addWidget(self._clear_btn, 1)
+
+        self._pause_plot_btn = QPushButton("Pause Plot")
+        self._pause_plot_btn.setObjectName("SyncBtn")
+        self._pause_plot_btn.clicked.connect(self._on_pause_plot_clicked)
+        plot_btn_row.addWidget(self._pause_plot_btn, 1)
+
+        v.addLayout(plot_btn_row)
 
         v.addWidget(_hline())
 
@@ -243,6 +266,32 @@ class CombinedTab(QWidget):
         self._sync_btn.setChecked(True)
         self._sync_btn.toggled.connect(self._on_sync_toggled)
         v.addWidget(self._sync_btn)
+
+        v.addWidget(_hline())
+
+        cmp_lbl = QLabel("Analysis")
+        cmp_lbl.setProperty("section", True)
+        v.addWidget(cmp_lbl)
+
+        self._compare_enable_btn = QPushButton("Compare Two Gauges")
+        self._compare_enable_btn.setCheckable(True)
+        self._compare_enable_btn.setObjectName("SyncBtn")
+        self._compare_enable_btn.toggled.connect(self._on_compare_toggled)
+        v.addWidget(self._compare_enable_btn)
+
+        self._compare_a = QComboBox()
+        self._compare_b = QComboBox()
+        self._compare_a.currentIndexChanged.connect(self._refresh_value_bar_for_compare)
+        self._compare_b.currentIndexChanged.connect(self._refresh_value_bar_for_compare)
+        v.addWidget(QLabel("Gauge A"))
+        v.addWidget(self._compare_a)
+        v.addWidget(QLabel("Gauge B"))
+        v.addWidget(self._compare_b)
+
+        self._compare_help = QLabel("Shows ΔP, Δ%, and A/B at cursor position")
+        self._compare_help.setStyleSheet("color:#9FA9B2; font-size:10px;")
+        v.addWidget(self._compare_help)
+        self._set_compare_controls_enabled(False)
 
         v.addWidget(_hline())
 
@@ -309,6 +358,13 @@ class CombinedTab(QWidget):
         self._set_layout_button_state()
         return panel
 
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        panel_width = max(210, min(360, int(self.width() * 0.24)))
+        self._controls_scroll.setFixedWidth(panel_width + 8)
+        self._controls_panel.setFixedWidth(panel_width)
+        self._gauge_scroll.setFixedHeight(46 if self.height() > 520 else 56)
+
     def _make_layout_btn(self, text: str, mode: str) -> QPushButton:
         btn = QPushButton(text)
         btn.setProperty("layout", True)
@@ -342,6 +398,7 @@ class CombinedTab(QWidget):
         self._visible.setdefault(device_id, True)
         self._rebuild_plot_layout()
         self._rebuild_chip_row()
+        self._refresh_comparison_sources()
         self._empty_label.hide()
         self._refresh_y_axis()
 
@@ -354,6 +411,7 @@ class CombinedTab(QWidget):
         g["color_btn"] = None
         self._rebuild_plot_layout()
         self._rebuild_chip_row()
+        self._refresh_comparison_sources()
         if not self._gauges:
             self._empty_label.show()
         self._refresh_y_axis()
@@ -373,6 +431,9 @@ class CombinedTab(QWidget):
         tb.append(t_rel)
         vb.append(value)
 
+        if self._plot_paused:
+            return
+
         curve = g.get("curve")
         if curve is not None:
             t_arr = np.array(tb, dtype=float)
@@ -380,6 +441,30 @@ class CombinedTab(QWidget):
             curve.setData(t_arr, v_arr)
             curve.setVisible(self._visible.get(device_id, True))
 
+        self._refresh_x_axis()
+        if self._y_mode == "auto_center":
+            self._refresh_y_axis()
+
+    def _refresh_all_curves(self) -> None:
+        for device_id, g in self._gauges.items():
+            curve = g.get("curve")
+            if curve is None:
+                continue
+            tb: deque = g["time_buf"]
+            vb: deque = g["val_buf"]
+            t_arr = np.array(tb, dtype=float)
+            v_arr = np.where(np.array(vb, dtype=float) > 0, np.array(vb, dtype=float), 1e-12)
+            curve.setData(t_arr, v_arr)
+            curve.setVisible(self._visible.get(device_id, True))
+
+    def _on_pause_plot_clicked(self) -> None:
+        self._plot_paused = not self._plot_paused
+        if self._plot_paused:
+            self._pause_plot_btn.setText("Resume Plot")
+            return
+
+        self._pause_plot_btn.setText("Pause Plot")
+        self._refresh_all_curves()
         self._refresh_x_axis()
         if self._y_mode == "auto_center":
             self._refresh_y_axis()
@@ -525,7 +610,8 @@ class CombinedTab(QWidget):
     def _setup_plot_item(self, plot: pg.PlotItem, *, title: str = "") -> None:
         plot.showGrid(x=True, y=True, alpha=0.3)
         plot.setLabel("bottom", "Time", units="s")
-        plot.setLabel("left", "Pressure", units=self._display_unit)
+        # Avoid SI prefix scaling by building our own label
+        plot.setLabel("left", f"Pressure ({self._display_unit})", units="")
         plot.setLogMode(x=False, y=True)
         if title:
             plot.setTitle(title, color="#AFC4D2", size="10pt")
@@ -723,6 +809,42 @@ class CombinedTab(QWidget):
         self._sync_btn.style().unpolish(self._sync_btn)
         self._sync_btn.style().polish(self._sync_btn)
 
+    def _set_compare_controls_enabled(self, enabled: bool) -> None:
+        self._compare_a.setEnabled(enabled)
+        self._compare_b.setEnabled(enabled)
+        self._compare_help.setEnabled(enabled)
+
+    def _on_compare_toggled(self, enabled: bool) -> None:
+        self._comparison_enabled = bool(enabled)
+        self._set_compare_controls_enabled(enabled)
+        self._refresh_value_bar_for_compare()
+
+    def _refresh_comparison_sources(self) -> None:
+        current_a = self._compare_a.currentData()
+        current_b = self._compare_b.currentData()
+        self._compare_a.blockSignals(True)
+        self._compare_b.blockSignals(True)
+        self._compare_a.clear()
+        self._compare_b.clear()
+        for did, gauge in self._gauges.items():
+            self._compare_a.addItem(gauge["name"], did)
+            self._compare_b.addItem(gauge["name"], did)
+        if self._compare_a.count() >= 1:
+            idx_a = self._compare_a.findData(current_a)
+            self._compare_a.setCurrentIndex(max(idx_a, 0))
+        if self._compare_b.count() >= 1:
+            idx_b = self._compare_b.findData(current_b)
+            if idx_b < 0:
+                idx_b = 1 if self._compare_b.count() > 1 else 0
+            self._compare_b.setCurrentIndex(idx_b)
+        self._compare_a.blockSignals(False)
+        self._compare_b.blockSignals(False)
+
+    def _refresh_value_bar_for_compare(self) -> None:
+        text = self._value_bar.text()
+        if text:
+            self._value_bar.setText(text)
+
     def _setup_crosshair_proxy(self) -> None:
         for plot in self._plots:
             line = pg.InfiniteLine(
@@ -795,6 +917,24 @@ class CombinedTab(QWidget):
                 f"<span style='color:{g['color']}'><b>{g['name']}</b></span>: "
                 f"{v:.3E} {self._display_unit}"
             )
+
+        if self._comparison_enabled and self._compare_a.count() > 0 and self._compare_b.count() > 0:
+            did_a = self._compare_a.currentData()
+            did_b = self._compare_b.currentData()
+            if isinstance(did_a, str) and isinstance(did_b, str) and did_a != did_b:
+                ga = self._gauges.get(did_a)
+                gb = self._gauges.get(did_b)
+                if ga is not None and gb is not None:
+                    va = _value_at_x(ga["time_buf"], ga["val_buf"], x)
+                    vb = _value_at_x(gb["time_buf"], gb["val_buf"], x)
+                    if va is not None and vb is not None and vb != 0:
+                        delta = va - vb
+                        ratio = va / vb
+                        pct = (delta / abs(vb)) * 100.0
+                        parts.append(
+                            f"<span style='color:#E8D74C'><b>Compare</b></span>: "
+                            f"Δ={delta:.3E} {self._display_unit}, Δ%={pct:+.2f}%, A/B={ratio:.4g}"
+                        )
 
         if parts:
             self._value_bar.setText("  |  ".join(parts))

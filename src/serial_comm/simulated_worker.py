@@ -28,6 +28,7 @@ from typing import Optional
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from serial_comm.models import DeviceError, DeviceReading, DeviceSpec, TerminalEntry
+from serial_comm.protocols.base import GaugeProtocol
 from serial_comm.simulation_engine import SimulationEngine, get_engine
 from serial_comm.simulation_models import (
     CDG_FULL_SCALE_OPTIONS_MBAR,
@@ -87,6 +88,7 @@ class SimulatedGaugeWorker(QThread):
         spec: DeviceSpec,
         config: SimulatedGaugeConfig,
         engine: SimulationEngine | None = None,
+        protocol: GaugeProtocol | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -99,6 +101,7 @@ class SimulatedGaugeWorker(QThread):
         self._poll_interval = max(float(config.poll_interval_s), 0.05)
         self._terminal_queue: _queue.SimpleQueue = _queue.SimpleQueue()
         self._polling_enabled = True
+        self._protocol = protocol
         self._rng = random.Random(hash(config.sim_id) & 0xFFFFFFFF)
         self._last_emit_mono: float | None = None
         self._last_modelled: float | None = None
@@ -106,6 +109,7 @@ class SimulatedGaugeWorker(QThread):
         # Keeps the terminal readable without flooding it at high poll rates.
         self._mock_terminal_every: int = max(1, round(2.0 / max(self._poll_interval, 0.05)))
         self._poll_count: int = 0
+        self._sim_command_state: dict[str, str] = {}
 
         # Fixed per-sensor calibration-like bias for realism.
         self._cal_bias_rel = self._rng.gauss(0.0, self._sim_spec.accuracy_rel / 3.0)
@@ -115,6 +119,7 @@ class SimulatedGaugeWorker(QThread):
         # the spec's explicit "pressure" entry but fall back to the first
         # readable command if the spec uses different naming.
         self._primary_command, self._primary_unit = self._pick_primary_command()
+        self._init_sim_command_state()
 
     # ------------------------------------------------------------------
     # Convenience accessors (mirror GaugeWorker so callers can duck-type)
@@ -226,6 +231,11 @@ class SimulatedGaugeWorker(QThread):
         """Turn the engine's "real" pressure into what this gauge would read."""
         family = self._family
 
+        # OPG550 is explicitly modelled as a Pirani + cold-cathode combination
+        # gauge with a pressure-dependent crossover and banded accuracy.
+        if self._config.model.upper() == "OPG550":
+            return self._model_opg550_combination(real_mbar, gas, command)
+
         # Combination gauges branch per-command first; whichever sub-family
         # applies drives the noise/range behaviour below.
         if family is GaugeFamily.COMBINATION:
@@ -276,9 +286,9 @@ class SimulatedGaugeWorker(QThread):
 
     def _model_cdg(self, real_mbar: float) -> float:
         fs = max(self._cdg_full_scale_mbar, 1e-9)
-        if real_mbar > fs:
-            return _CC_OVERRANGE
-        p = max(real_mbar, fs * 1e-6)
+        # CDG minimum reading: 0.05% of full scale per INFICON specs
+        cdg_min_mbar = fs * 0.5e-3  # 0.05% of full scale
+        p = max(real_mbar, cdg_min_mbar)
 
         # First two decades below full-scale keep nominal accuracy.
         # Below that, log-linear analog output and sensor nonlinearity degrade.
@@ -289,8 +299,13 @@ class SimulatedGaugeWorker(QThread):
             acc_abs *= (1.0 + 1.0 * decades_below)
 
         rep_abs = fs * self._sim_spec.repeatability_rel
-        bias = self._rng.gauss(0.0, acc_abs / 3.0)
-        noise = self._rng.gauss(0.0, rep_abs / 3.0)
+        # Clamp absolute noise so readings at the bottom of the range don't jump by
+        # full decades.  Peak-to-peak fluctuation is bounded to ±1.5× the CDG minimum
+        # detectable pressure (0.05 % FS), keeping the simulated signal realistic near
+        # the lowest suggested reading rather than spanning multiple pressure decades.
+        max_noise_abs = cdg_min_mbar * 1.5
+        bias = max(-max_noise_abs, min(max_noise_abs, self._rng.gauss(0.0, acc_abs / 3.0)))
+        noise = max(-max_noise_abs, min(max_noise_abs, self._rng.gauss(0.0, rep_abs / 3.0)))
         return max(min(p + bias + noise, fs), 0.0)
 
     def _model_cold_cathode(self, real_mbar: float) -> float:
@@ -304,6 +319,58 @@ class SimulatedGaugeWorker(QThread):
         log_p = math.log10(max(real_mbar, 1e-30))
         log_noise = self._rng.gauss(0.0, _CC_LOG_NOISE_SIGMA)
         return 10 ** (log_p + log_noise)
+
+    def _model_opg550_combination(self, real_mbar: float, gas: GasType, command: str) -> float:
+        lc = command.lower()
+        if "pirani" in lc or "thermal" in lc:
+            base = self._model_pirani(real_mbar, gas)
+        elif any(k in lc for k in ("ion", "cold", "cc", "cath")):
+            base = self._model_cold_cathode(real_mbar)
+        else:
+            lo = self._sim_spec.blend_low_mbar or 7e-4
+            hi = self._sim_spec.blend_high_mbar or 2e-3
+            if real_mbar >= hi:
+                base = self._model_pirani(real_mbar, gas)
+            elif real_mbar <= lo:
+                base = self._model_cold_cathode(real_mbar)
+            else:
+                span = max(hi - lo, 1e-12)
+                frac = (real_mbar - lo) / span
+                p_pirani = self._model_pirani(real_mbar, gas)
+                p_cc = self._model_cold_cathode(real_mbar)
+                if p_cc <= 0.0 or p_cc >= _CC_OVERRANGE:
+                    base = p_pirani
+                else:
+                    base = p_cc * (1.0 - frac) + p_pirani * frac
+
+        if base <= 0.0 or base >= _CC_OVERRANGE:
+            return base
+        rel_acc = self._opg550_accuracy_rel(max(real_mbar, 1e-12))
+        return self._apply_relative_accuracy(base, rel_acc)
+
+    @staticmethod
+    def _opg550_accuracy_rel(pressure_mbar: float) -> float:
+        """Piecewise relative accuracy envelope used for OPG550 simulation."""
+        p = max(pressure_mbar, 1e-12)
+        if p >= 100.0:
+            return 0.005
+        if p >= 2.0:
+            return 0.01
+        if p >= 1e-4:
+            return 0.05
+        if p >= 1e-5:
+            return 0.25
+        return 0.45
+
+    def _apply_relative_accuracy(self, reading_mbar: float, rel_accuracy: float) -> float:
+        """Apply bounded bias/noise so readings stay within the target accuracy band."""
+        if reading_mbar <= 0.0:
+            return reading_mbar
+        repeat_rel = min(self._sim_spec.repeatability_rel, rel_accuracy * 0.5)
+        bias = self._rng.gauss(0.0, rel_accuracy / 3.0)
+        noise = self._rng.gauss(0.0, repeat_rel / 3.0)
+        adjusted = reading_mbar * (1.0 + (0.35 * self._cal_bias_rel) + bias + noise)
+        return max(min(adjusted, self._sim_spec.max_mbar), self._sim_spec.min_mbar)
 
     def _apply_sensor_dynamics(self, target: float, now_mono: float) -> float:
         """First-order lag so readings move like real sensors, not instant jumps."""
@@ -378,13 +445,25 @@ class SimulatedGaugeWorker(QThread):
                                            command or self._primary_command)
         protocol = (self._spec.protocol or "").lower()
 
+        if command:
+            custom = self._fake_stateful_command_response(frame, command, protocol)
+            if custom is not None:
+                return custom
+
         if protocol == "ppg_ascii":
             return f"@{self._spec.default_address:03d}ACK{value:.3E}\\".encode("ascii")
 
         if protocol in ("pfeiffer_ascii", "inficon_ascii"):
-            # <addr>10<pid><len><payload><chk>\r — an opaque but well-formed frame.
-            payload = f"{value:.3E}"
-            core = f"{self._spec.default_address:03d}10{0:03d}{len(payload):02d}{payload}"
+            cmd_name = command or self._primary_command
+            payload = self._format_ascii_payload(cmd_name, value)
+            pid = 0
+            cmd_spec = self._spec.commands.get(cmd_name)
+            if cmd_spec is not None and cmd_spec.pid is not None:
+                pid = int(cmd_spec.pid)
+            core = (
+                f"{self._spec.default_address:03d}10{pid:03d}"
+                f"{len(payload):02d}{payload}"
+            )
             chk = sum(core.encode("ascii")) % 256
             return f"{core}{chk:03d}\r".encode("ascii")
 
@@ -396,14 +475,145 @@ class SimulatedGaugeWorker(QThread):
             return header + payload + b"\x00\x00"
 
         if protocol == "cdg_serial":
-            # Synchronisation byte + raw payload, fixed length 9.
-            raw = int(max(0.0, min(value * 1000, 0xFFFF))).to_bytes(2, "big")
-            return b"\x07" + raw + b"\x00" * 6
+            return self._build_cdg_frame(value)
 
         return self._fake_response_bytes(value)
 
+    def _init_sim_command_state(self) -> None:
+        for name in self._spec.commands:
+            lname = name.lower()
+            if "setpoint" in lname:
+                if "direction" in lname:
+                    self._sim_command_state[name] = "ABOVE"
+                elif "enable" in lname:
+                    self._sim_command_state[name] = "OFF"
+                else:
+                    self._sim_command_state[name] = "0"
+
+    def _fake_stateful_command_response(
+        self,
+        frame: bytes,
+        command: str,
+        protocol: str,
+    ) -> bytes | None:
+        if protocol != "ppg_ascii":
+            return None
+        if command not in self._sim_command_state:
+            return None
+
+        text = frame.decode("ascii", errors="ignore")
+        is_write = "!" in text
+        if is_write:
+            payload = text.split("!", 1)[1].rstrip("\\").strip()
+            if "," in payload:
+                payload = payload.split(",")[-1].strip()
+            self._sim_command_state[command] = payload.upper() if payload else self._sim_command_state[command]
+
+        value = self._sim_command_state.get(command, "0")
+        return f"@{self._spec.default_address:03d}ACK{value}\\".encode("ascii")
+
+    def _format_ascii_payload(self, command: str, value: float) -> str:
+        """Return a protocol-appropriate ASCII data payload for *command*."""
+        cmd_spec = self._spec.commands.get(command)
+        data_type = (getattr(cmd_spec, "data_type", None) or "string").lower()
+
+        if command == "software_version":
+            return "SIM-1.0"
+        if command == "serial_number":
+            return f"SIM{abs(hash(self._device_id)) % 1000000:06d}"
+        if command == "error_status":
+            return "OK"
+        if command == "temperature":
+            p = max(self._engine.current_real_pressure(), 1e-9)
+            norm = max(0.0, min(1.0, (math.log10(p) + 9.0) / 12.0))
+            temp_c = 28.0 + (norm * 22.0)
+            return f"{int(round(temp_c * 100.0)):06d}"
+
+        if data_type in ("u_expo_new", "u_expo"):
+            return self._encode_u_expo_new(value)
+        if data_type == "u_real":
+            return f"{int(round(max(value, 0.0) * 100.0)):06d}"
+        if data_type == "u_integer":
+            return f"{int(round(max(value, 0.0))):06d}"
+        if data_type == "u_short_int":
+            return f"{int(round(max(value, 0.0))):03d}"
+        if data_type == "boolean_new":
+            return "1" if value > 0.5 else "0"
+        if data_type == "boolean_old":
+            return "111111" if value > 0.5 else "000000"
+        return f"{value:.3E}"
+
+    @staticmethod
+    def _encode_u_expo_new(value: float) -> str:
+        """Encode a positive pressure value into 6-digit u_expo_new form."""
+        v = max(float(value), 1e-12)
+        exp = int(math.floor(math.log10(v)))
+        mant = int(round((v / (10 ** exp)) * 1000.0))
+        if mant >= 10000:
+            mant //= 10
+            exp += 1
+        exp_code = max(0, min(99, exp + 20))
+        return f"{mant:04d}{exp_code:02d}"
+
+    # Map CDG model name -> sensor type code (byte 7 of CDG frame)
+    _CDG_SENSOR_TYPE: dict[str, int] = {
+        "CDG025D": 0,
+        "CDG045D": 1,
+        "CDG100D": 2,
+        "CDG160D": 3,
+        "CDG200D": 4,
+    }
+
+    def _build_cdg_frame(self, modelled_mbar: float) -> bytes:
+        """Build a correct 9-byte CDG streaming frame for the given pressure.
+
+        Frame layout (TIRA49E1):
+          [0] 0x07  sync
+          [1] page (0x00 for continuous stream)
+          [2] status byte (setpoint/unit bits — 0x00 = mbar, no SP active)
+          [3] error byte (0x01=underrange, 0x02=overrange, 0x00=normal)
+          [4] measurement high byte  ⎫ signed int16: value / full_scale * 16384
+          [5] measurement low byte   ⎭
+          [6] read command echo (0x00)
+          [7] sensor type code
+          [8] checksum = sum(bytes[1:8]) % 256
+        """
+        fs = max(self._cdg_full_scale_mbar, 1e-9)
+        model_upper = self._config.model.upper()
+        sensor_code = self._CDG_SENSOR_TYPE.get(model_upper, 1)
+
+        err_byte = 0x00
+        if modelled_mbar >= _CC_OVERRANGE:
+            err_byte = 0x02
+            meas_i16 = 0x7FFF
+        elif modelled_mbar <= 0.0:
+            err_byte = 0x01
+            meas_i16 = 0
+        else:
+            raw = int(round(modelled_mbar / fs * 16384.0))
+            meas_i16 = max(-32768, min(32767, raw))
+
+        page = 0x00
+        status = 0x00  # mbar unit, no setpoints triggered
+        echo = 0x00
+
+        if meas_i16 < 0:
+            meas_bytes = (meas_i16 & 0xFFFF).to_bytes(2, "big")
+        else:
+            meas_bytes = meas_i16.to_bytes(2, "big")
+
+        frame = bytearray([0x07, page, status, err_byte,
+                           meas_bytes[0], meas_bytes[1],
+                           echo, sensor_code])
+        checksum = sum(frame[1:8]) & 0xFF
+        frame.append(checksum)
+        return bytes(frame)
+
     def _fake_response_bytes(self, value: float) -> bytes:
         """Short generic text representation attached to :class:`DeviceReading`."""
+        protocol = (self._spec.protocol or "").lower()
+        if protocol == "cdg_serial":
+            return self._build_cdg_frame(value)
         return f"SIM:{value:.4E}".encode("ascii")
 
     def _fake_request_bytes(self, command: str) -> bytes:
@@ -436,18 +646,22 @@ class SimulatedGaugeWorker(QThread):
             return bytes([addr & 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00])
 
         if protocol == "cdg_serial":
-            # Start byte only (device responds after any master byte)
-            return bytes([0x05])
+            # 5-byte read command: START=0x03, service=0x00, addr=0x00, data=0x00, checksum=0x00
+            return bytes([0x03, 0x00, 0x00, 0x00, 0x00])
 
         return f"READ:{command}".encode("ascii")
 
     def _emit_auto_poll_entry(self, response_bytes: bytes, command: str) -> None:
         """Emit a synthetic TX+RX terminal entry representing an automatic poll."""
         request = self._fake_request_bytes(command)
+        # Build a proper protocol-framed response so the terminal parser can
+        # decode it without checksum / format errors.  The generic reading.raw
+        # bytes are fine for internal accounting but not for display.
+        framed = self._fake_terminal_response(request, command)
         self.terminal_response.emit(
             TerminalEntry(
                 request=request,
-                response=response_bytes,
+                response=framed,
                 timestamp=datetime.now(tz=timezone.utc),
                 command=command,
                 auto_poll=True,

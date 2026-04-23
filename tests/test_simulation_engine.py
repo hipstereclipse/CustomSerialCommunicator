@@ -47,8 +47,8 @@ def test_pumpdown_at_key_times() -> None:
         p_10m = eng._pumpdown_locked(600.0)
     # P(0) == P_atm exactly.
     assert p_at_0 == pytest.approx(P_ATM_MBAR, rel=1e-12)
-    # Curve decreases monotonically and remains bounded above base.
-    assert base < p_10m < p_1m < P_ATM_MBAR
+    # Curve decreases monotonically and may reach base by 10 minutes.
+    assert base <= p_10m < p_1m < P_ATM_MBAR
 
 
 def test_pumpdown_stays_at_base_after_completion() -> None:
@@ -59,6 +59,32 @@ def test_pumpdown_stays_at_base_after_completion() -> None:
     with eng._lock:
         p = eng._pumpdown_locked(24 * 3600.0)  # far in the future
     assert p == pytest.approx(base, rel=1e-12)
+
+
+def test_pumpdown_reaches_e6_range_within_two_minutes() -> None:
+    """Default pumpdown should reach high-vac (1e-6..1e-5-ish) quickly."""
+    eng = SimulationEngine()
+    eng.set_pattern(SimulationPattern.PUMPDOWN, base_pressure_mbar=8e-6)
+    with eng._lock:
+        p_120 = eng._pumpdown_locked(120.0)
+    assert p_120 <= 1e-5
+
+
+def test_pumpdown_shows_roughing_then_turbo_handoff() -> None:
+    """Roughing dominates early, then turbo rapidly improves pressure."""
+    eng = SimulationEngine()
+    eng.set_pattern(SimulationPattern.PUMPDOWN, base_pressure_mbar=1e-6)
+    with eng._lock:
+        p_30 = eng._pumpdown_locked(30.0)
+        p_50 = eng._pumpdown_locked(50.0)
+        p_90 = eng._pumpdown_locked(90.0)
+
+    # Around 30 s we're still in rough vacuum (> 1 Torr region).
+    assert p_30 > 1.333
+    # Around 50 s we should be near/through the 1..10 Torr crossover band.
+    assert p_50 < 13.333
+    # By ~90 s turbo stage should have pushed well into high vacuum.
+    assert p_90 < 1e-3
 
 
 # ── LEAK ─────────────────────────────────────────────────────────────────────

@@ -194,8 +194,9 @@ class PortScanner(QThread):
                 best_rel_err = rel_err
                 best_val = float(nearest)
 
-        # Require a reasonably close match; otherwise avoid forcing a wrong scale.
-        if best_val is not None and best_rel_err <= 0.05:
+        # Be conservative: only accept near-exact matches. A wrong full-scale
+        # causes large pressure conversion errors, so prefer "unknown".
+        if best_val is not None and best_rel_err <= 0.005:
             return best_val
 
         logger.debug(

@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import html
 import logging
+import math
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import Qt, pyqtSlot
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QLabel,
+    QCheckBox, QComboBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QScrollArea, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -145,35 +146,44 @@ class TerminalWidget(QWidget):
 
         # --- Quick-command buttons ---
         quick_grp = QGroupBox("Quick Commands")
-        quick_grp.setMaximumHeight(64)
+        quick_grp.setMaximumHeight(150)
+        self._quick_group = quick_grp
         quick_inner = QWidget()
-        quick_layout = QHBoxLayout(quick_inner)
+        quick_layout = QGridLayout(quick_inner)
         quick_layout.setContentsMargins(2, 2, 2, 2)
-        quick_layout.setSpacing(4)
+        quick_layout.setHorizontalSpacing(4)
+        quick_layout.setVerticalSpacing(4)
+        self._quick_inner = quick_inner
+        self._quick_layout = quick_layout
+        self._quick_buttons: list[tuple[str, QPushButton]] = []
+        self._quick_hint: QLabel | None = None
 
         commands = getattr(self._spec, "commands", {}) or {}
         read_cmds = [(n, c) for n, c in commands.items() if getattr(c, "read", False)]
         if not read_cmds:
-            quick_layout.addWidget(QLabel("(no read commands defined for this device)"))
+            self._quick_hint = QLabel("(no read commands defined for this device)")
+            quick_layout.addWidget(self._quick_hint, 0, 0)
         else:
             for cmd_name, cmd_spec in read_cmds:
                 label = cmd_name.replace("_", " ").title()
                 btn = QPushButton(label)
-                btn.setFixedHeight(26)
+                btn.setMinimumHeight(30)
+                btn.setMinimumWidth(150)
                 btn.setToolTip(getattr(cmd_spec, "description", "") or cmd_name)
                 btn.clicked.connect(
                     lambda _checked=False, c=cmd_name: self._send_quick(c)
                 )
-                quick_layout.addWidget(btn)
+                self._quick_buttons.append((cmd_name, btn))
 
-        quick_layout.addStretch()
+        self._relayout_quick_buttons()
 
         scroll = QScrollArea()
         scroll.setWidget(quick_inner)
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._quick_scroll = scroll
 
         quick_grp_layout = QVBoxLayout(quick_grp)
         quick_grp_layout.setContentsMargins(4, 2, 4, 2)
@@ -198,6 +208,53 @@ class TerminalWidget(QWidget):
         input_row.addWidget(send_btn)
 
         root.addLayout(input_row)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._relayout_quick_buttons()
+
+    def _relayout_quick_buttons(self) -> None:
+        layout = getattr(self, "_quick_layout", None)
+        if layout is None:
+            return
+
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(self._quick_inner)
+
+        if self._quick_hint is not None:
+            layout.addWidget(self._quick_hint, 0, 0)
+            return
+
+        if not self._quick_buttons:
+            return
+
+        viewport = getattr(self, "_quick_scroll", None)
+        avail_w = viewport.viewport().width() if viewport is not None else self.width()
+        metrics = QFontMetrics(self.font())
+        widest = max(
+            metrics.horizontalAdvance(btn.text()) for _cmd, btn in self._quick_buttons
+        )
+        cell_w = max(150, widest + 28)
+        row_h = max(30, metrics.height() + 12)
+        cols = max(1, int((max(avail_w, cell_w) + 4) / (cell_w + 4)))
+
+        for _cmd, btn in self._quick_buttons:
+            btn.setMinimumWidth(cell_w)
+            btn.setMinimumHeight(row_h)
+
+        for idx, (_cmd, btn) in enumerate(self._quick_buttons):
+            row = idx // cols
+            col = idx % cols
+            layout.addWidget(btn, row, col)
+
+        rows = int(math.ceil(len(self._quick_buttons) / cols))
+        visible_rows = min(max(rows, 1), 3)
+        group_h = 34 + (visible_rows * (row_h + 4))
+        if hasattr(self, "_quick_group"):
+            self._quick_group.setMaximumHeight(group_h)
 
     # ------------------------------------------------------------------
     # Sending

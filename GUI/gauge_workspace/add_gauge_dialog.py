@@ -139,6 +139,14 @@ class AddGaugeDialog(QDialog):
         self._address_spin.setValue(254)
         adv_form.addRow("Address:", self._address_spin)
 
+        # CDG full scale (only shown for CDG models)
+        self._cdg_fs_combo = QComboBox()
+        self._cdg_fs_combo.setEditable(False)
+        self._cdg_fs_combo.hide()
+        self._cdg_fs_label = QLabel("CDG Full Scale:")
+        self._cdg_fs_label.hide()
+        adv_form.addRow(self._cdg_fs_label, self._cdg_fs_combo)
+
         layout.addWidget(self._adv_box)
 
         # ── Commands group ──
@@ -243,6 +251,51 @@ class AddGaugeDialog(QDialog):
             self._exp_label.show()
         else:
             self._exp_label.hide()
+
+        self._refresh_cdg_full_scale_controls(spec)
+
+    def _refresh_cdg_full_scale_controls(self, spec: DeviceSpec) -> None:
+        raw_extra = spec.__dict__.get("_raw_extra", {})
+        options = raw_extra.get("full_scale_options_mbar")
+        default_fs = raw_extra.get("full_scale_mbar")
+        is_cdg = bool(spec.protocol == "cdg_serial" and options)
+        self._cdg_fs_label.setVisible(is_cdg)
+        self._cdg_fs_combo.setVisible(is_cdg)
+        if not is_cdg:
+            self._cdg_fs_combo.clear()
+            return
+
+        parsed_options: list[float] = []
+        for opt in options:
+            try:
+                val = float(opt)
+            except (TypeError, ValueError):
+                continue
+            if val > 0:
+                parsed_options.append(val)
+        parsed_options = sorted(set(parsed_options))
+
+        self._cdg_fs_combo.clear()
+        for fs in parsed_options:
+            self._cdg_fs_combo.addItem(f"{fs:g} mbar", fs)
+
+        try:
+            target = float(default_fs)
+        except (TypeError, ValueError):
+            target = parsed_options[0] if parsed_options else 1.0
+        idx = self._index_for_fs(target)
+        if idx >= 0:
+            self._cdg_fs_combo.setCurrentIndex(idx)
+
+    def _index_for_fs(self, fs_mbar: float) -> int:
+        for i in range(self._cdg_fs_combo.count()):
+            try:
+                val = float(self._cdg_fs_combo.itemData(i))
+            except (TypeError, ValueError):
+                continue
+            if abs(val - fs_mbar) <= max(1e-6, fs_mbar * 1e-3):
+                return i
+        return -1
 
     def _on_rs_mode_changed(self, rs485: bool) -> None:
         if self._spec is None:
@@ -394,6 +447,16 @@ class AddGaugeDialog(QDialog):
             if idx >= 0:
                 self._model_combo.setCurrentIndex(idx)
 
+        if self._cdg_fs_combo.isVisible() and metadata.get("full_scale_mbar") is not None:
+            try:
+                fs = float(metadata.get("full_scale_mbar"))
+            except (TypeError, ValueError):
+                fs = None
+            if fs and fs > 0:
+                idx = self._index_for_fs(fs)
+                if idx >= 0:
+                    self._cdg_fs_combo.setCurrentIndex(idx)
+
     def _clone_spec_with_scan_overrides(self, spec: DeviceSpec, metadata: dict) -> DeviceSpec:
         full_scale = metadata.get("full_scale_mbar")
         if full_scale is None:
@@ -426,6 +489,7 @@ class AddGaugeDialog(QDialog):
             return None
 
         spec = self._clone_spec_with_scan_overrides(spec, metadata)
+        spec = self._apply_cdg_full_scale_override(spec)
 
         selected_cmds = [
             item.data(Qt.ItemDataRole.UserRole)
@@ -451,6 +515,22 @@ class AddGaugeDialog(QDialog):
             "baud_override": baud,
             "rs485_enabled": self._rs485_radio.isChecked(),
         }
+
+    def _apply_cdg_full_scale_override(self, spec: DeviceSpec) -> DeviceSpec:
+        if not self._cdg_fs_combo.isVisible():
+            return spec
+        try:
+            fs = float(self._cdg_fs_combo.currentData())
+        except (TypeError, ValueError):
+            return spec
+        if fs <= 0:
+            return spec
+
+        spec_copy = deepcopy(spec)
+        raw_extra = dict(spec_copy.__dict__.get("_raw_extra", {}))
+        raw_extra["full_scale_mbar"] = fs
+        spec_copy.__dict__["_raw_extra"] = raw_extra
+        return spec_copy
 
     def result_configs(self) -> list[dict]:
         configs: list[dict] = []

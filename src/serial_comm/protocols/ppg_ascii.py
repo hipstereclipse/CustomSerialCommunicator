@@ -72,9 +72,10 @@ class PPGProtocol(GaugeProtocol):
     ) -> None:
         super().__init__(address)
         self.gauge_type = gauge_type
-        # _cmd_table entries: (mnemonic, writable, unit, query_param)
+        # _cmd_table entries: (mnemonic, writable, unit, query_param, write_prefix)
         # query_param is appended after '?' on a read, e.g. "P?CMB\" or "Q?CONFIG\"
-        self._cmd_table: dict[str, tuple[str, bool, str, str]] = {}
+        # write_prefix is prepended to write payloads, e.g. SPV!"1," + <value>
+        self._cmd_table: dict[str, tuple[str, bool, str, str, str]] = {}
         self._runtime_mnemonic_override: dict[str, str] = {}
         self._pressure_fallback_tried: set[str] = set()
         if param_table:
@@ -86,10 +87,11 @@ class PPGProtocol(GaugeProtocol):
                         bool(info.get("write", False)),
                         info.get("unit", ""),
                         str(info.get("query_param", "") or ""),
+                        str(info.get("write_prefix", "") or ""),
                     )
         else:
             for name, (mn, wr, un) in self._MNEMONIC_DEFAULTS.items():
-                self._cmd_table[name] = (mn, wr, un, "")
+                self._cmd_table[name] = (mn, wr, un, "", "")
 
     # ------------------------------------------------------------------
     # GaugeProtocol interface
@@ -99,7 +101,7 @@ class PPGProtocol(GaugeProtocol):
         entry = self._cmd_table.get(command)
         if entry is None:
             raise ValueError(f"PPGProtocol: unknown command '{command}'")
-        mnemonic, writable, _, query_param = entry
+        mnemonic, writable, _, query_param, write_prefix = entry
         mnemonic = self._runtime_mnemonic_override.get(command, mnemonic)
         if value is not None and not writable:
             raise ValueError(f"PPGProtocol: command '{command}' is read-only")
@@ -108,7 +110,7 @@ class PPGProtocol(GaugeProtocol):
             suffix = query_param
         else:
             action = "!"
-            suffix = str(value)
+            suffix = f"{write_prefix}{value}"
         frame = f"@{self.address:03d}{mnemonic}{action}{suffix}\\"
         logger.debug("TX %r", frame)
         return frame.encode("ascii")
@@ -152,7 +154,7 @@ class PPGProtocol(GaugeProtocol):
 
     def _decode(self, command: str, data: str, raw: bytes) -> GaugeReading:
         try:
-            entry = self._cmd_table.get(command, ("", False, "", ""))
+            entry = self._cmd_table.get(command, ("", False, "", "", ""))
             unit = entry[2]
             # Route by unit or command name
             if unit in ("mbar", "Torr", "Pa", "hPa", "psi"):

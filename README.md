@@ -57,6 +57,7 @@ Specs define transport defaults, command metadata, protocol family, address cons
 - Simulation engine: [src/serial_comm/simulation_engine.py](src/serial_comm/simulation_engine.py)
 - Simulation worker: [src/serial_comm/simulated_worker.py](src/serial_comm/simulated_worker.py)
 - Simulation data models: [src/serial_comm/simulation_models.py](src/serial_comm/simulation_models.py)
+- OPG optical-spectrum helpers: [src/serial_comm/opg_spectrum.py](src/serial_comm/opg_spectrum.py)
 - Scenario catalog: [src/serial_comm/simulation_scenarios.py](src/serial_comm/simulation_scenarios.py)
 
 ## How the Program Works
@@ -113,6 +114,7 @@ The scanner actively probes protocols and emits structured metadata (not just a 
 - Supports ASCII command/response workflows with ACK/NAK handling.
 - Handles both `@ACK...` and address-prefixed ACK variants.
 - Includes pressure mnemonic fallback behavior for firmware variants.
+- Supports `query_param` and `write_prefix` command metadata for indexed writes (for example per-setpoint writes on PPG570).
 
 ### CDG/HPG Serial Family
 
@@ -137,6 +139,7 @@ Simulation is first-class and designed for realistic operator practice and UI te
 - Control and monitor simulated systems in [GUI/gauge_workspace/simulation_tab.py](GUI/gauge_workspace/simulation_tab.py).
 - Run recipe-driven and scenario-driven pressure dynamics.
 - Use humidity, gas type, leak-rate, and base-pressure inputs.
+- Simulate OPG optical spectra and identify likely species from synthetic wavelength signatures.
 - Plot simulated gauges in a dedicated combined simulation view.
 
 ## Data Views and Plotting
@@ -195,7 +198,7 @@ python -m pytest -q
 Run focused protocol and registry tests:
 
 ```bash
-python -m pytest tests/test_cdg_serial.py tests/test_ppg_ascii.py tests/test_device_registry.py -q
+python -m pytest tests/test_cdg_serial.py tests/test_ppg_ascii.py tests/test_opg_spectrum.py tests/test_device_registry.py -q
 ```
 
 ## Driver Development

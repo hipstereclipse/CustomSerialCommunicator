@@ -70,9 +70,15 @@ commands:
 - `read`, `write`: command capabilities.
 - `pid`: numeric parameter ID for binary/parameterized ASCII protocols.
 - `mnemonic`: command mnemonic for PPG-style ASCII protocols.
+- `query_param`: optional suffix appended on read requests (for example `SPV?1`).
+- `write_prefix`: optional prefix prepended before write values (for example `SPV!1,<value>`).
 - `data_type`: parse strategy (examples: `u_expo_new`, `u_integer`, `string`).
 - `unit`, `description`: UI and diagnostics metadata.
 - `experimental`: optional, for incomplete/early support.
+
+For indexed PPG-style commands (setpoints, channels), define both `query_param` and
+`write_prefix` so read/write framing remains symmetric in YAML and no custom UI framing
+logic is required.
 
 ## 4. Add A New Protocol Codec (When Needed)
 

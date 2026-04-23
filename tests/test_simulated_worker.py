@@ -20,11 +20,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from serial_comm.models import CommandSpec, DeviceReading, DeviceSpec
+from serial_comm.protocols.pfeiffer_ascii import PfeifferAsciiProtocol
 from serial_comm.simulated_worker import SimulatedGaugeWorker
 from serial_comm.simulation_models import (
+    GaugeFamily,
     GasType,
     SimulatedGaugeConfig,
     SimulationPattern,
+    classify_family,
 )
 
 
@@ -115,6 +118,30 @@ def test_cdg_is_gas_independent(gas: GasType) -> None:
     )
 
 
+def test_cdg_clamps_to_full_scale() -> None:
+    """CDG should never report pressure above its full scale."""
+    full_scale = 10.0  # 10 mbar full scale
+    spec = _make_spec("CDG025D", protocol="cdg_serial")
+    cfg = SimulatedGaugeConfig(
+        model="CDG025D",
+        display_name="SIM – CDG025D",
+        pattern=SimulationPattern.PUMPDOWN,
+        poll_interval_s=0.05,
+        cdg_full_scale_mbar=full_scale,
+    )
+    
+    # Test pressure well above full scale
+    real = 100.0  # 10x full scale
+    engine = _make_engine_stub(real, gas=GasType.N2)
+    worker = SimulatedGaugeWorker(spec=spec, config=cfg, engine=engine)
+    worker._rng = _NoNoise()
+    worker._cal_bias_rel = 0.0
+    
+    value = worker._apply_response_model(real, GasType.N2, "pressure")
+    assert value <= full_scale, f"CDG reading {value} exceeds full scale {full_scale}"
+
+
+
 # ── Cold cathode saturation / underrange ─────────────────────────────────────
 
 def test_cold_cathode_overrange_returns_saturation_sentinel() -> None:
@@ -201,6 +228,88 @@ def test_terminal_command_produces_fake_response(qtbot) -> None:
     assert entry.request == b"@254PR3?\\"
     assert entry.response, "simulated worker must synthesise a response"
     assert entry.command == "pressure"
+
+
+def test_opg550_is_combination_family() -> None:
+    assert classify_family("OPG550") is GaugeFamily.COMBINATION
+
+
+def test_opg550_combination_tracks_pressure_across_accuracy_bands() -> None:
+    spec = _make_spec("OPG550", protocol="pfeiffer_ascii")
+    cfg = _make_config("OPG550")
+    points = [120.0, 10.0, 5e-2, 8e-4, 7e-5]
+
+    def _band_limit(p: float) -> float:
+        if p >= 100.0:
+            return 0.005
+        if p >= 2.0:
+            return 0.01
+        if p >= 1e-4:
+            return 0.05
+        return 0.25
+
+    for p in points:
+        engine = _make_engine_stub(p, gas=GasType.N2)
+        worker = SimulatedGaugeWorker(spec=spec, config=cfg, engine=engine)
+        worker._rng = _NoNoise()
+        worker._cal_bias_rel = 0.0
+        value = worker._apply_response_model(p, GasType.N2, "pressure")
+        rel_err = abs(value - p) / max(p, 1e-12)
+        assert rel_err <= _band_limit(p), f"p={p} rel_err={rel_err}"
+
+
+def test_pfeiffer_ascii_temperature_response_is_parseable(qtbot) -> None:
+    spec = DeviceSpec(
+        model="OPG550",
+        family="inficon_ascii",
+        protocol="inficon_ascii",
+        default_baud=9600,
+        parity="N",
+        data_bits=8,
+        stop_bits=1,
+        rs_modes=["RS232"],
+        default_address=1,
+        rs485_address_range=(1, 253),
+        commands={
+            "pressure": CommandSpec(
+                name="pressure",
+                read=True,
+                write=False,
+                unit="mbar",
+                pid=340,
+                data_type="u_expo_new",
+            ),
+            "temperature": CommandSpec(
+                name="temperature",
+                read=True,
+                write=False,
+                unit="°C",
+                pid=216,
+                data_type="u_real",
+            ),
+        },
+    )
+    param_table = {
+        "pressure": {"pid": 340, "data_type": "u_expo_new", "unit": "mbar", "read": True, "write": False},
+        "temperature": {"pid": 216, "data_type": "u_real", "unit": "°C", "read": True, "write": False},
+    }
+    protocol = PfeifferAsciiProtocol(address=1, param_table=param_table)
+    cfg = _make_config("OPG550")
+    engine = _make_engine_stub(8e-4, gas=GasType.N2)
+    worker = SimulatedGaugeWorker(spec=spec, config=cfg, engine=engine, protocol=protocol)
+
+    with qtbot.waitSignal(worker.terminal_response, timeout=2000) as blocker:
+        worker.start()
+        frame = protocol.build_request("temperature")
+        worker.send_terminal_command(frame, command="temperature")
+    entry = blocker.args[0]
+    worker.stop()
+    worker.wait(2000)
+
+    parsed = protocol.parse_response(entry.response, "temperature")
+    assert parsed.success
+    assert parsed.value is not None
+    assert 20.0 <= float(parsed.value) <= 60.0
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

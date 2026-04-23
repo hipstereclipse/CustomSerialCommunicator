@@ -20,12 +20,18 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout,
-    QHBoxLayout, QHeaderView, QLabel, QPushButton, QScrollArea, QSizePolicy,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QPushButton, QScrollArea, QSizePolicy,
     QProgressBar, QSlider, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
 from serial_comm.models import DeviceError, DeviceReading, DeviceSpec
+from serial_comm.opg_spectrum import (
+    OPG_ANALYSIS_MAX_PRESSURE_MBAR,
+    SpectrumMode,
+    identify_optical_species,
+    simulate_optical_spectrum,
+)
 from serial_comm.units import SUPPORTED_UNITS, convert_pressure
 from GUI.gauge_workspace.terminal_widget import TerminalWidget
 from GUI.settings_dialog import display_signals, get_display_unit
@@ -88,6 +94,7 @@ class PlotPanel(QWidget):
         # Toggle-button state (persists across layout rebuilds)
         self._toggle_states: dict[str, bool] = {}
         self._cmd_toggles: dict[str, QPushButton] = {}
+        self._plot_paused: bool = False
 
         self._build_ui()
 
@@ -99,17 +106,6 @@ class PlotPanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(2)
-
-        # ── Control bar (layout selector) ──────────────────────────────
-        ctrl = QHBoxLayout()
-        ctrl.addWidget(QLabel("Layout:"))
-        self._layout_combo = QComboBox()
-        self._layout_combo.addItems(["Overlay", "Stacked", "Grid"])
-        self._layout_combo.setFixedWidth(90)
-        self._layout_combo.currentTextChanged.connect(self._on_layout_changed)
-        ctrl.addWidget(self._layout_combo)
-        ctrl.addStretch()
-        root.addLayout(ctrl)
 
         # ── Trace toggle pill buttons (scrollable) ─────────────────────
         self._toggle_inner = QWidget()
@@ -147,6 +143,22 @@ class PlotPanel(QWidget):
         )
         root.addWidget(self._glw)
 
+        # ── Control bar (layout selector) — fixed at bottom ────────────
+        ctrl = QHBoxLayout()
+        ctrl.setContentsMargins(4, 2, 4, 2)
+        ctrl.addWidget(QLabel("Layout:"))
+        self._layout_combo = QComboBox()
+        self._layout_combo.addItems(["Overlay", "Stacked", "Grid"])
+        self._layout_combo.setFixedWidth(90)
+        self._layout_combo.currentTextChanged.connect(self._on_layout_changed)
+        ctrl.addWidget(self._layout_combo)
+        self._pause_plot_btn = QPushButton("Pause Plot")
+        self._pause_plot_btn.setFixedHeight(24)
+        self._pause_plot_btn.clicked.connect(self._on_pause_plot_clicked)
+        ctrl.addWidget(self._pause_plot_btn)
+        ctrl.addStretch()
+        root.addLayout(ctrl)
+
         self._plots:  dict[str, pg.PlotItem]     = {}
         self._curves: dict[str, pg.PlotDataItem] = {}
 
@@ -175,6 +187,9 @@ class PlotPanel(QWidget):
             tb.popleft()
             vb.popleft()
 
+        if self._plot_paused:
+            return
+
         curve = self._curves.get(command)
         if curve is None or not curve.isVisible():
             return
@@ -192,6 +207,14 @@ class PlotPanel(QWidget):
     def _on_layout_changed(self, mode: str) -> None:
         self._layout_mode = mode.lower()
         self._rebuild_plots()
+        self._replay()
+
+    def _on_pause_plot_clicked(self) -> None:
+        self._plot_paused = not self._plot_paused
+        if self._plot_paused:
+            self._pause_plot_btn.setText("Resume Plot")
+            return
+        self._pause_plot_btn.setText("Pause Plot")
         self._replay()
 
     def _rebuild_plots(self) -> None:
@@ -246,7 +269,10 @@ class PlotPanel(QWidget):
 
         if self._is_pressure(command):
             pi.setLogMode(x=False, y=True)
-            pi.setLabel("left", "Pressure", units=self._display_unit or unit or "mbar")
+            # Don't pass units to setLabel—pyqtgraph auto-scales with SI prefixes (G, M, etc.)
+            # Instead, build our own label to avoid "GTorr" / "Gmbar" artifacts
+            unit_str = self._display_unit or unit or "mbar"
+            pi.setLabel("left", f"Pressure ({unit_str})", units="")
         else:
             label = command.replace("_", " ").title() if command else "Value"
             pi.setLabel("left", label, units=unit)
@@ -498,10 +524,10 @@ class PlotPanel(QWidget):
             buf.clear()
             buf.extend(rescaled)
 
-        # Relabel pressure plots.
+        # Relabel pressure plots (avoid SI prefix scaling by building our own label).
         for cmd, pi in self._plots.items():
             if self._is_pressure(cmd):
-                pi.setLabel("left", "Pressure", units=unit)
+                pi.setLabel("left", f"Pressure ({unit})", units="")
 
         self._replay()
 
@@ -541,6 +567,7 @@ class GaugeSettingsPanel(QWidget):
         self._sim_curve: pg.PlotDataItem | None = None
         self._hover_marker: pg.InfiniteLine | None = None
         self._setpoint_hover_proxy: pg.SignalProxy | None = None
+        self._live_pressure_line: pg.InfiniteLine | None = None
         self._raw_max: float = 255.0
         proto = getattr(self._worker, "_protocol", None)
         self._full_scale_mbar: float = float(
@@ -549,6 +576,14 @@ class GaugeSettingsPanel(QWidget):
         self._display_unit: str = get_display_unit()
         self._setpoint_state: dict[str, bool] = {}
         self._suppress_sync: bool = False
+        self._ppg_setpoint_controls: dict[str, QWidget] = {}
+        self._ppg_setpoint_rows: list[int] = []
+        self._pin_setpoint_plot: pg.PlotWidget | None = None
+        self._pin_setpoint_lines: dict[int, pg.InfiniteLine] = {}
+        self._pin_setpoint_hyst_regions: dict[int, pg.LinearRegionItem] = {}
+        self._pin_setpoint_status = QLabel("Setpoint states update from the live pressure reading.")
+        self._last_pressure_mbar: float | None = None
+        self._setpoint_preview_unit: str = self._display_unit
 
         self._build_ui()
 
@@ -561,20 +596,16 @@ class GaugeSettingsPanel(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        outer.addWidget(scroll)
+        # ── Fixed top section: polling + auto-query (never scrolls away) ─
+        fixed_top = QWidget()
+        fixed_top.setStyleSheet(
+            "QWidget { background: #1A1A1A; border-bottom: 1px solid #333; }"
+        )
+        top_layout = QVBoxLayout(fixed_top)
+        top_layout.setContentsMargins(8, 6, 8, 6)
+        top_layout.setSpacing(6)
 
-        content = QWidget()
-        scroll.setWidget(content)
-
-        root = QVBoxLayout(content)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
-
-        # ── Polling + Auto-query controls — one compact row ──────────
+        # Polling + Auto-query controls — one compact row
         poll_row = QHBoxLayout()
         poll_row.setSpacing(6)
         poll_row.addWidget(QLabel("Polling:"))
@@ -601,9 +632,9 @@ class GaugeSettingsPanel(QWidget):
         self._query_once_btn.clicked.connect(self._query_selected_once)
         poll_row.addWidget(self._query_once_btn)
         poll_row.addStretch()
-        root.addLayout(poll_row)
+        top_layout.addLayout(poll_row)
 
-        # ── Auto Query Schedule ─────────────────────────────────────
+        # Auto Query Schedule table
         auto_box = QFrame()
         auto_box.setFrameShape(QFrame.Shape.StyledPanel)
         auto_layout = QVBoxLayout(auto_box)
@@ -619,7 +650,8 @@ class GaugeSettingsPanel(QWidget):
             ["Command", "Auto", "Interval (s)", "Last Value", "Updated", "Query"]
         )
         self._table.verticalHeader().setVisible(False)
-        self._table.setMinimumHeight(150)
+        self._table.setMinimumHeight(120)
+        self._table.setMaximumHeight(240)
         self._table.setAlternatingRowColors(True)
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -628,7 +660,23 @@ class GaugeSettingsPanel(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self._table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         auto_layout.addWidget(self._table)
-        root.addWidget(auto_box)
+        top_layout.addWidget(auto_box)
+
+        outer.addWidget(fixed_top)
+
+        # ── Scrollable area: analysis / setpoint controls ─────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        outer.addWidget(scroll, 1)
+
+        content = QWidget()
+        scroll.setWidget(content)
+
+        root = QVBoxLayout(content)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
 
         self._build_query_rows()
         self._build_setpoint_editor(root)
@@ -693,8 +741,29 @@ class GaugeSettingsPanel(QWidget):
         setpoint_names = [
             "setpoint_1_low", "setpoint_1_high", "setpoint_2_low", "setpoint_2_high",
         ]
-        if not all(name in self._spec.commands for name in setpoint_names):
+        if all(name in self._spec.commands for name in setpoint_names):
+            self._build_cdg_setpoint_editor(root)
             return
+
+        ppg_rows = self._detect_indexed_setpoint_rows()
+        if ppg_rows:
+            self._build_ppg_setpoint_editor(root, ppg_rows)
+
+    def _detect_indexed_setpoint_rows(self) -> list[int]:
+        rows: list[int] = []
+        for name in self._spec.commands:
+            if not name.startswith("setpoint_"):
+                continue
+            parts = name.split("_")
+            if len(parts) < 2:
+                continue
+            if parts[1].isdigit():
+                rows.append(int(parts[1]))
+        if not rows:
+            return []
+        return sorted(set(rows))
+
+    def _build_cdg_setpoint_editor(self, root: QVBoxLayout) -> None:
 
         box = QFrame()
         box.setFrameShape(QFrame.Shape.StyledPanel)
@@ -772,7 +841,8 @@ class GaugeSettingsPanel(QWidget):
         self._setpoint_plot.setMinimumHeight(260)
         self._setpoint_plot.setMinimumWidth(320)
         self._setpoint_plot.setBackground("#1E1E1E")
-        self._setpoint_plot.setLabel("left", "Pressure", units=self._display_unit)
+        # Avoid SI prefix scaling (GTorr/Gmbar)
+        self._setpoint_plot.setLabel("left", f"Pressure ({self._display_unit})", units="")
         self._setpoint_plot.setLabel(
             "bottom", "Pumpdown progress", units="",
         )
@@ -796,6 +866,200 @@ class GaugeSettingsPanel(QWidget):
     # ------------------------------------------------------------------
     # Setpoint control group (per setpoint): header + two rows (low/high)
     # ------------------------------------------------------------------
+
+    def _build_ppg_setpoint_editor(self, root: QVBoxLayout, rows: list[int]) -> None:
+        box = QFrame()
+        box.setFrameShape(QFrame.Shape.StyledPanel)
+        v = QVBoxLayout(box)
+        v.setContentsMargins(8, 6, 8, 8)
+        v.setSpacing(6)
+
+        title = QLabel("Setpoint Configuration")
+        title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        subtitle = QLabel("PPG setpoints: value, hysteresis, direction, and enable")
+        subtitle.setStyleSheet("color:#888; font-size:11px;")
+        v.addWidget(title)
+        v.addWidget(subtitle)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+        grid.addWidget(QLabel("Setpoint"), 0, 0)
+        grid.addWidget(QLabel("Value"), 0, 1)
+        grid.addWidget(QLabel("Hysteresis"), 0, 2)
+        grid.addWidget(QLabel("Direction"), 0, 3)
+        grid.addWidget(QLabel("Enable"), 0, 4)
+
+        self._ppg_setpoint_rows = list(rows)
+        for row_idx, sp_idx in enumerate(rows, start=1):
+            grid.addWidget(QLabel(f"SP{sp_idx}"), row_idx, 0)
+
+            value_spin = QDoubleSpinBox()
+            value_spin.setRange(0.0, 1e9)
+            value_spin.setDecimals(6)
+            value_spin.setSingleStep(0.001)
+            value_spin.setSuffix(f" {self._display_unit}")
+            grid.addWidget(value_spin, row_idx, 1)
+            self._ppg_setpoint_controls[f"setpoint_{sp_idx}"] = value_spin
+            value_spin.valueChanged.connect(lambda _v, self=self: self._refresh_pin_setpoint_plot())
+
+            hyst_spin = QDoubleSpinBox()
+            hyst_spin.setRange(0.0, 1e9)
+            hyst_spin.setDecimals(6)
+            hyst_spin.setSingleStep(0.001)
+            hyst_spin.setSuffix(f" {self._display_unit}")
+            grid.addWidget(hyst_spin, row_idx, 2)
+            self._ppg_setpoint_controls[f"setpoint_{sp_idx}_hysteresis"] = hyst_spin
+            hyst_spin.valueChanged.connect(lambda _v, self=self: self._refresh_pin_setpoint_plot())
+
+            direction = QComboBox()
+            direction.addItems(["ABOVE", "BELOW"])
+            grid.addWidget(direction, row_idx, 3)
+            self._ppg_setpoint_controls[f"setpoint_{sp_idx}_direction"] = direction
+            direction.currentIndexChanged.connect(lambda _i, self=self: self._refresh_pin_setpoint_status())
+
+            enabled = QCheckBox("ON")
+            grid.addWidget(enabled, row_idx, 4)
+            self._ppg_setpoint_controls[f"setpoint_{sp_idx}_enable"] = enabled
+            enabled.toggled.connect(lambda _on, self=self: self._refresh_pin_setpoint_status())
+
+        v.addLayout(grid)
+
+        btn_row = QHBoxLayout()
+        read_btn = QPushButton("Read")
+        read_btn.clicked.connect(self._read_ppg_setpoints_once)
+        btn_row.addWidget(read_btn)
+
+        apply_btn = QPushButton("Apply to Gauge")
+        apply_btn.setStyleSheet("font-weight: 600;")
+        apply_btn.clicked.connect(self._apply_ppg_setpoints)
+        btn_row.addWidget(apply_btn)
+        btn_row.addStretch()
+        v.addLayout(btn_row)
+
+        self._build_pin_setpoint_preview(v)
+
+        root.addWidget(box)
+
+    def _build_pin_setpoint_preview(self, root: QVBoxLayout) -> None:
+        self._pin_setpoint_plot = pg.PlotWidget()
+        self._pin_setpoint_plot.setMinimumHeight(200)
+        self._pin_setpoint_plot.setBackground("#181818")
+        self._pin_setpoint_plot.setLabel("bottom", "Index")
+        # Avoid SI prefix scaling (GTorr/Gmbar)
+        self._pin_setpoint_plot.setLabel("left", f"Pressure ({self._setpoint_preview_unit})", units="")
+        self._pin_setpoint_plot.setLogMode(x=False, y=True)
+        self._pin_setpoint_plot.showGrid(x=True, y=True, alpha=0.25)
+
+        self._pin_setpoint_status.setStyleSheet(
+            "color:#AFC7D6; font-size:11px; font-family: Consolas, monospace;"
+        )
+        root.addWidget(self._pin_setpoint_plot)
+        root.addWidget(self._pin_setpoint_status)
+
+        self._refresh_pin_setpoint_plot()
+
+    def _refresh_pin_setpoint_plot(self) -> None:
+        if self._pin_setpoint_plot is None:
+            return
+        plot_item = self._pin_setpoint_plot.getPlotItem()
+        plot_item.clear()
+        self._pin_setpoint_lines.clear()
+        self._pin_setpoint_hyst_regions.clear()
+
+        if not self._ppg_setpoint_rows:
+            return
+
+        values_x: list[float] = []
+        values_y: list[float] = []
+        all_y: list[float] = []
+
+        palette = ["#4C9BE8", "#E8954C", "#4CE87A", "#E84C6F"]
+        for idx, sp_idx in enumerate(self._ppg_setpoint_rows):
+            value_widget = self._ppg_setpoint_controls.get(f"setpoint_{sp_idx}")
+            if not isinstance(value_widget, QDoubleSpinBox):
+                continue
+            p_disp = max(1e-12, float(value_widget.value()))
+            x = float(sp_idx)
+            values_x.append(x)
+            values_y.append(p_disp)
+            all_y.append(p_disp)
+
+            color = palette[idx % len(palette)]
+            line = pg.InfiniteLine(
+                pos=p_disp,
+                angle=0,
+                movable=False,
+                pen=pg.mkPen(color, width=2),
+                label=f"SP{sp_idx}",
+                labelOpts={"position": 0.96, "color": "#EDEDED"},
+            )
+            plot_item.addItem(line)
+            self._pin_setpoint_lines[sp_idx] = line
+
+            hyst_widget = self._ppg_setpoint_controls.get(f"setpoint_{sp_idx}_hysteresis")
+            if isinstance(hyst_widget, QDoubleSpinBox):
+                hyst = max(0.0, float(hyst_widget.value()))
+                lo = max(1e-12, p_disp - hyst)
+                hi = max(lo, p_disp + hyst)
+                region = pg.LinearRegionItem(
+                    values=[lo, hi],
+                    orientation="horizontal",
+                    brush=self._band_brush(color),
+                    pen=pg.mkPen(color, width=0),
+                    movable=False,
+                )
+                region.setZValue(-8)
+                plot_item.addItem(region)
+                self._pin_setpoint_hyst_regions[sp_idx] = region
+                all_y.extend([lo, hi])
+
+        if values_x and values_y:
+            curve = plot_item.plot(
+                np.array(values_x, dtype=float),
+                np.array(values_y, dtype=float),
+                pen=pg.mkPen("#70D2FF", width=1, style=Qt.PenStyle.DotLine),
+                symbol="o",
+                symbolSize=7,
+                symbolBrush="#70D2FF",
+            )
+            curve.setZValue(6)
+            xmin = min(values_x) - 0.6
+            xmax = max(values_x) + 0.6
+            plot_item.setXRange(xmin, xmax, padding=0.02)
+
+        if all_y:
+            ymin = max(1e-12, min(all_y) * 0.5)
+            ymax = max(ymin * 1.2, max(all_y) * 1.8)
+            plot_item.setYRange(ymin, ymax, padding=0.0)
+
+        self._refresh_pin_setpoint_status()
+
+    def _refresh_pin_setpoint_status(self) -> None:
+        if self._last_pressure_mbar is None:
+            self._pin_setpoint_status.setText("Setpoint states update from the live pressure reading.")
+            return
+        p_disp = float(convert_pressure(self._last_pressure_mbar, "mbar", self._setpoint_preview_unit))
+        parts = [f"P={p_disp:.3E} {self._setpoint_preview_unit}"]
+        for sp_idx in self._ppg_setpoint_rows:
+            value_widget = self._ppg_setpoint_controls.get(f"setpoint_{sp_idx}")
+            direction_widget = self._ppg_setpoint_controls.get(f"setpoint_{sp_idx}_direction")
+            enable_widget = self._ppg_setpoint_controls.get(f"setpoint_{sp_idx}_enable")
+            if not isinstance(value_widget, QDoubleSpinBox):
+                continue
+            enabled = True
+            if isinstance(enable_widget, QCheckBox):
+                enabled = enable_widget.isChecked()
+            if not enabled:
+                parts.append(f"SP{sp_idx}=OFF")
+                continue
+            direction = "ABOVE"
+            if isinstance(direction_widget, QComboBox):
+                direction = direction_widget.currentText().strip().upper() or "ABOVE"
+            threshold = float(value_widget.value())
+            active = p_disp >= threshold if direction == "ABOVE" else p_disp <= threshold
+            parts.append(f"SP{sp_idx}:{'ON' if active else 'OFF'}")
+        self._pin_setpoint_status.setText(" | ".join(parts))
 
     def _make_setpoint_group(
         self, title: str, low_key: str, high_key: str, color: str,
@@ -925,6 +1189,24 @@ class GaugeSettingsPanel(QWidget):
         )
         self._hover_marker.setVisible(False)
         plot_item.addItem(self._hover_marker, ignoreBounds=True)
+
+        # Live pressure indicator — solid white dotted line that tracks the
+        # most-recently received pressure reading.  Automatically updates so
+        # the user can see at a glance where the chamber pressure sits relative
+        # to the configured setpoint bands.
+        self._live_pressure_line = pg.InfiniteLine(
+            angle=0, movable=False,
+            pen=pg.mkPen("#FFD700", width=2, style=Qt.PenStyle.DotLine),
+            label="Live P",
+            labelOpts={
+                "position": 0.90,
+                "color": "#FFD700",
+                "fill": QColor("#2A2000"),
+                "movable": False,
+            },
+        )
+        self._live_pressure_line.setVisible(False)
+        plot_item.addItem(self._live_pressure_line, ignoreBounds=True)
 
         # Draggable threshold lines (one per spinbox)
         for sp_num, color in self._SP_COLORS.items():
@@ -1206,13 +1488,31 @@ class GaugeSettingsPanel(QWidget):
     def set_display_unit(self, unit: str) -> None:
         if unit not in SUPPORTED_UNITS or unit == self._display_unit:
             return
+        old_unit = self._display_unit
         self._display_unit = unit
+        self._setpoint_preview_unit = unit
         if self._setpoint_plot is not None:
-            self._setpoint_plot.setLabel("left", "Pressure", units=unit)
+            # Avoid SI prefix scaling (GTorr/Gmbar)
+            self._setpoint_plot.setLabel("left", f"Pressure ({unit})", units="")
+        if self._pin_setpoint_plot is not None:
+            # Avoid SI prefix scaling (GTorr/Gmbar)
+            self._pin_setpoint_plot.setLabel("left", f"Pressure ({unit})", units="")
         for key in self._setpoint_mbar_labels:
             self._update_mbar_label(key)
+        for widget in self._ppg_setpoint_controls.values():
+            if isinstance(widget, QDoubleSpinBox):
+                old_value = float(widget.value())
+                widget.blockSignals(True)
+                widget.setValue(float(convert_pressure(old_value, old_unit, unit)))
+                widget.setSuffix(f" {unit}")
+                widget.blockSignals(False)
         self._refresh_regions_and_lines()
         self._rebuild_sim_envelope()
+        self._refresh_pin_setpoint_plot()
+        # Reposition live pressure line in the new unit.
+        if self._live_pressure_line is not None and self._last_pressure_mbar is not None:
+            p_disp = float(convert_pressure(self._last_pressure_mbar, "mbar", self._display_unit))
+            self._live_pressure_line.setValue(p_disp)
 
     def _apply_status_ui(self, title: str, active: bool, sp_num: str, region: str = "") -> None:
         status = self._setpoint_status_labels.get(title)
@@ -1291,6 +1591,17 @@ class GaugeSettingsPanel(QWidget):
             if cmd in self._rows:
                 self._send_query(cmd)
 
+    def _read_ppg_setpoints_once(self) -> None:
+        for sp_idx in self._ppg_setpoint_rows:
+            for cmd in (
+                f"setpoint_{sp_idx}",
+                f"setpoint_{sp_idx}_hysteresis",
+                f"setpoint_{sp_idx}_direction",
+                f"setpoint_{sp_idx}_enable",
+            ):
+                if cmd in self._spec.commands:
+                    self._send_query(cmd)
+
     def refresh_setpoints(self) -> None:
         """Pull setpoint values from the gauge and refresh the preview envelope."""
         self._read_setpoints_once()
@@ -1311,12 +1622,90 @@ class GaugeSettingsPanel(QWidget):
             except Exception:
                 logger.exception("Failed to send setpoint command %s", cmd)
 
+    def _apply_ppg_setpoints(self) -> None:
+        protocol = getattr(self._worker, "_protocol", None)
+        if protocol is None:
+            return
+        for sp_idx in self._ppg_setpoint_rows:
+            cmd_value = f"setpoint_{sp_idx}"
+            cmd_hyst = f"setpoint_{sp_idx}_hysteresis"
+            cmd_dir = f"setpoint_{sp_idx}_direction"
+            cmd_en = f"setpoint_{sp_idx}_enable"
+
+            try:
+                value_widget = self._ppg_setpoint_controls.get(cmd_value)
+                if cmd_value in self._spec.commands and isinstance(value_widget, QDoubleSpinBox):
+                    p_mbar = self._display_to_mbar(float(value_widget.value()))
+                    frame = protocol.build_request(cmd_value, f"{p_mbar:.6E}")
+                    self._worker.send_terminal_command(frame, cmd_value)
+
+                hyst_widget = self._ppg_setpoint_controls.get(cmd_hyst)
+                if cmd_hyst in self._spec.commands and isinstance(hyst_widget, QDoubleSpinBox):
+                    p_mbar = self._display_to_mbar(float(hyst_widget.value()))
+                    frame = protocol.build_request(cmd_hyst, f"{p_mbar:.6E}")
+                    self._worker.send_terminal_command(frame, cmd_hyst)
+
+                dir_widget = self._ppg_setpoint_controls.get(cmd_dir)
+                if cmd_dir in self._spec.commands and isinstance(dir_widget, QComboBox):
+                    frame = protocol.build_request(cmd_dir, dir_widget.currentText().strip().upper())
+                    self._worker.send_terminal_command(frame, cmd_dir)
+
+                en_widget = self._ppg_setpoint_controls.get(cmd_en)
+                if cmd_en in self._spec.commands and isinstance(en_widget, QCheckBox):
+                    frame = protocol.build_request(cmd_en, "ON" if en_widget.isChecked() else "OFF")
+                    self._worker.send_terminal_command(frame, cmd_en)
+            except Exception:
+                logger.exception("Failed to send PPG setpoint command for SP%d", sp_idx)
+        self._refresh_pin_setpoint_plot()
+
+    def _update_ppg_setpoint_control_from_response(self, command: str, parsed) -> bool:
+        widget = self._ppg_setpoint_controls.get(command)
+        if widget is None:
+            return False
+        if not parsed.success:
+            return True
+
+        if isinstance(widget, QDoubleSpinBox) and parsed.value is not None:
+            value = float(parsed.value)
+            if parsed.unit in SUPPORTED_UNITS:
+                value = float(convert_pressure(value, parsed.unit, self._display_unit))
+            elif command.startswith("setpoint_"):
+                value = float(convert_pressure(value, "mbar", self._display_unit))
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+            return True
+
+        text_value = (parsed.formatted or "").strip().upper()
+        if isinstance(widget, QComboBox) and text_value:
+            idx = widget.findText(text_value)
+            if idx >= 0:
+                widget.blockSignals(True)
+                widget.setCurrentIndex(idx)
+                widget.blockSignals(False)
+            return True
+        if isinstance(widget, QCheckBox):
+            on = text_value in {"ON", "YES", "TRUE", "1"}
+            widget.blockSignals(True)
+            widget.setChecked(on)
+            widget.blockSignals(False)
+            return True
+        return True
+
     def on_terminal_response(self, entry) -> None:
         command = entry.command or ""
+        protocol = getattr(self._worker, "_protocol", None)
+        if command in self._ppg_setpoint_controls and entry.response and protocol is not None:
+            try:
+                parsed = protocol.parse_response(entry.response, command)
+                self._update_ppg_setpoint_control_from_response(command, parsed)
+                self._refresh_pin_setpoint_plot()
+            except Exception:
+                logger.exception("Failed to parse PPG setpoint response for %s", command)
+
         if command not in self._rows:
             return
         row = self._rows[command]
-        protocol = getattr(self._worker, "_protocol", None)
         text = "(no response)"
 
         if entry.error:
@@ -1350,6 +1739,26 @@ class GaugeSettingsPanel(QWidget):
         row["last"].setText(text)
         row["updated"].setText(entry.timestamp.strftime("%H:%M:%S"))
 
+    def on_reading(self, reading: DeviceReading) -> None:
+        if reading.command != "pressure" or reading.value is None:
+            return
+        p_mbar = float(reading.value)
+        if reading.unit in SUPPORTED_UNITS:
+            p_mbar = float(convert_pressure(reading.value, reading.unit, "mbar"))
+        self._last_pressure_mbar = max(p_mbar, 1e-12)
+        self._refresh_pin_setpoint_status()
+        # Update the live pressure indicator on the CDG setpoint plot and
+        # automatically refresh the SP trigger status from the live reading.
+        if self._live_pressure_line is not None and self._setpoint_plot is not None:
+            p_disp = float(convert_pressure(self._last_pressure_mbar, "mbar", self._display_unit))
+            self._live_pressure_line.setValue(p_disp)
+            self._live_pressure_line.setVisible(True)
+            y_raw = float(self._mbar_to_raw(self._last_pressure_mbar))
+            sp1_trig, sp1_region = self._setpoint_triggered_at_raw("1", y_raw)
+            sp2_trig, sp2_region = self._setpoint_triggered_at_raw("2", y_raw)
+            self._apply_status_ui("Setpoint 1", sp1_trig, "1", sp1_region)
+            self._apply_status_ui("Setpoint 2", sp2_trig, "2", sp2_region)
+
 
 class OPG550ControlPanel(QWidget):
     """Dedicated OPG550 controls and visual telemetry.
@@ -1371,15 +1780,24 @@ class OPG550ControlPanel(QWidget):
         self._pressure_value = QLabel(f"- {self._display_unit}")
         self._temperature_value = QLabel("- °C")
         self._pressure_quality = QLabel("Vacuum quality: -")
+        self._molecule_label = QLabel("Likely molecules: -")
 
         self._vacuum_bar = QProgressBar()
         self._temperature_bar = QProgressBar()
+        self._spectrum_mode = SpectrumMode.AUTO
 
         self._trend_t: deque[float] = deque(maxlen=360)
         self._trend_p: deque[float] = deque(maxlen=360)
         self._trend_t0: float | None = None
         self._trend_plot: pg.PlotWidget | None = None
         self._trend_curve: pg.PlotDataItem | None = None
+        self._spectrum_plot: pg.PlotWidget | None = None
+        self._spectrum_curve: pg.PlotDataItem | None = None
+        self._spectrum_user_zoomed: bool = False
+        self._spectrum_reset_btn: QPushButton | None = None
+        self._spectrum_mode_desc: QLabel | None = None
+        self._last_pressure_mbar: float | None = None
+        self._last_pressure_t: float | None = None
 
         self._build_ui()
 
@@ -1397,30 +1815,153 @@ class OPG550ControlPanel(QWidget):
         root.addWidget(title)
         root.addWidget(subtitle)
 
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(6)
-        for label, command in (
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.setChildrenCollapsible(False)
+        body.setHandleWidth(6)
+
+        # Left side: dedicated chart workspace.
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+
+        trend_box = QFrame()
+        trend_box.setStyleSheet(
+            "QFrame { background: #141414; border: 1px solid #2F3C47; border-radius: 8px; }"
+        )
+        trend_layout = QVBoxLayout(trend_box)
+        trend_layout.setContentsMargins(10, 8, 10, 8)
+        trend_layout.setSpacing(6)
+        trend_title = QLabel("Pressure Trend")
+        trend_title.setStyleSheet("font-weight: 600; color: #D8E2EA;")
+        trend_layout.addWidget(trend_title)
+
+        self._trend_plot = pg.PlotWidget()
+        self._trend_plot.setMinimumHeight(170)
+        self._trend_plot.setBackground("#121619")
+        # Avoid SI prefix scaling by building our own label
+        self._trend_plot.setLabel("left", f"Pressure ({self._display_unit})", units="")
+        self._trend_plot.setLabel("bottom", "Time", units="s")
+        self._trend_plot.setLogMode(y=True)
+        self._trend_plot.showGrid(x=True, y=True, alpha=0.22)
+        self._trend_curve = self._trend_plot.plot(
+            pen=pg.mkPen("#43C5FF", width=2)
+        )
+        trend_layout.addWidget(self._trend_plot)
+
+        spectrum_box = QFrame()
+        spectrum_box.setStyleSheet(
+            "QFrame { background: #121816; border: 1px solid #2F3C47; border-radius: 8px; }"
+        )
+        spectrum_layout = QVBoxLayout(spectrum_box)
+        spectrum_layout.setContentsMargins(10, 8, 10, 8)
+        spectrum_layout.setSpacing(6)
+
+        spectrum_hdr = QHBoxLayout()
+        spectrum_title = QLabel("Virtual Spectrum")
+        spectrum_title.setStyleSheet("font-weight: 600; color: #D8E2EA;")
+        spectrum_hdr.addWidget(spectrum_title)
+        spectrum_hdr.addStretch()
+        spectrum_hdr.addWidget(QLabel("Mode"))
+        self._spectrum_mode_combo = QComboBox()
+        for mode in SpectrumMode:
+            self._spectrum_mode_combo.addItem(mode.value, mode)
+        self._spectrum_mode_combo.currentIndexChanged.connect(self._on_spectrum_mode_changed)
+        spectrum_hdr.addWidget(self._spectrum_mode_combo)
+        spectrum_layout.addLayout(spectrum_hdr)
+
+        self._spectrum_mode_desc = QLabel(self._spectrum_mode_description(SpectrumMode.AUTO))
+        self._spectrum_mode_desc.setStyleSheet("color:#7FAABB; font-size:10px; font-style:italic;")
+        self._spectrum_mode_desc.setWordWrap(True)
+        spectrum_layout.addWidget(self._spectrum_mode_desc)
+
+        self._spectrum_plot = pg.PlotWidget()
+        self._spectrum_plot.setMinimumHeight(160)
+        self._spectrum_plot.setBackground("#101316")
+        self._spectrum_plot.setLabel("left", "Relative optical intensity")
+        self._spectrum_plot.setLabel("bottom", "Wavelength", units="nm")
+        self._spectrum_plot.showGrid(x=True, y=True, alpha=0.2)
+        self._spectrum_curve = self._spectrum_plot.plot(
+            pen=pg.mkPen("#90D98E", width=2),
+            fillLevel=0.0,
+            brush=pg.mkBrush(144, 217, 142, 90),
+        )
+        self._spectrum_user_zoomed = False
+        self._spectrum_plot.getViewBox().sigRangeChangedManually.connect(
+            self._on_spectrum_range_manual
+        )
+        self._spectrum_reset_btn = QPushButton("A")
+        self._spectrum_reset_btn.setToolTip("Reset spectrum view to auto-scale")
+        self._spectrum_reset_btn.setFixedSize(24, 24)
+        self._spectrum_reset_btn.setStyleSheet(
+            "QPushButton { background: #2A3A2A; color: #90D98E; border: 1px solid #3E6E4D;"
+            " border-radius: 4px; font-weight: bold; font-size: 11px; }"
+            "QPushButton:hover { background: #3A5A3A; }"
+        )
+        self._spectrum_reset_btn.hide()
+        self._spectrum_reset_btn.clicked.connect(self._on_spectrum_reset_view)
+        spectrum_hdr.addWidget(self._spectrum_reset_btn)
+        spectrum_layout.addWidget(self._spectrum_plot)
+
+        charts_splitter = QSplitter(Qt.Orientation.Vertical)
+        charts_splitter.setChildrenCollapsible(False)
+        charts_splitter.addWidget(trend_box)
+        charts_splitter.addWidget(spectrum_box)
+        charts_splitter.setStretchFactor(0, 3)
+        charts_splitter.setStretchFactor(1, 2)
+        charts_splitter.setSizes([320, 220])
+        left_layout.addWidget(charts_splitter, 1)
+
+        # Right side: controls + device info.
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        right_panel = QWidget()
+        right = QVBoxLayout(right_panel)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(8)
+
+        actions = QFrame()
+        actions.setStyleSheet(
+            "QFrame { background: #1B232A; border: 1px solid #2E3F4D; border-radius: 8px; }"
+        )
+        actions_layout = QGridLayout(actions)
+        actions_layout.setContentsMargins(8, 8, 8, 8)
+        actions_layout.setHorizontalSpacing(6)
+        actions_layout.setVerticalSpacing(6)
+        for idx, (label, command) in enumerate((
             ("Snapshot All", "_snapshot"),
             ("Read Error", "error_status"),
             ("Read Firmware", "software_version"),
             ("Read Serial", "serial_number"),
             ("Read Temperature", "temperature"),
-        ):
+        )):
             btn = QPushButton(label)
-            btn.setFixedHeight(28)
+            btn.setMinimumHeight(28)
             btn.clicked.connect(lambda _=False, c=command: self._on_action(c))
-            btn_row.addWidget(btn)
-        btn_row.addStretch()
-        root.addLayout(btn_row)
+            actions_layout.addWidget(btn, idx // 2, idx % 2)
+        right.addWidget(actions)
 
         cards = QGridLayout()
         cards.setHorizontalSpacing(10)
         cards.setVerticalSpacing(8)
         cards.addWidget(self._metric_card("Pressure", self._pressure_value), 0, 0)
         cards.addWidget(self._metric_card("Temperature", self._temperature_value), 0, 1)
-        cards.addWidget(self._metric_card("Firmware", self._fw_value), 1, 0)
-        cards.addWidget(self._metric_card("Serial", self._sn_value), 1, 1)
-        root.addLayout(cards)
+        cards_frame = QWidget()
+        cards_frame.setLayout(cards)
+        right.addWidget(cards_frame)
+
+        compact_meta = QGroupBox("Device Details")
+        compact_meta.setCheckable(True)
+        compact_meta.setChecked(False)
+        compact_meta.toggled.connect(lambda checked: self._err_value.setVisible(checked))
+        meta_layout = QGridLayout(compact_meta)
+        meta_layout.addWidget(QLabel("Firmware"), 0, 0)
+        meta_layout.addWidget(self._fw_value, 0, 1)
+        meta_layout.addWidget(QLabel("Serial"), 1, 0)
+        meta_layout.addWidget(self._sn_value, 1, 1)
+        right.addWidget(compact_meta)
 
         status_box = QFrame()
         status_box.setStyleSheet(
@@ -1434,19 +1975,20 @@ class OPG550ControlPanel(QWidget):
         self._err_value.setStyleSheet("font-family: Consolas, monospace; color: #F9C6C6;")
         sv.addWidget(err_title)
         sv.addWidget(self._err_value)
-        root.addWidget(status_box)
+        self._err_value.setVisible(False)
+        right.addWidget(status_box)
 
-        viz_box = QFrame()
-        viz_box.setStyleSheet(
+        health = QFrame()
+        health.setStyleSheet(
             "QFrame { background: #1A1A1A; border: 1px solid #333; border-radius: 8px; }"
         )
-        vv = QVBoxLayout(viz_box)
-        vv.setContentsMargins(10, 8, 10, 10)
-        vv.setSpacing(8)
+        hv = QVBoxLayout(health)
+        hv.setContentsMargins(10, 8, 10, 10)
+        hv.setSpacing(8)
 
         vacuum_title = QLabel("Vacuum Regime")
         vacuum_title.setStyleSheet("font-weight: 600; color: #D8E2EA;")
-        vv.addWidget(vacuum_title)
+        hv.addWidget(vacuum_title)
 
         self._vacuum_bar.setRange(0, 1000)
         self._vacuum_bar.setValue(0)
@@ -1462,13 +2004,13 @@ class OPG550ControlPanel(QWidget):
             "  border-radius: 4px;"
             "}"
         )
-        vv.addWidget(self._vacuum_bar)
+        hv.addWidget(self._vacuum_bar)
         self._pressure_quality.setStyleSheet("color: #AFC7D6; font-size: 11px;")
-        vv.addWidget(self._pressure_quality)
+        hv.addWidget(self._pressure_quality)
 
         temp_title = QLabel("Sensor Thermal Load")
         temp_title.setStyleSheet("font-weight: 600; color: #D8E2EA;")
-        vv.addWidget(temp_title)
+        hv.addWidget(temp_title)
         self._temperature_bar.setRange(0, 1200)
         self._temperature_bar.setValue(0)
         self._temperature_bar.setFormat("%p%")
@@ -1483,21 +2025,66 @@ class OPG550ControlPanel(QWidget):
             "  border-radius: 4px;"
             "}"
         )
-        vv.addWidget(self._temperature_bar)
+        hv.addWidget(self._temperature_bar)
 
-        self._trend_plot = pg.PlotWidget()
-        self._trend_plot.setMinimumHeight(180)
-        self._trend_plot.setBackground("#141414")
-        self._trend_plot.setLabel("left", "Pressure", units=self._display_unit)
-        self._trend_plot.setLabel("bottom", "Time", units="s")
-        self._trend_plot.setLogMode(y=True)
-        self._trend_plot.showGrid(x=True, y=True, alpha=0.22)
-        self._trend_curve = self._trend_plot.plot(
-            pen=pg.mkPen("#43C5FF", width=2)
-        )
-        vv.addWidget(self._trend_plot)
+        self._molecule_label.setStyleSheet("color:#CFE6D5; font-size:11px;")
+        self._molecule_label.setWordWrap(True)
+        hv.addWidget(self._molecule_label)
 
-        root.addWidget(viz_box, 1)
+        right.addWidget(health)
+        right.addStretch()
+
+        right_scroll.setWidget(right_panel)
+
+        body.addWidget(left_panel)
+        body.addWidget(right_scroll)
+        body.setStretchFactor(0, 3)
+        body.setStretchFactor(1, 2)
+        body.setSizes([860, 420])
+
+        root.addWidget(body, 1)
+
+    @staticmethod
+    def _spectrum_mode_description(mode: SpectrumMode) -> str:
+        return {
+            SpectrumMode.AUTO: (
+                "Auto — composition derived from pressure level and trend. "
+                "N₂/O₂ dominate at higher pressures; H₂/H₂O/CO shift in at deep vacuum."
+            ),
+            SpectrumMode.AIR_LEAK: (
+                "Air Leak — atmosphere ingress simulation. "
+                "N₂ 72%, O₂ 20%, Ar 3%, H₂O 4% baseline; peaks evolve as outgassing grows over time."
+            ),
+            SpectrumMode.WATER_LEAK: (
+                "Water Leak — humid atmosphere ingress. "
+                "H₂O dominates; thermal dissociation produces H₂ over time."
+            ),
+            SpectrumMode.HELIUM_LEAK: (
+                "Helium Leak — He tracer simulation. "
+                "He dominates (~78%); residual N₂/O₂ diminish as He fills the chamber."
+            ),
+            SpectrumMode.HYDROCARBON_BACKSTREAM: (
+                "Hydrocarbon Backstream — pump oil vapour contamination. "
+                "CH₄ and H₂O initially high; CO grows as decomposition proceeds."
+            ),
+        }.get(mode, mode.value)
+
+    def _on_spectrum_range_manual(self) -> None:
+        self._spectrum_user_zoomed = True
+        self._spectrum_reset_btn.show()
+
+    def _on_spectrum_reset_view(self) -> None:
+        self._spectrum_user_zoomed = False
+        self._spectrum_reset_btn.hide()
+        if self._spectrum_plot is not None:
+            self._spectrum_plot.enableAutoRange()
+
+    def _on_spectrum_mode_changed(self, index: int) -> None:
+        mode = self._spectrum_mode_combo.itemData(index)
+        if isinstance(mode, SpectrumMode):
+            self._spectrum_mode = mode
+            self._spectrum_mode_desc.setText(self._spectrum_mode_description(mode))
+            self._update_spectrum_plot()
 
     def _metric_card(self, title: str, value: QLabel) -> QFrame:
         box = QFrame()
@@ -1594,7 +2181,8 @@ class OPG550ControlPanel(QWidget):
             converted = convert_pressure(value, old, unit)
             self._pressure_value.setText(f"{converted:.4E} {unit}")
         if self._trend_plot is not None:
-            self._trend_plot.setLabel("left", "Pressure", units=unit)
+            # Avoid SI prefix scaling by building our own label
+            self._trend_plot.setLabel("left", f"Pressure ({unit})", units="")
         if self._trend_p:
             self._trend_p = deque(
                 [convert_pressure(v, old, unit) for v in self._trend_p],
@@ -1634,6 +2222,7 @@ class OPG550ControlPanel(QWidget):
         self._trend_t.append(float(t_rel))
         self._trend_p.append(max(value_display, 1e-12))
         self._refresh_trend()
+        self._update_spectrum_plot(value_mbar=value_mbar, timestamp_mono=timestamp_mono)
 
     def _update_temperature(self, value: float | None) -> None:
         if value is None:
@@ -1648,6 +2237,68 @@ class OPG550ControlPanel(QWidget):
             np.array(self._trend_t, dtype=float),
             np.array(self._trend_p, dtype=float),
         )
+
+    def _update_spectrum_plot(
+        self,
+        *,
+        value_mbar: float | None = None,
+        timestamp_mono: float | None = None,
+    ) -> None:
+        if self._spectrum_curve is None:
+            return
+
+        p_mbar = self._last_pressure_mbar if value_mbar is None else value_mbar
+        if p_mbar is None:
+            return
+
+        if timestamp_mono is None:
+            timestamp_mono = time.monotonic()
+
+        trend = 0.0
+        if self._last_pressure_mbar is not None and self._last_pressure_t is not None:
+            dt = max(1e-3, timestamp_mono - self._last_pressure_t)
+            trend = (p_mbar - self._last_pressure_mbar) / dt
+
+        elapsed = 0.0
+        if self._trend_t0 is not None:
+            elapsed = max(0.0, timestamp_mono - self._trend_t0)
+
+        spectrum = simulate_optical_spectrum(
+            pressure_mbar=max(p_mbar, 1e-12),
+            trend_mbar_per_s=trend,
+            elapsed_s=elapsed,
+            mode=self._spectrum_mode,
+            wavelength_min_nm=380.0,
+            wavelength_max_nm=780.0,
+            samples=401,
+        )
+        x = np.linspace(380.0, 780.0, len(spectrum), dtype=float)
+        y = np.array(spectrum, dtype=float)
+        if self._spectrum_user_zoomed:
+            self._spectrum_plot.disableAutoRange()
+        self._spectrum_curve.setData(x, y)
+
+        if p_mbar <= OPG_ANALYSIS_MAX_PRESSURE_MBAR:
+            matches = identify_optical_species(
+                spectrum,
+                wavelength_min_nm=380.0,
+                wavelength_max_nm=780.0,
+                top_k=4,
+            )
+            if matches:
+                txt = ", ".join(f"{m.name} ({m.score * 100:.0f}%)" for m in matches)
+            else:
+                txt = "No dominant optical signature"
+            self._molecule_label.setText(f"Likely optical gas signatures: {txt}")
+        else:
+            self._molecule_label.setText(
+                "Gas analysis unavailable above "
+                f"{OPG_ANALYSIS_MAX_PRESSURE_MBAR:.1E} mbar "
+                "(pump down further to enable species identification)"
+            )
+
+        self._last_pressure_mbar = max(p_mbar, 1e-12)
+        self._last_pressure_t = float(timestamp_mono)
 
     @staticmethod
     def _vacuum_score(pressure_mbar: float) -> int:
@@ -1771,10 +2422,12 @@ class GaugeTab(QWidget):
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
-        self._table.setMaximumHeight(160)
+        self._table.setMinimumHeight(120)
+        self._table.setMaximumHeight(220)
         splitter.addWidget(self._table)
 
         splitter.setSizes([400, 130])
+        self._live_splitter = splitter
         live_layout.addWidget(splitter)
         self._tabs.addTab(live, "Live View")
 
@@ -1798,6 +2451,11 @@ class GaugeTab(QWidget):
         if self._tabs.tabText(index) == "Settings":
             self._settings.refresh_setpoints()
 
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        table_h = max(120, min(300, int(self.height() * 0.28)))
+        self._table.setMaximumHeight(table_h)
+
     # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
@@ -1808,6 +2466,7 @@ class GaugeTab(QWidget):
         if reading.value is not None:
             value = self._to_display(reading.value, reading.unit)
             self._plot_panel.feed(reading.command, reading.timestamp_mono, value)
+        self._settings.on_reading(reading)
         if self._opg_panel is not None:
             self._opg_panel.on_reading(reading)
         self._update_table(reading)

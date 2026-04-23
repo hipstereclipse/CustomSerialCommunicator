@@ -45,25 +45,28 @@ P_ATM_MBAR: float = 1013.0
 _DEFAULT_VOLUME_L: float = 10.0
 
 # Two-stage pumpdown time constants (at LOW humidity, typical 10 L chamber).
-# Stage 1: roughing pump  atm → ~1 mbar  (mechanical pump, ~3 min)
-# Stage 2: high-vac pump  ~1 mbar → base  (turbo/cryo, ~7 min)
-# Both use exponential decay; humidity multiplies both constants equally.
-_ROUGHING_TAU_S: float = 60.0    # e-folding time, roughing stage
-_HIGHVAC_TAU_S: float = 150.0    # e-folding time, high-vac stage
-_CROSSOVER_MBAR: float = 1.0     # pressure where high-vac pump takes over
+# Stage 1: roughing pump  atm → 1..10 Torr region (turbo spin-up threshold)
+# Stage 2: turbo pump     crossover → deep vacuum
+# Stage 3: molecular flow region where conductance limits effective speed
+# and pumpdown naturally slows.
+_ROUGHING_TAU_S: float = 9.0         # e-folding time, roughing stage
+_TURBO_TAU_S: float = 3.8            # e-folding time, turbo viscous/transitional stage
+_MOLECULAR_TAU_S: float = 18.0       # slower deep-vac tail in molecular flow
+_CROSSOVER_MBAR: float = 13.0        # 10 Torr (turbo enable threshold)
+_MOLECULAR_TRANSITION_MBAR: float = 3e-6
 
 # Moisture-loaded surfaces outgas after pump start. This adds a long tail that
 # is especially visible at medium/high humidity and keeps real pumpdowns from
 # unrealistically reaching deep vacuum too quickly.
 _OUTGASSING_TAU_S: dict[HumidityLevel, float] = {
-    HumidityLevel.LOW: 420.0,
-    HumidityLevel.MEDIUM: 780.0,
-    HumidityLevel.HIGH: 1200.0,
+    HumidityLevel.LOW: 180.0,
+    HumidityLevel.MEDIUM: 240.0,
+    HumidityLevel.HIGH: 320.0,
 }
 _OUTGASSING_START_FRACTION: dict[HumidityLevel, float] = {
-    HumidityLevel.LOW: 0.01,
-    HumidityLevel.MEDIUM: 0.03,
-    HumidityLevel.HIGH: 0.07,
+    HumidityLevel.LOW: 2e-9,
+    HumidityLevel.MEDIUM: 8e-9,
+    HumidityLevel.HIGH: 3e-8,
 }
 
 
@@ -268,21 +271,13 @@ class SimulationEngine:
     # --- individual pattern implementations -------------------------------
 
     def _pumpdown_locked(self, t: float) -> float:
-        """Realistic two-stage pumpdown: roughing pump then high-vac pump.
+        """Realistic staged pumpdown: roughing, turbo, then molecular-flow tail.
 
-        Stage 1 — Roughing (mechanical pump): atmospheric → crossover pressure.
-          P₁(t) = P_atm · exp(-t / (τ₁ · h))  where h = humidity multiplier.
-
-        Stage 2 — High-vacuum (turbo/cryo): crossover → base pressure.
-          P₂(t′) = P_cross · exp(-t′ / (τ₂ · h))
-          where t′ is the time elapsed since reaching crossover.
-
-                Moisture outgassing tail:
-                    P_out(t) = (P_atm * f_humidity) · exp(-t / τ_out)
-
-                where ``f_humidity`` and ``τ_out`` depend on selected humidity. This
-                keeps medium/high humidity pumpdowns slower in the 1e-2 to 1e-5 mbar
-                region, matching common chamber behavior.
+        Behavior targets:
+        - Roughing stage handles atmosphere down to the 1..10 Torr region.
+        - Turbo stage then quickly reaches high vacuum.
+        - Below a deep-vac threshold, effective speed drops (molecular flow),
+          so the final decades flatten naturally.
         """
         base = self._base_pressure_mbar
         if base >= P_ATM_MBAR:
@@ -290,7 +285,8 @@ class SimulationEngine:
 
         h = HUMIDITY_TIME_FACTOR.get(self._humidity, 1.0)
         tau1 = _ROUGHING_TAU_S * h
-        tau2 = _HIGHVAC_TAU_S * h
+        tau_turbo = _TURBO_TAU_S * h
+        tau_mol = _MOLECULAR_TAU_S * h
 
         # Stage 1: roughing decay
         p_rough = P_ATM_MBAR * math.exp(-t / tau1)
@@ -305,17 +301,28 @@ class SimulationEngine:
             # Still in roughing stage — high-vac pump not yet effective.
             return max(p_rough, base)
 
-        # Stage 2: high-vac exponential from crossover pressure toward base.
+        # Stage 2: turbo pump dominates down to molecular-flow threshold.
         t2 = t - t_cross
-        p_hv = _CROSSOVER_MBAR * math.exp(-t2 / tau2)
+        p_turbo = _CROSSOVER_MBAR * math.exp(-t2 / tau_turbo)
+
+        if _CROSSOVER_MBAR > _MOLECULAR_TRANSITION_MBAR:
+            t_mol = tau_turbo * math.log(_CROSSOVER_MBAR / _MOLECULAR_TRANSITION_MBAR)
+        else:
+            t_mol = 0.0
+
+        if t2 <= t_mol:
+            p_flow_limited = p_turbo
+        else:
+            # Stage 3: deep-vac molecular regime slows further decay.
+            t3 = t2 - t_mol
+            p_flow_limited = _MOLECULAR_TRANSITION_MBAR * math.exp(-t3 / tau_mol)
 
         out_tau = _OUTGASSING_TAU_S.get(self._humidity, 780.0)
         out_frac = _OUTGASSING_START_FRACTION.get(self._humidity, 0.03)
         p_out = (P_ATM_MBAR * out_frac) * math.exp(-t / out_tau)
 
-        # Blend contributions; high-vac term dominates below crossover and
-        # outgassing limits ultimate speed in humid environments.
-        pressure = max(p_rough, p_hv, p_out, base)
+        # After crossover, roughing no longer governs chamber pressure.
+        pressure = max(p_flow_limited, p_out, base)
         # Clamp to base once we’re close enough.
         if pressure <= base * 1.0001:
             return base

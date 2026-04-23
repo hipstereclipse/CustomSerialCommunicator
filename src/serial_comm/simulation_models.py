@@ -47,8 +47,8 @@ class HumidityLevel(str, Enum):
 #: adsorbed water vapour on chamber walls, which out-gasses during pumping.
 HUMIDITY_TIME_FACTOR: dict[HumidityLevel, float] = {
     HumidityLevel.LOW: 1.0,
-    HumidityLevel.MEDIUM: 1.9,
-    HumidityLevel.HIGH: 3.2,
+    HumidityLevel.MEDIUM: 1.15,
+    HumidityLevel.HIGH: 1.35,
 }
 
 
@@ -105,10 +105,10 @@ _FAMILY_BY_MODEL: dict[str, GaugeFamily] = {
     "CDG045D": GaugeFamily.CDG,
     # Cold cathode / ionisation only
     "MAG500": GaugeFamily.COLD_CATHODE,
-    "OPG550": GaugeFamily.COLD_CATHODE,
     "BPG402": GaugeFamily.COLD_CATHODE,
     "BPG552": GaugeFamily.COLD_CATHODE,
     # Combination (Pirani + CC)
+    "OPG550": GaugeFamily.COMBINATION,
     "BCG450": GaugeFamily.COMBINATION,
     "BCG552": GaugeFamily.COMBINATION,
     "PCG550": GaugeFamily.COMBINATION,
@@ -251,7 +251,11 @@ _MODEL_SIM_SPECS: dict[str, GaugeSimulationSpec] = {
     "BPG402": GaugeSimulationSpec(1e-10, 1e-2, 0.01, 0.2, 1.6, warmup_s=2.5),
     "BPG552": GaugeSimulationSpec(1e-10, 1e-2, 0.01, 0.2, 1.6, warmup_s=2.5),
     "MAG500": GaugeSimulationSpec(1e-9, 1e-2, 0.012, 0.2, 1.6, warmup_s=2.0),
-    "OPG550": GaugeSimulationSpec(5e-9, 2e-2, 0.012, 0.2, 1.8, warmup_s=2.0),
+    # OPG550 simulated as Pirani + cold-cathode with pressure-dependent blending.
+    "OPG550": GaugeSimulationSpec(
+        1e-9, 1.3e3, 0.003, 0.03, 0.8,
+        warmup_s=1.5, blend_low_mbar=7e-4, blend_high_mbar=2e-3,
+    ),
     # Capacitance / piezo combinations
     "MPG400": GaugeSimulationSpec(5e-4, 1.3e3, 0.003, 0.03, 0.75),
     "MPG500": GaugeSimulationSpec(5e-4, 1.3e3, 0.003, 0.03, 0.75),

@@ -236,3 +236,95 @@ commands:
     read: true
     write: true
     description: Setpoint source (SPS?<n> / SPS!<n>,P|T|CMB|VAC|ATM|DIFF|PIR)
+
+  # ── Convenience aliases for per-setpoint UI editors ────────────────
+  setpoint_1:
+    mnemonic: SPV
+    query_param: 1
+    write_prefix: "1,"
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 1 value (SPV?1 / SPV!1,<pressure>)
+  setpoint_2:
+    mnemonic: SPV
+    query_param: 2
+    write_prefix: "2,"
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 2 value (SPV?2 / SPV!2,<pressure>)
+  setpoint_3:
+    mnemonic: SPV
+    query_param: 3
+    write_prefix: "3,"
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 3 value (SPV?3 / SPV!3,<pressure>)
+  setpoint_1_hysteresis:
+    mnemonic: SPH
+    query_param: 1
+    write_prefix: "1,"
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 1 hysteresis (SPH?1 / SPH!1,<pressure>)
+  setpoint_2_hysteresis:
+    mnemonic: SPH
+    query_param: 2
+    write_prefix: "2,"
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 2 hysteresis (SPH?2 / SPH!2,<pressure>)
+  setpoint_3_hysteresis:
+    mnemonic: SPH
+    query_param: 3
+    write_prefix: "3,"
+    read: true
+    write: true
+    unit: mbar
+    description: Setpoint 3 hysteresis (SPH?3 / SPH!3,<pressure>)
+  setpoint_1_direction:
+    mnemonic: SPD
+    query_param: 1
+    write_prefix: "1,"
+    read: true
+    write: true
+    description: Setpoint 1 direction (SPD?1 / SPD!1,ABOVE|BELOW)
+  setpoint_2_direction:
+    mnemonic: SPD
+    query_param: 2
+    write_prefix: "2,"
+    read: true
+    write: true
+    description: Setpoint 2 direction (SPD?2 / SPD!2,ABOVE|BELOW)
+  setpoint_3_direction:
+    mnemonic: SPD
+    query_param: 3
+    write_prefix: "3,"
+    read: true
+    write: true
+    description: Setpoint 3 direction (SPD?3 / SPD!3,ABOVE|BELOW)
+  setpoint_1_enable:
+    mnemonic: SPE
+    query_param: 1
+    write_prefix: "1,"
+    read: true
+    write: true
+    description: Setpoint 1 enable (SPE?1 / SPE!1,ON|OFF)
+  setpoint_2_enable:
+    mnemonic: SPE
+    query_param: 2
+    write_prefix: "2,"
+    read: true
+    write: true
+    description: Setpoint 2 enable (SPE?2 / SPE!2,ON|OFF)
+  setpoint_3_enable:
+    mnemonic: SPE
+    query_param: 3
+    write_prefix: "3,"
+    read: true
+    write: true
+    description: Setpoint 3 enable (SPE?3 / SPE!3,ON|OFF)

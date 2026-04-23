@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 
 from PyQt6.QtCore import Qt, QSettings, pyqtSlot
-from PyQt6.QtGui import QAction, QColor, QKeySequence
+from PyQt6.QtGui import QAction, QColor, QGuiApplication, QKeySequence
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QHBoxLayout, QPushButton, QListWidget, QListWidgetItem,
@@ -97,7 +97,15 @@ class MainWindow(QMainWindow):
         self._combined_sim_tab: CombinedTab | None = None
 
         self.setWindowTitle("Serial Communicator")
-        self.resize(1280, 800)
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            self.resize(
+                max(1100, int(avail.width() * 0.78)),
+                max(720, int(avail.height() * 0.82)),
+            )
+        else:
+            self.resize(1280, 800)
 
         self._build_menu()
         self._build_toolbar()
@@ -232,6 +240,7 @@ class MainWindow(QMainWindow):
 
         left.setMinimumWidth(180)
         left.setMaximumWidth(300)
+        self._left_panel = left
         splitter.addWidget(left)
 
         # --- Right panel: tab widget (always visible) ---
@@ -375,7 +384,10 @@ class MainWindow(QMainWindow):
         self._gauge_tabs[device_id] = tab
         inserted_idx = self._tab_widget.insertTab(insert_idx, tab, display_name)
         self._tab_widget.tabBar().setTabTextColor(inserted_idx, QColor(color))
-        self._tab_widget.setCurrentIndex(inserted_idx)
+        if real_count >= 1 and self._main_tab is not None:
+            self._tab_widget.setCurrentWidget(self._main_tab)
+        else:
+            self._tab_widget.setCurrentIndex(inserted_idx)
 
         self._add_device_list_entry(
             device_id=device_id,
@@ -461,7 +473,8 @@ class MainWindow(QMainWindow):
             engine.set_gas(config.gas_type)
 
         engine.register(config)
-        worker = SimulatedGaugeWorker(spec=spec, config=config)
+        protocol = self._registry.make_protocol(spec, address=spec.default_address)
+        worker = SimulatedGaugeWorker(spec=spec, config=config, protocol=protocol)
 
         # Assign colour before creating the tab
         color = self._next_gauge_color()
@@ -1008,6 +1021,13 @@ class MainWindow(QMainWindow):
         state = self._settings.value("mainwindow/state")
         if state:
             self.restoreState(state)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if not hasattr(self, "_left_panel"):
+            return
+        max_left = max(220, min(380, int(self.width() * 0.3)))
+        self._left_panel.setMaximumWidth(max_left)
 
     def closeEvent(self, event) -> None:
         self._settings.setValue("mainwindow/geometry", self.saveGeometry())
