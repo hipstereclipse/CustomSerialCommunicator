@@ -1,0 +1,30 @@
+model: CDG100D
+manufacturer: INFICON
+family: cdg_serial
+protocol: cdg_serial
+full_scale_mbar: 1.3332
+full_scale_options_mbar: [0.1, 0.13332, 1.0, 1.3332, 10.0, 13.332, 100.0, 133.32, 1100.0, 1333.22]
+transport:
+  default_baud: 9600
+  parity: N
+  data_bits: 8
+  stop_bits: 1
+  rs_modes: [RS232]
+  default_address: 0
+commands:
+  pressure: {read: true, write: false, unit: mbar, description: Continuous pressure measurement (streamed)}
+  cdg_type: {read: true, write: false, description: Query gauge full-scale / type code}
+  firmware: {read: true, write: false, description: Query firmware revision}
+  serial_number: {read: true, write: false, description: Query gauge serial number}
+  unit: {read: false, write: true, description: Set pressure unit (0=mbar, 1=Torr, 2=Pa)}
+  setpoint_1_low: {read: false, write: true, description: Set Setpoint 1 lower threshold}
+  setpoint_1_high: {read: false, write: true, description: Set Setpoint 1 upper threshold}
+  setpoint_2_low: {read: false, write: true, description: Set Setpoint 2 lower threshold}
+  setpoint_2_high: {read: false, write: true, description: Set Setpoint 2 upper threshold}
+  setpoint_1_read: {read: true, write: false, description: Read Setpoint 1 thresholds}
+  setpoint_2_read: {read: true, write: false, description: Read Setpoint 2 thresholds}
+  zero_adjust: {read: false, write: true, description: Execute zero-offset adjustment}
+  fs_adjust: {read: false, write: true, description: Execute full-scale adjustment}
+  clear_zero: {read: false, write: true, description: Clear user zero adjustment}
+  reset: {read: false, write: true, description: Power-cycle reset}
+  factory_reset: {read: false, write: true, description: Restore factory defaults}

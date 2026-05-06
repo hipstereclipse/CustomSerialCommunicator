@@ -10,8 +10,10 @@ measurement data so the user has more context before selecting a device.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 import serial
+import serial.tools.list_ports
 from PyQt6.QtCore import QThread, pyqtSignal
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,25 @@ _PPG_PR1 = b"@254PR1?\\"   # combined (piezo+Pirani) pressure — PPG570 only
 # Use an explicit read command so scanner classification is based on an active
 # protocol probe, not only passive observation of a byte pattern.
 _CDG_PRESSURE_READ = b"\x03\x00\x00\x00\x00"
+
+
+@dataclass(frozen=True)
+class _CdgIdentification:
+    model: str | None
+    full_scale_mbar: float | None
+    sensor_code: int
+    type_word: int | None
+    raw_ratio: float
+
+
+_CDG_SENSOR_MODELS: dict[int, str] = {
+    0x00: "CDG025D",
+    0x01: "CDG045D",
+    0x02: "CDG100D",
+    0x03: "CDG160D",
+    0x04: "CDG200D",
+    0x0B: "HPG400",
+}
 
 # ── Pfeiffer ASCII probes ───────────────────────────────────────────────────
 # Frame format: addr(3) + action(2) + param(3) + len(2) + data + chk(3) + CR
@@ -64,18 +85,44 @@ class PortScanner(QThread):
     """
 
     port_found   = pyqtSignal(str, str, str, object)  # port, description, model_hint, metadata
+    port_scanning = pyqtSignal(str, int, int, str)  # port, current, total, status text
     scan_complete = pyqtSignal()
 
     def __init__(self, ports: list[str], parent=None) -> None:
         super().__init__(parent)
         self._ports = ports
+        self._port_info = {
+            p.device: (p.description or "", p.hwid or "")
+            for p in serial.tools.list_ports.comports()
+        }
 
     def run(self) -> None:
-        for port in self._ports:
+        total = len(self._ports)
+        for index, port in enumerate(self._ports, start=1):
             if self.isInterruptionRequested():
                 break
+            if self._should_skip_port(port):
+                self.port_scanning.emit(
+                    port,
+                    index,
+                    total,
+                    "skipping virtual TCP/IP adapter port because opening it can block the scan",
+                )
+                logger.info("Scanner: skipping %s virtual TCP/IP adapter port", port)
+                continue
+            self.port_scanning.emit(
+                port,
+                index,
+                total,
+                "opening port and probing PPG/Pfeiffer/CDG at 9600 baud",
+            )
             self._probe_port(port)
         self.scan_complete.emit()
+
+    def _should_skip_port(self, port: str) -> bool:
+        description, hwid = self._port_info.get(port, ("", ""))
+        text = f"{description} {hwid}".lower()
+        return "virtual" in text and "tcp/ip" in text
 
     # ------------------------------------------------------------------
     # Port probing
@@ -88,7 +135,10 @@ class PortScanner(QThread):
                 bytesize=8, parity="N", stopbits=1,
                 timeout=_PROBE_TIMEOUT, write_timeout=1.0,
             ) as ser:
+                if self.isInterruptionRequested():
+                    return
                 # ── PPG ASCII probe ─────────────────────────────────────
+                self._emit_port_status(port, "trying INFICON PPG ASCII commands")
                 ser.reset_input_buffer()
                 ser.write(_PPG_FV)
                 raw = self._read_until(ser, b"\\", 64)
@@ -106,7 +156,11 @@ class PortScanner(QThread):
                     self._identify_ppg(ser, port, raw)
                     return
 
+                if self.isInterruptionRequested():
+                    return
+
                 # ── Pfeiffer ASCII probe ────────────────────────────────
+                self._emit_port_status(port, "trying Pfeiffer ASCII identification")
                 ser.reset_input_buffer()
                 ser.write(_PFA_FW)
                 raw = self._read_until(ser, b"\r", 64)
@@ -119,7 +173,11 @@ class PortScanner(QThread):
                     self._identify_pfeiffer(ser, port, raw)
                     return
 
+                if self.isInterruptionRequested():
+                    return
+
                 # ── CDG/HPG binary probe (active command verification) ──
+                self._emit_port_status(port, "checking for CDG/HPG SKY binary frames")
                 ser.reset_input_buffer()
                 ser.write(_CDG_PRESSURE_READ)
                 stream = ser.read(96)
@@ -133,6 +191,143 @@ class PortScanner(QThread):
 
         except serial.SerialException as exc:
             logger.debug("Scanner: %s — %s", port, exc)
+
+        if self.isInterruptionRequested():
+            return
+
+        # ── INFICON P3 V02 probe (OPG550) — runs at 115200 baud ─────────
+        # Reopen the port at a different baud rate since the OPG550 uses a
+        # completely separate binary protocol and will never respond to the
+        # 9600-baud ASCII probes above.
+        try:
+            self._emit_port_status(port, "trying INFICON P3 V02 at 115200 baud for OPG550")
+            if self._probe_p3v02(port):
+                return
+        except serial.SerialException as exc:
+            logger.debug("Scanner: %s P3 V02 probe failed — %s", port, exc)
+
+    def _emit_port_status(self, port: str, message: str) -> None:
+        try:
+            index = self._ports.index(port) + 1
+        except ValueError:
+            index = 0
+        self.port_scanning.emit(port, index, len(self._ports), message)
+
+    # ------------------------------------------------------------------
+    # INFICON P3 V02 identification (OPG550)
+    # ------------------------------------------------------------------
+
+    def _probe_p3v02(self, port: str) -> bool:
+        """Probe for an OPG550 via the P3 V02 binary protocol at 115200."""
+        from serial_comm.protocols.inficon_p3_v02 import (
+            CMD_READ_REQ,
+            build_frame,
+            parse_frame,
+        )
+
+        with serial.Serial(
+            port=port, baudrate=115200,
+            bytesize=8, parity="N", stopbits=1,
+            timeout=_PROBE_TIMEOUT, write_timeout=1.0,
+        ) as ser:
+            # Read product_name (PID 10001)
+            ser.reset_input_buffer()
+            ser.write(build_frame(CMD_READ_REQ, 10001))
+            raw = self._read_p3v02_frame(ser)
+            if not raw:
+                return False
+            try:
+                parsed = parse_frame(raw)
+            except ValueError:
+                return False
+            if not parsed["crc_ok"] or parsed["ack"] != 1:
+                return False
+            product = parsed["data"].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+            if not product:
+                return False
+
+            # Read manufacturer_name (PID 10000)
+            ser.reset_input_buffer()
+            ser.write(build_frame(CMD_READ_REQ, 10000))
+            mfg_raw = self._read_p3v02_frame(ser)
+            manufacturer = ""
+            if mfg_raw:
+                try:
+                    mfg_parsed = parse_frame(mfg_raw)
+                    if mfg_parsed["crc_ok"] and mfg_parsed["ack"] == 1:
+                        manufacturer = mfg_parsed["data"].split(b"\x00", 1)[0].decode(
+                            "ascii", errors="replace"
+                        ).strip()
+                except ValueError:
+                    pass
+
+            # Read serial_number (PID 10002)
+            ser.reset_input_buffer()
+            ser.write(build_frame(CMD_READ_REQ, 10002))
+            sn_raw = self._read_p3v02_frame(ser)
+            serial_number = ""
+            if sn_raw:
+                try:
+                    sn_parsed = parse_frame(sn_raw)
+                    if sn_parsed["crc_ok"] and sn_parsed["ack"] == 1:
+                        serial_number = sn_parsed["data"].split(b"\x00", 1)[0].decode(
+                            "ascii", errors="replace"
+                        ).strip()
+                except ValueError:
+                    pass
+
+            # Read software_version (PID 10004)
+            ser.reset_input_buffer()
+            ser.write(build_frame(CMD_READ_REQ, 10004))
+            fw_raw = self._read_p3v02_frame(ser)
+            firmware = ""
+            if fw_raw:
+                try:
+                    fw_parsed = parse_frame(fw_raw)
+                    if fw_parsed["crc_ok"] and fw_parsed["ack"] == 1:
+                        firmware = fw_parsed["data"].split(b"\x00", 1)[0].decode(
+                            "ascii", errors="replace"
+                        ).strip()
+                except ValueError:
+                    pass
+
+        parts: list[str] = []
+        if firmware:
+            parts.append(f"FW: {firmware}")
+        if serial_number:
+            parts.append(f"SN: {serial_number}")
+        if manufacturer:
+            parts.append(manufacturer)
+        desc = "  |  ".join(parts) if parts else f"INFICON {product}"
+
+        model_hint = f"INFICON {product}" if "OPG" in product.upper() else f"INFICON {product}"
+        metadata = {
+            "family": "inficon_p3_v02",
+            "firmware": firmware,
+            "serial_number": serial_number,
+            "manufacturer": manufacturer,
+            "product": product,
+            "model": product,
+        }
+        self.port_found.emit(port, desc, model_hint, metadata)
+        logger.info("Scanner: %s — detected P3 V02 gauge (%s, SN=%s)",
+                    port, product, serial_number)
+        return True
+
+    @staticmethod
+    def _read_p3v02_frame(ser: serial.Serial) -> bytes:
+        """Read a complete P3 V02 frame from the serial port, or b'' on timeout."""
+        header = ser.read(5)  # addr, id, hdr, len_hi, len_lo
+        if len(header) < 5:
+            return b""
+        apdu_len = (header[3] << 8) | header[4]
+        # Sanity check: APDU is 1 (CMD) + 2 (PID) + 2 (IDX) + payload; cap at 512
+        if apdu_len < 5 or apdu_len > 512:
+            return b""
+        remaining = ser.read(apdu_len + 2)  # APDU body + 2-byte CRC
+        if len(remaining) < apdu_len + 2:
+            return b""
+        return bytes(header) + bytes(remaining)
 
     # ------------------------------------------------------------------
     # CDG identification (continuous output — no probe required)
@@ -168,6 +363,28 @@ class PortScanner(QThread):
         return b""
 
     @staticmethod
+    def _cdg_model_from_frame(frame: bytes, type_frame: bytes = b"") -> str | None:
+        """Decode the CDG model from validated protocol frames."""
+        if not frame:
+            return None
+
+        # Prefer the dedicated type-query response when it carries a model byte.
+        # Some heads put the model/family discriminator in the high byte of the
+        # type reply while the low byte remains a full-scale mantissa/range code.
+        if type_frame:
+            type_hi = type_frame[4]
+            type_lo = type_frame[5]
+            for code in (type_hi, type_frame[7]):
+                if code in _CDG_SENSOR_MODELS:
+                    # Avoid interpreting a plain integer full-scale reply such as
+                    # 0x0002 (2 Torr) as CDG100D; that form has a zero high byte.
+                    if code == type_hi and type_hi == 0 and type_lo != 0:
+                        continue
+                    return _CDG_SENSOR_MODELS[code]
+
+        return _CDG_SENSOR_MODELS.get(frame[7])
+
+    @staticmethod
     def _infer_cdg_full_scale_mbar(sensor_code: int, type_word: int | None) -> float | None:
         # Canonical CDG full-scale options across mbar-native and Torr-native heads.
         options = (0.1, 0.13332, 0.25, 0.3333, 1.0, 1.3332, 2.0, 2.6664,
@@ -175,6 +392,22 @@ class PortScanner(QThread):
                    500.0, 666.6, 1000.0, 1100.0, 1333.22)
         if type_word is None:
             return None
+
+        # Some heads report the nominal full-scale directly as an integer.  A
+        # 2 Torr head is therefore reported as 0x0002, which must become
+        # 2.6664 mbar for pressure parsing.
+        torr_native = {
+            1: 1.3332,
+            2: 2.6664,
+            10: 13.332,
+            20: 26.664,
+            100: 133.32,
+            200: 266.64,
+            500: 666.6,
+            1000: 1333.22,
+        }
+        if type_word in torr_native:
+            return torr_native[type_word]
 
         candidates: list[float] = []
         base = float(type_word)
@@ -194,9 +427,8 @@ class PortScanner(QThread):
                 best_rel_err = rel_err
                 best_val = float(nearest)
 
-        # Be conservative: only accept near-exact matches. A wrong full-scale
-        # causes large pressure conversion errors, so prefer "unknown".
-        if best_val is not None and best_rel_err <= 0.005:
+        # Require a reasonably close match; otherwise avoid forcing a wrong scale.
+        if best_val is not None and best_rel_err <= 0.05:
             return best_val
 
         logger.debug(
@@ -206,9 +438,9 @@ class PortScanner(QThread):
         )
         return None
 
-    def _identify_cdg(self, port: str, stream: bytes, type_stream: bytes | None = None) -> None:
-        """Emit a port_found signal for a detected CDG gauge."""
+    def _decode_cdg_identification(self, stream: bytes, type_stream: bytes | None = None) -> _CdgIdentification:
         frame = self._first_cdg_frame(stream)
+        type_frame = self._first_cdg_frame(type_stream or b"", read_echo=0x3B)
 
         sensor_code = frame[7] if frame else 0
         raw_ratio = 0.0
@@ -216,37 +448,45 @@ class PortScanner(QThread):
             meas = int.from_bytes(frame[4:6], "big", signed=True)
             raw_ratio = meas / 16384.0
 
-        type_frame = self._first_cdg_frame(type_stream or b"", read_echo=0x3B)
         type_word = int.from_bytes(type_frame[4:6], "big", signed=False) if type_frame else None
-        full_scale_mbar = self._infer_cdg_full_scale_mbar(sensor_code, type_word)
+        return _CdgIdentification(
+            model=self._cdg_model_from_frame(frame, type_frame),
+            full_scale_mbar=self._infer_cdg_full_scale_mbar(sensor_code, type_word),
+            sensor_code=sensor_code,
+            type_word=type_word,
+            raw_ratio=raw_ratio,
+        )
 
-        # Sensor-code byte is not a reliable model identifier on CDG025D
-        # (it encodes the factory full-scale range, not the model).
-        # Default to CDG025D and only special-case HPG400.
-        if sensor_code == 0x0B:
+    def _identify_cdg(self, port: str, stream: bytes, type_stream: bytes | None = None) -> None:
+        """Emit a port_found signal for a detected CDG gauge."""
+        decoded = self._decode_cdg_identification(stream, type_stream)
+
+        if decoded.model == "HPG400":
             model_hint = "INFICON HPG400"
+        elif decoded.model:
+            model_hint = f"INFICON {decoded.model}"
         else:
-            model_hint = "INFICON CDG025D"
-        parts = [f"ratio {raw_ratio:+.3f}", f"code 0x{sensor_code:02X}"]
-        if full_scale_mbar is not None:
-            parts.append(f"FS≈{full_scale_mbar:g} mbar")
-        if type_word is not None:
-            parts.append(f"type=0x{type_word:04X}")
+            model_hint = "INFICON CDG (unclassified)"
+        parts = [f"ratio {decoded.raw_ratio:+.3f}", f"code 0x{decoded.sensor_code:02X}"]
+        if decoded.full_scale_mbar is not None:
+            parts.append(f"FS≈{decoded.full_scale_mbar:g} mbar")
+        if decoded.type_word is not None:
+            parts.append(f"type=0x{decoded.type_word:04X}")
         desc = "  |  ".join(parts)
         metadata = {
             "family": "cdg_serial",
-            "sensor_code": sensor_code,
-            "type_word": type_word,
-            "full_scale_mbar": full_scale_mbar,
-            "model": model_hint.replace("INFICON ", ""),
+            "sensor_code": decoded.sensor_code,
+            "type_word": decoded.type_word,
+            "full_scale_mbar": decoded.full_scale_mbar,
+            "model": decoded.model or "",
         }
         self.port_found.emit(port, desc, model_hint, metadata)
         logger.info(
             "Scanner: %s — detected SKY-binary gauge (code 0x%02X, model=%s, fs=%s)",
             port,
-            sensor_code,
-            metadata["model"],
-            full_scale_mbar,
+            decoded.sensor_code,
+            metadata["model"] or "unclassified",
+            decoded.full_scale_mbar,
         )
 
     # ------------------------------------------------------------------

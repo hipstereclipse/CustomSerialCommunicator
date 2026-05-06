@@ -103,6 +103,11 @@ class DeviceRegistry:
                 param_table=param_table,
             )
 
+        if spec.protocol == "inficon_p3_v02":
+            from serial_comm.protocols.inficon_p3_v02 import InficonP3V02Protocol
+            param_table = self._build_param_table(spec)
+            return InficonP3V02Protocol(address=addr, param_table=param_table)
+
         if spec.protocol == "cdg_serial":
             from serial_comm.protocols.cdg_serial import CDGProtocol
             raw_extra = spec.__dict__.get("_raw_extra", {})

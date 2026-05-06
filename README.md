@@ -150,6 +150,11 @@ Simulation is first-class and designed for realistic operator practice and UI te
 
 Combined plotting supports overlay/stacked/grid layouts, visibility toggles, per-device color assignment, and synchronized chart navigation.
 
+Spectrum Studio (OPG550 advanced workspace) also includes a shared bottom hover-information bar with stable positioning:
+
+- The cursor X value is always rendered first at the far left of the info bar, so time/wavelength stays in a fixed location while hovering.
+- In Advanced Analysis mode, the hover bar shows the instantaneous pressure delta between comparison sources at the same cursor time: $\Delta(A-B)$.
+
 ## Session and Export
 
 - Session save/load model: [src/serial_comm/session.py](src/serial_comm/session.py)

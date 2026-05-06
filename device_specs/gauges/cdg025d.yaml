@@ -10,7 +10,7 @@ full_scale_mbar: 1.333  # default: 1 Torr head (≈1.333 mbar)
 # Keep full_scale_options_mbar in sync with the heads actually available;
 # the simulation dialog uses cdg_full_scale_options() from simulation_models.py
 # for the canonical list, so this YAML field is used only by the CDG serial protocol driver.
-full_scale_options_mbar: [0.1, 0.13332, 1.0, 1.3332, 10.0, 13.332, 100.0, 133.32, 1100.0, 1333.22]
+full_scale_options_mbar: [0.1, 0.13332, 1.0, 1.3332, 2.0, 2.6664, 10.0, 13.332, 100.0, 133.32, 1100.0, 1333.22]
 transport:
   default_baud: 9600
   parity: N

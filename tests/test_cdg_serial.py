@@ -132,6 +132,18 @@ class TestParseResponse:
         assert reading.success
         assert "sensor not ready" in reading.extra["warnings"]
 
+    def test_error_byte_0x18_still_returns_pressure(self):
+        cdg200 = CDGProtocol(gauge_type="CDG200D", full_scale_mbar=1.3332)
+        frame = make_cdg_response(8192, err=0x18, sensor_type=4)
+
+        reading = cdg200.parse_continuous(frame)
+
+        assert reading.success
+        assert reading.value == pytest.approx(0.6666)
+        assert reading.extra["gauge_type"] == "CDG200D"
+        assert "fs adjust running" in reading.extra["warnings"]
+        assert "extended status" in reading.extra["warnings"]
+
     def test_bad_checksum(self, cdg025):
         frame = bytearray(make_cdg_response(0))
         frame[8] ^= 0xFF
@@ -167,6 +179,52 @@ class TestDetectGaugeType:
         frame = make_cdg_response(0, sensor_type=0x0B)
         assert cdg025.detect_gauge_type(frame) == "HPG400"
 
+    def test_detects_cdg100d(self, cdg025):
+        frame = make_cdg_response(0, sensor_type=2)
+        assert cdg025.detect_gauge_type(frame) == "CDG100D"
+
+    def test_detects_cdg160d(self, cdg025):
+        frame = make_cdg_response(0, sensor_type=3)
+        assert cdg025.detect_gauge_type(frame) == "CDG160D"
+
+    def test_detects_cdg200d(self, cdg025):
+        frame = make_cdg_response(0, sensor_type=4)
+        assert cdg025.detect_gauge_type(frame) == "CDG200D"
+
     def test_unknown_sensor_type(self, cdg025):
         frame = make_cdg_response(0, sensor_type=99)
         assert cdg025.detect_gauge_type(frame) is None
+
+
+    def test_scanner_infers_two_torr_full_scale_as_mbar(self):
+        from GUI.gauge_workspace.port_scanner import PortScanner
+
+        assert PortScanner._infer_cdg_full_scale_mbar(1, 2) == pytest.approx(2.6664)
+
+    def test_scanner_decodes_cdg_model_from_frame(self):
+        from GUI.gauge_workspace.port_scanner import PortScanner
+
+        frame = make_cdg_response(8192, sensor_type=3)
+        decoded = PortScanner([])._decode_cdg_identification(frame)
+        assert decoded.model == "CDG160D"
+        assert decoded.raw_ratio == pytest.approx(0.5)
+
+    def test_scanner_does_not_turn_plain_full_scale_into_model(self):
+        from GUI.gauge_workspace.port_scanner import PortScanner
+
+        pressure_frame = make_cdg_response(0, sensor_type=1)
+        type_reply = bytearray(make_cdg_response(2, sensor_type=1))
+        type_reply[6] = 0x3B
+        type_reply[8] = sum(type_reply[1:8]) & 0xFF
+
+        decoded = PortScanner([])._decode_cdg_identification(pressure_frame, bytes(type_reply))
+        assert decoded.model == "CDG045D"
+        assert decoded.full_scale_mbar == pytest.approx(2.6664)
+
+    def test_registry_has_cdg_scan_targets(self):
+        from serial_comm.device_registry import DeviceRegistry
+
+        registry = DeviceRegistry()
+        for model in ("CDG025D", "CDG045D", "CDG100D", "CDG160D", "CDG200D"):
+            spec = registry.get_spec(model)
+            assert spec.protocol == "cdg_serial"

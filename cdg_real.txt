@@ -1,0 +1,1127 @@
+=== PAGE 1 ===
+tina49e1-f   (2024-08)
+SKY
+®
+ CDG025D
+SKY
+®
+ CDG025D-S
+Capacitance Diaphragm Gauge
+Operating Manual
+Incl. EU Declaration of Conformity
+
+=== PAGE 2 ===
+Table of Contents INFICON
+Table of Contents
+1  General .......................................................................................... 4
+1.1  Product Identification ........................................................... 4
+1.2  Validity ................................................................................. 4
+1.3  Intended Use ........................................................................ 6
+1.4  Functional Principle .............................................................. 6
+1.5  Trademarks .......................................................................... 6
+1.6  Patents ................................................................................. 6
+2  Safety ............................................................................................ 7
+2.1  Symbols Used ...................................................................... 7
+2.2  Personnel Qualifications ...................................................... 7
+2.3  General Safety Instructions .................................................. 8
+2.4  Liability and Warranty .......................................................... 8
+3  Technical Data .............................................................................. 9
+4  Installation .................................................................................... 14
+4.1  Vacuum Connection ............................................................. 14
+4.2  Power Connection ................................................................ 17
+5  Operation ...................................................................................... 19
+5.1  Displays ............................................................................... 19
+5.2  Zeroing the Gauge ............................................................... 20
+5.2.1  <ZERO> Adjustment .................................................. 20
+5.2.2  <ZERO> Adjustment with Ramp Function ................. 22
+5.3  Switching Functions (CDG025D‑S only) .............................. 24
+5.3.1  Adjusting the Setpoints .............................................. 24
+5.4  Activating the Factory Setting (Factory Reset) .................... 27
+6  Deinstallation ................................................................................ 27
+7  Maintenance, Repair .................................................................... 28
+8  Returning the Product ................................................................. 29
+9  Disposal ........................................................................................ 29
+Further Information ........................................................................... 31
+ETL Certification ................................................................................ 32
+EU Declaration of Conformity .......................................................... 33
+UKCA Declaration of Conformity ..................................................... 34
+2 tina49e1-f  (2024-08)
+
+=== PAGE 3 ===
+INFICON Table of Contents
+tina49e1-f  (2024-08) 3
+Symbol for cross-references within this docu-
+ment: ®   2  XY
+Symbol for references to literature list: ®   &  [Z]
+
+=== PAGE 4 ===
+1  | General INFICON
+1
+ | 
+General
+1.1
+ | 
+Product Identification
+In all communications with INFICON , please specify the informa-
+tion on the product nameplate.
+                    V               W
+INFICON AG, LI-9496 Balzers 
+Model:
+PN: 
+SN:
+3103457
+1.2
+ | 
+Validity
+This document applies to products of the SKY
+®
+ CDG025D and
+SKY
+®
+ CDG025D‑S series.
+Part numbers of standard products are indicated below. OEM
+products have other part numbers and different parameter set-
+tings (e.g. factory setting of setpoint) as defined in the corre-
+sponding ordering information.
+4 tina49e1-f  (2024-08)
+
+=== PAGE 5 ===
+INFICON General  | 1
+tina49e1-f  (2024-08) 5
+3xx-x0x
+0 /g159 
+1 /g159 
+2 /g159 
+3 /g159 
+5 /g159
+7 /g159 
+75 /g159 
+75 /g159 
+76 /g159 
+77 /g159 
+78 /g159
+79 /g159 
+82 /g159 
+83 /g159 
+84 /g159 
+85 /g159
+87 /g159  
+0 /g159 
+2 /g159
+3 /g159 
+5 /g159
+1000 (Torr only)
+1100 (mbar only)
+100
+10
+1
+0.1
+200
+20
+2
+0.25
+500
+Torr (× 133 Pa; × 1.3 mbar)
+mbar (× 100 Pa)
+½" tube
+DN 16 ISO-KF
+DN 16 CF-R
+8 VCR female
+4 VCR female
+4 VCR male
+Flange
+Switching function
+Unit
+Full scale (FS)
+Without switching function
+With switching function
+Torr (× 133 Pa; × 1.3 mbar)
+mbar (× 100 Pa)
+The part number (PN) can be taken from the product nameplate.
+If not indicated otherwise in the legends, the illustrations in this
+document correspond to CDG025D-S gauges with the
+DN 16 ISO-KF vacuum connection. They apply to other gauges
+by analogy.
+We reserve the right to make technical changes without prior no-
+tice.
+All dimensions in mm.
+
+=== PAGE 6 ===
+1  | General INFICON
+1.3
+ | 
+Intended Use
+The Capacitance Diaphragm Gauges of the SKY
+®
+ CDG025D se-
+ries are intended for absolute pressure measurement of gases in
+their respective pressure ranges.
+The gauges belong to the SKY
+®
+ Smart Sensors family and can
+be operated in connection with an INFICON  Vacuum Gauge
+Controller (VGC series) or another appropriate controller.
+1.4
+ | 
+Functional Principle
+A ceramic diaphragm is deflected by pressure. The deflection is
+measured capacitively and converted into an analog linear out-
+put signal by the digital electronics.
+The output signal is independent of the gas type.
+1.5
+ | 
+Trademarks
+SKY
+®
+INFICON Holding AG
+VCR
+®
+Swagelok Marketing Co.
+1.6
+ | 
+Patents
+EP 1070239 B1, 1040333 B1
+US Patents 6528008, 6591687, 7107855, 7140085
+6 tina49e1-f  (2024-08)
+
+=== PAGE 7 ===
+INFICON Safety  | 2
+tina49e1-f  (2024-08) 7
+2
+ | 
+Safety
+2.1
+ | 
+Symbols Used
+DANGER
+Information on preventing any kind of physical injury.
+WARNING
+Information on preventing extensive equipment and environmen-
+tal damage.
+Caution
+Information on correct handling or use. Disregard can lead to
+malfunctions or minor equipment damage.
+Notice
+Labeling
+2.2
+ | 
+Personnel Qualifications
+All work described in this document may only be carried out by
+persons who have suitable technical training and the necessary
+experience or who have been instructed by the end-user of the
+product.
+
+=== PAGE 8 ===
+2  | Safety INFICON
+2.3
+ | 
+General Safety Instructions
+· Adhere to the applicable regulations and take the necessary
+precautions for the process media used.
+Consider possible reactions with the product materials.
+· Adhere to the applicable regulations and take the necessary
+precautions for all work you are going to do and consider the
+safety instructions in this document.
+· Before beginning to work, find out whether any vacuum com-
+ponents are contaminated. Adhere to the relevant regulations
+and take the necessary precautions when handling contami-
+nated parts.
+Communicate the safety instructions to all other users.
+2.4
+ | 
+Liability and Warranty
+INFICON  assumes no liability and the warranty becomes null
+and void if the end-user or third parties
+· disregard the information in this document
+· use the product in a non-conforming manner
+· make any kind of interventions (modifications, alterations etc.)
+on the product
+· use the product with accessories not listed in the correspond-
+ing product documentation.
+The end-user assumes the responsibility in conjunction with the
+process media used.
+Gauge failures due to contamination are not covered by the war-
+ranty.
+8 tina49e1-f  (2024-08)
+
+=== PAGE 9 ===
+INFICON Technical Data  | 3
+tina49e1-f  (2024-08) 9
+3
+ | 
+Technical Data
+Measurement range ®  "Validity""
+Accuracy
+1 )
+≥1 Torr/mbar (FS) 0.20% of reading
+0.25 Torr/mbar (FS) 0.25% of reading
+0.1 Torr/mbar (FS) 0.50% of reading
+Temperature effect on zero
+≥10 Torr/mbar (FS) 0.0050% FS/ °C
+1 / 2 Torr/mbar (FS) 0.015% FS/ °C
+0.1 / 0.25 Torr/mbar (FS) 0.020% FS/ °C
+Temperature effect on span
+≥1 Torr/mbar (FS) 0.01% of reading / °C
+0.1 / 0.25 Torr/mbar (FS) 0.03% of reading / °C
+Resolution 0.003% FS
+Gas type dependence none
+Output signal analog
+(measurement signal)
+Measurement range 0 … +10 V
+Voltage range –5 … +10.24 V
+Voltage vs. pressure linear
+Output impedance 0 Ω (short-circuit proof)
+Loaded impedance >10 kΩ
+Response time
+≥1 Torr/mbar (FS) 30 ms
+≤0.25 Torr/mbar (FS) 130 ms
+Identification
+Resistance R
+Ident
+Resistance 13.2 kΩ refer-
+enced to supply common
+1 )
+Non-linearity, hysteresis, repeatability in the calibrated range at 23 °C
+ambient operating temperature without temperature effects after opera-
+tion of 2 h.
+
+=== PAGE 10 ===
+3  | Technical Data INFICON
+Switching function SP1, SP2
+Setting range 0 … +10 V
+Hysteresis 1% FS
+Relay contact 30 V (dc) / ≤0.5 A (dc)
+floating (NO)
+closed at low pressure (LED on)
+open at high pressure (LED off)
+Switching time ≤50 ms
+RS232C interface
+Transmission rate 9600 Baud
+Data format binary, 8 data bits, one
+stop bit, no parity bit, no
+handshake
+For further information on the RS232C interface ®   &  [5]
+Supply
+DANGER
+The gauge may only be connected to power supplies, instru-
+ments or control devices that conform to the requirements of a
+grounded protective extra-low voltage (PELV) and limited power
+source (LPS), Class 2.
+· The connection to the gauge has to be fused 
+2 )
+.
+Supply voltage Class 2 / LPS
+at the gauge +14 … +30 V (dc)
+Ripple ≤1 V
+pp
+Current consumption (max. starting
+current)
+<500 mA
+Power consumption (depending on
+supply voltage)
+≤1 W
+Fuse to be connected 
+2 )
+1 AT (slow), automatic re-
+set (Polyfuse)
+The gauge is protected against reverse polarity of the supply
+voltage.
+2 )
+INFICON  controllers fulfill these requirements.
+10 tina49e1-f  (2024-08)
+
+=== PAGE 11 ===
+INFICON Technical Data  | 3
+tina49e1-f  (2024-08) 11
+Receptacle D-sub 15-pin, male
+Sensor cable
+without switching functions 9-pin plus shielding
+with switching functions 13-pin plus shielding
+Cable length ≤100 m (0.14 mm²/conduc-
+tor)
+For longer cables, larger conductor cross-sections are required
+(R
+cable
+ ≤1.0  W ).
+Grounding concept
+Vacuum flange–signal common see "Power Connection"
+Supply common–signal common conducted separately; for
+differential measurement
+(10 Ω)
+Materials exposed to vacuum
+Flange, tube stainless steel AISI 316L
+Sensor and diaphragm ceramics (Al
+2
+O
+3
+ ≥99.5%)
+Sensor–diaphragm connection glass ceramics solder
+Ceramics–metal connection AgTiCu hard solder, Va-
+con 70 (28% Ni, 23% Co,
+49% Fe)
+Internal volume ≤4.0 cm
+3
+Leak rate <1×10
+-9
+ mbar l/s
+Admissible pressure (absolute)
+≥200 Torr/mbar (FS) 4 bar
+1 … 100 Torr/mbar (FS) 2.6 bar
+0.1 / 0.25 Torr/mbar (FS) 1.3 bar
+Bursting pressure (absolute) 5 bar
+Admissible temperature
+Storage –40 °C … +65 °C
+Operation +5 °C … +50 °C
+Bakeout (not in operation) ≤110 °C at the flange
+Relative humidity ≤80% at temperatures
+≤+31 °C, decreasing to
+50% at +40 °C
+Use indoors only, altitude up to
+2000 m NN
+
+=== PAGE 12 ===
+3  | Technical Data INFICON
+Pollution degree 2
+Degree of protection IP30
+Dimensions [mm]
+44
+55
+69 3.8
+8 VCR
+DN 16 CF-R
+26
+½" *) DN 16 ISO-KF
+4 VCR
+79 
+4 VCR
+64 
+*)
+Outer diameter
+female
+female male
+Weight 285 g  …  342 g
+12 tina49e1-f  (2024-08)
+
+=== PAGE 13 ===
+INFICON Technical Data  | 3
+tina49e1-f  (2024-08) 13
+Analog Measurement Signal vs. Pressure
+Pressure p
+1.1×FS
+1.0×FS
+0.9×FS
+0.8×FS
+0.7×FS
+0.6×FS
+0.5×FS
+0.4×FS
+0.3×FS
+0.2×FS
+0.1×FS
+0.0×FS
+Measurement signal U
+0 1 2 3 4 5 6 7 8 9 10
+out
+[V]
+p = (U
+out
+ / 10 V) × p(FS)
+Conversion Torr ↔ Pascal
+Torr mbar 
+3 )
+Pa 
+3 )
+1:00 1013.25 / 760 =
+1.3332…
+101325 / 760 =
+133.3224…
+Example: Gauge with 10 Torr FS
+Measurement signal U
+out
+ = 6 V
+p = (6 V / 10 V) × 10 Torr
+= 0.6 × 10 Torr = 6 Torr
+3 )
+Source: NPL (National Physical Laboratory)
+Guide to the Measurement of Pressure and Vacuum, ISBN 0904457x /
+1998
+
+=== PAGE 14 ===
+4  | Installation INFICON
+4
+ | 
+Installation
+WARNING
+Fragile components
+The ceramic sensor may be damaged by impacts.
+· Do not drop the product and prevent shocks and impacts.
+DANGER
+Leaking process media
+High-intensity mechanical, chemical or thermal impacts can
+cause leaks in the measuring sensor. Process media can thus
+leak and possibly cause hazards, if overpressure is in the vac-
+uum system.
+· Avoid high-intensity mechanical, chemical or thermal impacts
+and overpressure in the vacuum system.
+· Take appropriate measures (e.g. shut off gas supply, extrac-
+tion, leak test) to avoid hazards or damage due to leaking
+process media.
+4.1
+ | 
+Vacuum Connection
+DANGER
+Overpressure in the vacuum system >1 bar
+Injury caused by released parts and harm caused by escaping
+process gases can result if clamps are opened while the vacuum
+system is pressurized.
+· Do not open any clamps while the vacuum system is pressur-
+ized. Use the type of clamps which are suited to overpres-
+sure.
+14 tina49e1-f  (2024-08)
+
+=== PAGE 15 ===
+INFICON Installation  | 4
+tina49e1-f  (2024-08) 15
+DANGER
+Overpressure in the vacuum system >2.5 bar
+KF flange connections with elastomer seals (e.g. O-rings) cannot
+withstand such pressures. Process media can thus leak and
+possibly damage your health.
+· Use O-rings provided with an outer centering ring.
+DANGER
+Protective ground
+Products that are not correctly connected to ground can be ex-
+tremely hazardous in the event of a fault. The gauge must be
+electrically connected to the grounded vacuum chamber. This
+connection must conform to the requirements of a protective
+connection according to EN 61010:
+· CF and VCR connections fulfill this requirement.
+· For gauges with a KF vacuum connection, use a conductive
+metallic clamping ring.
+· For gauges with a ½" tube, take appropriate measures to fulfill
+this requirement.
+Caution
+Vacuum component
+Dirt and damages impair the function of the vacuum component.
+· When handling vacuum components, take appropriate mea-
+sures to ensure cleanliness and prevent damages.
+
+=== PAGE 16 ===
+4  | Installation INFICON
+Caution
+Dirt sensitive area
+Touching the product or parts thereof with bare hands increases
+the desorption rate.
+· Always wear clean, lint-free gloves and use clean tools when
+working in this area.
+Mount the gauge so that no vibrations occur. The
+gauge may be mounted in any orientation. To keep
+condensates and particles from getting into the mea-
+suring chamber preferably choose a horizontal to up-
+right position and possibly use a seal with a centering
+ring and filter. If adjustment should be possible after
+the gauge has been installed, be sure to install it so
+that the buttons can be accessed with a pin.
+Remove the protective lid and connect the product to the vac-
+uum system.
+Seal with centering ring
+Clamp
+Protective lid
+Seal with centering ring
+and filter
+or
+Keep the protective lid.
+16 tina49e1-f  (2024-08)
+
+=== PAGE 17 ===
+INFICON Installation  | 4
+tina49e1-f  (2024-08) 17
+4.2
+ | 
+Power Connection
+Make sure the vacuum connection is properly made.
+DANGER
+The gauge may only be connected to power supplies, instru-
+ments or control devices that conform to the requirements of a
+grounded protective extra-low voltage (PELV) and limited power
+source (LPS), Class 2.
+· The connection to the gauge has to be fused 
+4 )
+.
+Ground loops, differences of potential, or EMC prob-
+lems may affect the measurement signal. For optimum
+signal quality, please do observe the following notes:
+· Connect the cable shield to ground on one side via
+the chassis ground. Do not connect the other side of
+the shield.
+· Connect the supply common with protective ground
+directly at the power supply.
+· Use differential measurement input (signal common
+and supply common conducted separately).
+· Potential difference between supply common and
+housing ≤18 V (overvoltage protection).
+If no sensor cable is available, make one according to the follow-
+ing diagram. Connect the sensor cable.
+4 )
+INFICON  controllers fulfill these requirements.
+
+=== PAGE 18 ===
+4  | Installation INFICON
+4
+1
+8
+9
+10
+13
+14
+2
+12
+7
+11
+5
+1 M/g58
+15
+10 /g58
+Ident
+Gauge with switching functions
+TxD
+RxD
+18 V
+100nF
+case
+SP1
+SP2
+Pin 1, 4 Relay SP1, closing contact
+D-sub, 15-pin 
+female 
+soldering side
+1
+8
+9
+15
+Pin 2 Signal Output or thresholds SP1/2
+Pin 5 Supply common, GND
+Pin 7, 11 Supply
+Pin 8, 9 Relay SP2, closing contact
+Pin 10 Gauge identification Inficon
+Pin 12 Signal common
+Pin 13 RS232, TxD
+Pin 14 RS232, RxD
+Pin 15 Housing (Chassis Ground)
+case Connector case
+18 tina49e1-f  (2024-08)
+
+=== PAGE 19 ===
+INFICON Operation  | 5
+tina49e1-f  (2024-08) 19
+5
+ | 
+Operation
+Put the gauge into operation. If you are using an INFICON con-
+troller (VGC032 or VGC40x series), define the measurement
+range.
+Warm-up time
+· for general purpose reading (within specifica-
+tions) >¼ hour
+· for precision measurement and zero adjust-
+ment >2 hours
+5.1
+ | 
+Displays
+RUN ZERO
+1 2 SP
+LED State Meaning
+<RUN> lit measurement mode
+blinking other mode, warning, over-/
+underrange, error
+<1> (CDG025D-S only) lit p ≤ setpoint level 1
+blinking adjusting setpoint 1
+<2> (CDG025D-S only) lit p ≤ setpoint level 2
+blinking adjusting setpoint 2
+
+=== PAGE 20 ===
+5  | Operation INFICON
+5.2
+ | 
+Zeroing the Gauge
+The gauge is factory calibrated while "standing upright" ( ®  "Cali-
+bration Test Report").
+We recommend performing a zero adjustment, when
+the gauge is operated for the first time.
+Due to long time operation or contamination, a zero drift could
+occur and zero adjustment may become necessary.
+For adjusting the zero, operate the gauge under the same con-
+stant ambient conditions and in the same mounting orientation
+as normally.
+The output signal (measurement signal) is depending on the
+mounting orientation. The signal difference between the vertical
+and horizontal mounting orientation is:
+FS D U / 90°
+1000 Torr/mbar ≈2 mV
+100 Torr/mbar ≈10 mV
+10 Torr/mbar ≈50 mV
+1 Torr/mbar ≈300 mV
+0.1 Torr/mbar ≈1.8 V
+If the gauge is operated via a controller, the zero of the
+whole measuring system has to be adjusted on the
+controller:
+· First, adjust the zero of the gauge and then, the zero
+of the controller.
+5.2.1
+ | 
+<ZERO> Adjustment
+The zero can be adjusted via
+· the <ZERO> button on the gauge
+· the RS232C interface
+· an INFICON Vacuum Gauge Controller (VGC se-
+ries)
+20 tina49e1-f  (2024-08)
+
+=== PAGE 21 ===
+INFICON Operation  | 5
+tina49e1-f  (2024-08) 21
+1 Evacuate the gauge to a pressure according to the table
+below:
+FS
+Recommended final pressure for 
+zero adjustment
+[Torr] [Pa] [mbar]
+1100 mbar − <7×10
+0
+<7×10
+‑2
+1000 Torr <5×10
+‑2
+<7×10
+0
+−
+500 Torr/mbar <2.5×10
+‑2
+<3×10
+‑0
+<3×10
+‑2
+200 Torr/mbar <1×10
+‑2
+<1×10
+‑0
+<1×10
+‑2
+100 Torr/mbar <5×10
+‑3
+<7×10
+‑1
+<7×10
+‑3
+20 Torr/mbar <1×10
+‑3
+<1×10
+‑1
+<1×10
+‑3
+10 Torr/mbar <5×10
+‑4
+<7×10
+‑2
+<7×10
+‑4
+2 Torr/mbar <1×10
+‑4
+<1×10
+‑2
+<1×10
+‑4
+1 Torr/mbar <5×10
+‑5
+<7×10
+‑3
+<7×10
+‑5
+0.25 Torr/mbar <1×10
+‑5
+<1×10
+‑3
+<1×10
+‑5
+0.1 Torr/mbar <5×10
+‑6
+<7×10
+‑4
+<7×10
+‑6
+If the final pressure is too high for zero adjustment (>25% of
+the FS), the zero cannot be reached and the <RUN> LED
+blinks green. If this is the case, activate the factory setting
+and adjust the zero again ( ®   2   27 ).
+2 Operate the gauge for at least 2 hours under constant am-
+bient conditions (until the signal is stable).
+3 Briefly press the <ZERO> button with a pin (max.
+ø1.1 mm). The zero adjustment runs automatically. The
+<RUN> LED blinks until the adjustment (duration ≤ 8 s) is
+completed.
+
+=== PAGE 22 ===
+5  | Operation INFICON
+Press the button briefly
+max. ø1.1 mm
+After zero adjustment the gauge automatically returns
+to measurement mode. The <RUN> LED lits.
+The <RUN> LED blinks green if
+· the signal output is negative (< -20 mV) when the final pres-
+sure has been attained
+· the zero adjustment has failed.
+5.2.2
+ | 
+<ZERO> Adjustment with Ramp Function
+The ramp function allows to adjust the zero at a known reference
+pressure within the measurement range of the gauge.
+It also permits to adjust an offset of the characteristic curve in or-
+der to
+· compensate for the offset of the measuring system or
+· obtain a slightly positive zero for a 0 … 10 V AD converter.
+The offset should not exceed 2% of the FS (+200 mV). At a
+higher positive offset, the upper limit of the measurement range
+is exceeded.
+Recommended procedure for adjusting the offset of a
+measuring system: Notice ®   2   20 .
+22 tina49e1-f  (2024-08)
+
+=== PAGE 23 ===
+INFICON Operation  | 5
+tina49e1-f  (2024-08) 23
+1 Operate the gauge for at least 2 hours under constant am-
+bient conditions (until the signal is stable).
+2 Push the <ZERO> button with a pin (max. ø1.1 mm) and
+keep it depressed. The <RUN> LED starts blinking. After
+5 s, the zero adjustment value, starting at the current output
+value, keeps continually changing (ramp) until the button is
+released or until the setting limit (max. 25% FS) is reached.
+The corresponding output signal is delayed by about 1 s.
+Keep the button depressed
+max. ø1.1 mm
+· Fine adjustment of the zero adjustment value: Release
+the button. Briefly press it again within 3 s. The value
+changes by one unit (push <ZERO> button in intervals of
+1 s).
+· Change of direction (inverse ramp): Release the button.
+Press and keep it depressed again within 3...5 s (the
+blinking frequency of the <RUN> indicator changes
+briefly).
+If the <ZERO> button is released for more than 5 s, the
+gauge returns to the measurement mode.
+The zero with Base-Pressure-Offset can also be ad-
+justed via the RS232C interface ( ®   &  [5] ).
+The <RUN> LED flashes if the signal output is negative
+(< -20 mV).
+
+=== PAGE 24 ===
+5  | Operation INFICON
+5.3
+ | 
+Switching Functions (CDG025D‑S only)
+The two setpoints can be set to any pressure within the mea-
+surement range of the gauge.
+The current setpoint setting
+· is output at the D-sub connector instead of the measurement
+signal and can be measured with a voltmeter after the <SP>
+button is pressed
+· can be read/written via the RS232C interface.
+If the pressure in the vacuum system is lower than the setpoint,
+the corresponding LED (<1> or <2>) is lit solid and the corre-
+sponding relay is energized.
+Off
+Measurement signal (pressure p)
+Time t
+OnOff
+Setpoint
+Threshold value
+Hysteresis
+(1% FS)
+5.3.1
+ | 
+Adjusting the Setpoints
+The setpoints can be adjusted via
+· the buttons on the gauge
+· the RS232C interface
+24 tina49e1-f  (2024-08)
+
+=== PAGE 25 ===
+INFICON Operation  | 5
+tina49e1-f  (2024-08) 25
+DANGER
+Malfunction
+If processes are controlled via the signal output, keep in mind
+that by pushing the <SP> button the measurement signal is sup-
+pressed and the corresponding threshold value is output instead.
+This can cause malfunctions.
+· Push the <SP> button only if you are sure that no malfunction
+will cause.
+Adjusting Setpoint <1>
+1 Push the <SP> button with a pin (max. ø1.1 mm). The
+gauge changes to the switching function mode and outputs
+the current threshold value at the measurement signal out-
+put for about 10 s (LED <1> blinks).
+Press the button briefly
+max. ø1.1 mm
+2 For changing the threshold value, push the <ZERO> button
+and keep it depressed. The threshold keeps changing from
+the current value (ramp) until the button is released or until
+the limit of the setting range is reached.
+
+=== PAGE 26 ===
+5  | Operation INFICON
+Keep the button depressed
+max. ø1.1 mm
+· Fine adjustment of the threshold value: Release the but-
+ton. Briefly press it again within 3 s. The value changes
+by one unit (push <ZERO> button in intervals of 1 s).
+· Change of direction (inverse ramp): Release the button.
+Press and keep it depressed again within 3...5 s (the
+blinking frequency of the <RUN> indicator changes
+briefly).
+If the <ZERO> button is released for more than 5 s, the
+gauge returns to the measurement mode.
+The upper threshold is automatically set 1% FS above
+the lower one (hysteresis).
+Adjusting Setpoint <2>
+Push the <SP> button twice (the LED <2> blinks). The adjust-
+ment procedure is the same as for setpoint <1>.
+26 tina49e1-f  (2024-08)
+
+=== PAGE 27 ===
+INFICON Deinstallation  | 6
+tina49e1-f  (2024-08) 27
+5.4
+ | 
+Activating the Factory Setting (Factory Reset)
+All user defined parameters (e.g. zero, filter) are restored to their
+default values.
+Loading of the default parameters is irreversible.
+Loading the default parameters:
+1 Put the gauge out of operation.
+2 Keep the <ZERO> button depressed for at least 5 s while
+the gauge is being put into operation (Power ON).
+6
+ | 
+Deinstallation
+WARNING
+Fragile components
+The ceramic sensor may be damaged by impacts.
+· Do not drop the product and prevent shocks and impacts.
+DANGER
+Contaminated parts
+Contaminated parts can be detrimental to health and environ-
+ment.
+· Before beginning to work, find out whether any parts are con-
+taminated. Adhere to the relevant regulations and take the
+necessary precautions when handling contaminated parts.
+
+=== PAGE 28 ===
+7  | Maintenance, Repair INFICON
+Caution
+Vacuum component
+Dirt and damages impair the function of the vacuum component.
+· When handling vacuum components, take appropriate mea-
+sures to ensure cleanliness and prevent damages.
+Caution
+Dirt sensitive area
+Touching the product or parts thereof with bare hands increases
+the desorption rate.
+· Always wear clean, lint-free gloves and use clean tools when
+working in this area.
+1 Vent the vacuum system.
+2 Put the gauge out of operation and disconnect the sensor
+cable.
+3 Remove the gauge from the vacuum system and install the
+protective lid.
+7
+ | 
+Maintenance, Repair
+Under clean operating conditions, the product requires no main-
+tenance.
+Gauge failures due to contamination are not covered
+by the warranty.
+· We recommend checking the zero at regular inter-
+vals.
+28 tina49e1-f  (2024-08)
+
+=== PAGE 29 ===
+INFICON Returning the Product  | 8
+tina49e1-f  (2024-08) 29
+INFICON  assumes no liability and the warranty becomes null
+and void if any repair work is carried out by the end-user or third
+parties.
+8
+ | 
+Returning the Product
+WARNING
+Forwarding contaminated products
+Contaminated products (e.g. radioactive, toxic, caustic or biologi-
+cal hazard) can be detrimental to health and environment.
+· Products returned should preferably be free of harmful sub-
+stances. Adhere to the forwarding regulations of all involved
+countries and forwarding companies Enclose a duly com-
+pleted declaration of contamination (form under www.infi-
+con.com ).
+Products that are not clearly declared as "free of harmful sub-
+stances" are decontaminated at the expense of the customer.
+Products not accompanied by a duly completed declaration of
+contamination are returned to the sender at his own expense.
+9
+ | 
+Disposal
+DANGER
+Contaminated parts
+Contaminated parts can be detrimental to health and environ-
+ment.
+· Before beginning to work, find out whether any parts are con-
+taminated. Adhere to the relevant regulations and take the
+necessary precautions when handling contaminated parts.
+
+=== PAGE 30 ===
+9  | Disposal INFICON
+WARNING
+Substances detrimental to the environment
+Products or parts thereof (mechanical and electric components,
+operating fluids etc.) can be detrimental to the environment.
+· Dispose of such substances in accordance with the relevant
+local regulations.
+Separating the components
+After disassembling the product, separate its components ac-
+cording to the following criteria:
+· Contaminated components
+Contaminated components (radioactive, toxic, caustic or bio-
+logical hazard etc.) must be decontaminated in accordance
+with the relevant national regulations, separated according to
+their materials, and disposed of.
+· Other components
+Such components must be separated according to their mate-
+rials and recycled.
+30 tina49e1-f  (2024-08)
+
+=== PAGE 31 ===
+INFICON Further Information
+tina49e1-f  (2024-08) 31
+Further Information
+&  [1] Operating Manual
+Vacuum Gauge Controller VGC032
+tinb02e1
+INFICON AG, LI-9496 Balzers, Liechtenstein
+&  [2] Operating Manual
+Single-Channel Controller VGC401
+tinb01e1
+INFICON AG, LI-9496 Balzers, Liechtenstein
+&  [3] Operating Manual
+Two- & Three-Channel Measurement and Control Unit
+VGC402, VGC403
+tinb07e1
+INFICON AG, LI-9496 Balzers, Liechtenstein
+&  [4] Operating Manual
+Single-, Two- & Three-Channel Measurement and Control Unit
+VGC501, VGC502, VGC503
+tina96e1
+INFICON AG, LI-9496 Balzers, Liechtenstein
+&  [5] Communication Protocol
+RS232C SKY
+®
+ CDG025D, SKY
+®
+ CDG025D-S
+tira49e1
+INFICON AG, LI-9496 Balzers, Liechtenstein
+
+=== PAGE 32 ===
+ETL Certification INFICON
+ETL Certification
+3103457 
+RECOGNIZED
+COMPONENT
+ETL LISTED
+The products CDG025D & CDG025D-S
+· conform to the UL Standard UL 61010-1
+· are certified to the CAN/CSA Standard
+C22.2#61010-1-12
+32 tina49e1-f  (2024-08)
+
+=== PAGE 33 ===
+INFICON EU Declaration of Conformity
+tina49e1-f  (2024-08) 33
+EU Declaration of Conformity
+Manufacturer: INFICON AG, Alte Landstraße 6, LI-9496 Balzers
+This declaration of conformity is issued under the sole responsibility of the
+manufacturer.
+Products: SKY
+®
+ CDG025D, SKY
+®
+ CDG025D-S
+The products of the declaration described above are in conformity with fol-
+lowing Union harmonization legislation:
+· 2014/30/EU, OJ L 96/79, 29.3.2014
+(EMC Directive; Directive relating to electromagnetic compatibility)
+· 2011/65/EU, OJ L 174/88, 1.7.2011
+(RoHS Directive; Directive on the restriction of the use of certain hazardous sub-
+stances in electrical and electronic equipment)
+Harmonized and international/national standards and specifications:
+· EN 61010‑1:2010 + A1:2019 + A1:2019/AC:2019
+(Safety requirements for electrical equipment for measurement, control and labora-
+tory use)
+· EN 61326‑1:2013; Group 1, Class B
+(EMC requirements for electrical equipment for measurement, control and labora-
+tory use)
+Signed for and on behalf
+of:
+INFICON AG, Alte Landstraße 6, LI-9496
+Balzers
+Balzers, 2024-08-26 Balzers, 2024-08-26
+William Opie Michael Wildi
+Managing Director Director Marketing
+
+=== PAGE 34 ===
+UKCA Declaration of Conformity INFICON
+UKCA Declaration of Conformity
+Manufacturer: INFICON AG, Alte Landstraße 6, LI-9496 Balzers
+This declaration of conformity is issued under the sole responsibility of the
+manufacturer.
+Products: SKY
+®
+ CDG025D, SKY
+®
+ CDG025D-S
+The products of the declaration described above are in conformity with the
+relevant UK Statutory Instruments:
+· S.I. 2016/1091, 11.2016
+(Regulation relating to electromagnetic compatibility 2016)
+· S.I. 2012/3032, 12.2012
+(Regulation on the restriction of the use of certain hazardous substances in electri-
+cal and electronic equipment 2012)
+Harmonized and international/national standards and specifications:
+· EN 61010‑1:2010 + A1:2019 + A1:2019/AC:2019
+(Safety requirements for electrical equipment for measurement, control and labora-
+tory use)
+· EN 61326‑1:2013; Group 1, Class B
+(EMC requirements for electrical equipment for measurement, control and labora-
+tory use)
+Signed for and on behalf
+of:
+INFICON AG, Alte Landstraße 6, LI-9496
+Balzers
+Balzers, 2024-08-26 Balzers, 2024-08-26
+William Opie Michael Wildi
+Managing Director Director Marketing
+34 tina49e1-f  (2024-08)
+
+=== PAGE 35 ===
+INFICON
+Notes
+tina49e1-f  (2024-08) 35
+
+=== PAGE 36 ===
+LI–9496 Balzers
+Liechtenstein
+Tel +423 / 388 3111
+reachus@inficon.com
+www.inficon.com
+Original: German tina49d1-f (2024-08)
+
+

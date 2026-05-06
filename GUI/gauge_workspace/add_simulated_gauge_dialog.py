@@ -27,6 +27,7 @@ from serial_comm.simulation_models import (
 from serial_comm.simulation_scenarios import SCENARIOS, scenario_by_key
 
 from GUI.gauge_workspace.recipe_editor import RecipeEditorWidget
+from GUI.theme import current_theme
 
 
 # INFICON brand colours used consistently for every simulated-gauge UI touch.
@@ -61,6 +62,7 @@ class AddSimulatedGaugeDialog(QDialog):
         self._on_model_changed(self._model_combo.currentText())
         self._on_pattern_changed(self._pattern_combo.currentText())
         self._autofill_name()
+        self.apply_theme()
 
     # ------------------------------------------------------------------
     # Build UI
@@ -117,7 +119,7 @@ class AddSimulatedGaugeDialog(QDialog):
 
         self._scenario_hint = QLabel("")
         self._scenario_hint.setWordWrap(True)
-        self._scenario_hint.setStyleSheet("color:#7a7a7a; font-size:11px;")
+        self._scenario_hint.setStyleSheet(f"color:{current_theme(self).muted}; font-size:11px;")
         combo_form.addRow("", self._scenario_hint)
 
         self._pattern_combo = QComboBox()
@@ -178,6 +180,9 @@ class AddSimulatedGaugeDialog(QDialog):
 
         # Seed with the first scenario so the form starts meaningful.
         self._on_scenario_changed(0)
+
+    def apply_theme(self) -> None:
+        self._scenario_hint.setStyleSheet(f"color:{current_theme(self).muted}; font-size:11px;")
 
     # ------------------------------------------------------------------
     # Population helpers

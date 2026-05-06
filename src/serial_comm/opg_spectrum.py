@@ -38,11 +38,17 @@ _OPTICAL_SIGNATURES: dict[str, dict[float, float]] = {
     "Ar": {696.0: 0.7, 706.0: 1.0, 738.0: 0.8},
     "He": {447.0: 0.6, 588.0: 1.0, 668.0: 0.6},
     "H2O": {720.0: 0.8, 742.0: 1.0, 760.0: 0.9},
+    "OH": {309.0: 1.0, 312.0: 0.8, 431.0: 0.45},
     "CO2": {690.0: 0.45, 720.0: 0.9, 760.0: 1.0},
     "CH4": {430.0: 0.7, 620.0: 0.55, 730.0: 1.0},
     "H2": {486.0: 0.65, 656.0: 1.0},
     "CO": {520.0: 0.5, 607.0: 1.0, 646.0: 0.45},
 }
+
+
+def optical_signature_wavelengths(gas: str) -> tuple[float, ...]:
+    """Return known optical signature wavelengths for *gas* in nm."""
+    return tuple(sorted(_OPTICAL_SIGNATURES.get(gas, {})))
 
 # Scenario baseline fractions for the synthetic partial-pressure model.
 _SCENARIO_COMPOSITION: dict[SpectrumMode, dict[str, float]] = {
@@ -51,10 +57,12 @@ _SCENARIO_COMPOSITION: dict[SpectrumMode, dict[str, float]] = {
         "O2": 0.20,
         "Ar": 0.03,
         "H2O": 0.04,
+        "OH": 0.01,
         "CO2": 0.01,
     },
     SpectrumMode.WATER_LEAK: {
         "H2O": 0.62,
+        "OH": 0.08,
         "N2": 0.18,
         "O2": 0.06,
         "CO2": 0.06,
@@ -66,10 +74,12 @@ _SCENARIO_COMPOSITION: dict[SpectrumMode, dict[str, float]] = {
         "O2": 0.04,
         "Ar": 0.02,
         "H2O": 0.02,
+        "OH": 0.005,
     },
     SpectrumMode.HYDROCARBON_BACKSTREAM: {
         "CH4": 0.44,
         "H2O": 0.26,
+        "OH": 0.04,
         "CO": 0.14,
         "CO2": 0.08,
         "H2": 0.08,
@@ -107,6 +117,7 @@ def _auto_composition(
         "Ar": 0.018 * air_weight,
         "CO2": 0.020 + 0.028 * air_weight,
         "H2O": 0.22 * drydown + 0.05 * air_weight,
+        "OH": 0.035 * drydown + 0.025 * max(trend_mbar_per_s, 0.0) / (max(trend_mbar_per_s, 0.0) + 1e-5),
         "H2": 0.06 + 0.11 * (1.0 - air_weight),
         "CO": 0.05 + 0.06 * (1.0 - air_weight),
         "CH4": 0.03 + 0.02 * (1.0 - air_weight),
@@ -141,6 +152,7 @@ def _scenario_composition_evolved(
         co2_growth = _clamp(t / 480.0, 0.0, 0.07)
         air_decay = h2o_growth * 0.55 + co2_growth * 0.35
         base["H2O"] = base.get("H2O", 0.0) + h2o_growth
+        base["OH"] = base.get("OH", 0.0) + h2o_growth * 0.25
         base["CO2"] = base.get("CO2", 0.0) + co2_growth
         base["N2"] = max(0.05, base.get("N2", 0.0) - air_decay * 0.65)
         base["O2"] = max(0.01, base.get("O2", 0.0) - air_decay * 0.35)
@@ -154,6 +166,7 @@ def _scenario_composition_evolved(
         co2_growth = _clamp(t / 600.0, 0.0, 0.08)
         h2o_decay = h2_growth * 0.6 + co2_growth * 0.3
         base["H2"] = base.get("H2", 0.0) + h2_growth
+        base["OH"] = base.get("OH", 0.0) + h2_growth * 0.35
         base["CO2"] = base.get("CO2", 0.0) + co2_growth
         base["H2O"] = max(0.15, base.get("H2O", 0.0) - h2o_decay)
 

@@ -43,6 +43,7 @@ _FORMATS = ["Decoded", "Translated", "ASCII", "Hex", "Binary"]
 _COL_TX  = "#4C9BE8"   # blue  — sent frames
 _COL_RX  = "#4CE87A"   # green — received frames
 _COL_ERR = "#E84C4C"   # red   — errors
+_COL_DIAG = "#E8D74C"  # yellow — diagnostic trace notes
 
 # Protocols whose raw frames are binary — Hex is the only sensible default.
 _BINARY_PROTOCOLS = {"pfeiffer_binary", "cdg_serial"}
@@ -349,6 +350,11 @@ class TerminalWidget(QWidget):
 
     def _render_response(self, entry: TerminalEntry) -> None:
         ts = entry.timestamp.strftime("%H:%M:%S") if entry.timestamp else ""
+
+        if getattr(entry, "diagnostic", False):
+            detail = entry.error or _ascii_escape(entry.response)
+            self._append(f"[{ts}] DIAG: {detail}", _COL_DIAG)
+            return
 
         if entry.error:
             self._append(f"[{ts}] ERR: {entry.error}", _COL_ERR)

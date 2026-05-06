@@ -13,6 +13,9 @@ Acquisition
 
 Serial
     • Default connection timeout
+
+Diagnostics
+    • Verbose OPG550 spectrum trace in terminal widgets
 """
 
 from __future__ import annotations
@@ -40,6 +43,13 @@ DEFAULTS: dict[str, object] = {
     "acquisition/default_poll_interval": 1.0,
     "serial/default_timeout": 2.0,
     "display/pressure_unit": "mbar",
+    "diagnostics/opg_spectrum_verbose": False,
+    # OPG550 plasma auto-control thresholds (in mbar). Defaults are conservative
+    # placeholders; the user is expected to tune them in the Settings dialog or
+    # the Spectrum Studio panel.
+    "opg/auto_plasma_enabled": False,
+    "opg/min_ignition_pressure_mbar": 1.0e-6,
+    "opg/max_safe_pressure_mbar": 1.0e-2,
 }
 
 _LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -80,6 +90,11 @@ def get_display_unit() -> str:
     if unit not in SUPPORTED_UNITS:
         return str(DEFAULTS["display/pressure_unit"])
     return unit
+
+
+def get_opg_spectrum_verbose_diagnostics() -> bool:
+    """Return whether OPG550 spectrum trace entries should be shown."""
+    return bool(get_setting("diagnostics/opg_spectrum_verbose"))
 
 
 class _DisplaySignals(QObject):
@@ -158,6 +173,8 @@ class SettingsDialog(QDialog):
         root.addWidget(self._build_acquisition_group())
         root.addWidget(self._build_serial_group())
         root.addWidget(self._build_display_group())
+        root.addWidget(self._build_opg_group())
+        root.addWidget(self._build_diagnostics_group())
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
@@ -250,6 +267,57 @@ class SettingsDialog(QDialog):
 
         return grp
 
+    def _build_opg_group(self) -> QGroupBox:
+        grp = QGroupBox("OPG550 Plasma")
+        form = QFormLayout(grp)
+
+        self._opg_auto_plasma_chk = QCheckBox("Auto ignite/extinguish plasma based on pressure")
+        self._opg_auto_plasma_chk.setToolTip(
+            "When enabled, Spectrum Studio will automatically turn the plasma ON when\n"
+            "pressure falls below the safe range and OFF when it rises above the max."
+        )
+        form.addRow("Auto plasma (default):", self._opg_auto_plasma_chk)
+
+        self._opg_min_p_spin = QDoubleSpinBox()
+        self._opg_min_p_spin.setDecimals(2)
+        self._opg_min_p_spin.setRange(1e-12, 1e3)
+        self._opg_min_p_spin.setSingleStep(1.0)
+        self._opg_min_p_spin.setSuffix(" mbar")
+        self._opg_min_p_spin.setToolTip(
+            "Minimum total pressure required to allow plasma ignition (mbar).\n"
+            "Below this pressure auto-plasma keeps the plasma OFF."
+        )
+        # Tiny step values won't fit a normal QDoubleSpinBox; allow scientific text.
+        self._opg_min_p_spin.setStepType(QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        form.addRow("Min ignition pressure:", self._opg_min_p_spin)
+
+        self._opg_max_p_spin = QDoubleSpinBox()
+        self._opg_max_p_spin.setDecimals(2)
+        self._opg_max_p_spin.setRange(1e-12, 1e3)
+        self._opg_max_p_spin.setSingleStep(1.0)
+        self._opg_max_p_spin.setSuffix(" mbar")
+        self._opg_max_p_spin.setToolTip(
+            "Maximum total pressure for safe plasma operation (mbar).\n"
+            "Above this pressure auto-plasma forces the plasma OFF."
+        )
+        self._opg_max_p_spin.setStepType(QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        form.addRow("Max safe pressure:", self._opg_max_p_spin)
+
+        return grp
+
+    def _build_diagnostics_group(self) -> QGroupBox:
+        grp = QGroupBox("Diagnostics")
+        form = QFormLayout(grp)
+
+        self._opg_spectrum_diag_chk = QCheckBox("Enable verbose OPG550 spectrum trace")
+        self._opg_spectrum_diag_chk.setToolTip(
+            "Show OPG550 SPEC request/response payload summaries and decoded pixel statistics "
+            "in the gauge terminal while Spectrum Studio is polling live spectrum data."
+        )
+        form.addRow("OPG550 spectrum:", self._opg_spectrum_diag_chk)
+
+        return grp
+
     # ------------------------------------------------------------------
     # Populate / persist
     # ------------------------------------------------------------------
@@ -273,6 +341,13 @@ class SettingsDialog(QDialog):
         idx = self._unit_combo.findText(unit)
         self._unit_combo.setCurrentIndex(max(idx, 0))
 
+        self._opg_spectrum_diag_chk.setChecked(
+            bool(get_setting("diagnostics/opg_spectrum_verbose"))
+        )
+        self._opg_auto_plasma_chk.setChecked(bool(get_setting("opg/auto_plasma_enabled")))
+        self._opg_min_p_spin.setValue(float(get_setting("opg/min_ignition_pressure_mbar")))
+        self._opg_max_p_spin.setValue(float(get_setting("opg/max_safe_pressure_mbar")))
+
     def _save_values(self) -> None:
         self._settings.setValue("logging/level", self._level_combo.currentText())
         self._settings.setValue("logging/max_terminal_messages", self._max_msg_spin.value())
@@ -281,6 +356,17 @@ class SettingsDialog(QDialog):
         self._settings.setValue("acquisition/default_poll_interval", self._poll_spin.value())
         self._settings.setValue("serial/default_timeout", self._timeout_spin.value())
         self._settings.setValue("display/pressure_unit", self._unit_combo.currentText())
+        self._settings.setValue(
+            "diagnostics/opg_spectrum_verbose",
+            self._opg_spectrum_diag_chk.isChecked(),
+        )
+        self._settings.setValue("opg/auto_plasma_enabled", self._opg_auto_plasma_chk.isChecked())
+        self._settings.setValue(
+            "opg/min_ignition_pressure_mbar", float(self._opg_min_p_spin.value())
+        )
+        self._settings.setValue(
+            "opg/max_safe_pressure_mbar", float(self._opg_max_p_spin.value())
+        )
 
     # ------------------------------------------------------------------
     # Slots
@@ -306,6 +392,9 @@ class SettingsDialog(QDialog):
         self._timeout_spin.setValue(float(DEFAULTS["serial/default_timeout"]))  # type: ignore[arg-type]
         idx = self._unit_combo.findText(str(DEFAULTS["display/pressure_unit"]))
         self._unit_combo.setCurrentIndex(max(idx, 0))
+        self._opg_spectrum_diag_chk.setChecked(
+            bool(DEFAULTS["diagnostics/opg_spectrum_verbose"])
+        )
 
     def _on_log_to_file_toggled(self, checked: bool) -> None:
         self._log_file_label.setEnabled(checked)

@@ -14,7 +14,7 @@ from collections import deque
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QDoubleValidator
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -29,15 +29,22 @@ from PyQt6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
 from serial_comm.units import SUPPORTED_UNITS, convert_pressure
+from serial_comm.command_utils import command_display_name
+from GUI.theme import current_theme, line_edit_style, style_plot_item, themed_graphics_layout, value_bar_style
 
 logger = logging.getLogger(__name__)
 
 _MAX_POINTS = 200_000
+_AXIS_REFRESH_MS = 120
+_CONTROL_PANEL_WIDTH = 270
+_CONTROL_PANEL_MIN_WIDTH = 245
+_CONTROL_PANEL_MAX_WIDTH = 310
 
 COLOR_PALETTE: list[str] = [
     "#4C9BE8",
@@ -58,6 +65,8 @@ COLOR_PALETTE: list[str] = [
 class CombinedTab(QWidget):
     color_changed = pyqtSignal(str, str)
     gauge_toggled = pyqtSignal(str, bool)
+    export_requested = pyqtSignal(object)
+    poll_commands_requested = pyqtSignal(object)
 
     def __init__(
         self,
@@ -71,6 +80,9 @@ class CombinedTab(QWidget):
         self._is_simulation = is_simulation
         self._display_unit = display_unit
 
+        self._devices: dict[str, dict] = {}
+        self._device_series: dict[str, set[str]] = {}
+        self._active_commands: dict[str, set[str]] = {}
         self._gauges: dict[str, dict] = {}
         self._visible: dict[str, bool] = {}
         self._t0: float | None = None
@@ -84,6 +96,13 @@ class CombinedTab(QWidget):
         self._sync_hover: bool = True
         self._comparison_enabled: bool = False
         self._plot_paused: bool = False
+        self._pending_x_refresh: bool = False
+        self._pending_y_refresh: bool = False
+
+        self._axis_refresh_timer = QTimer(self)
+        self._axis_refresh_timer.setSingleShot(True)
+        self._axis_refresh_timer.setInterval(_AXIS_REFRESH_MS)
+        self._axis_refresh_timer.timeout.connect(self._apply_deferred_axis_refresh)
 
         self._plots: list[pg.PlotItem] = []
         self._plot_to_devices: dict[pg.PlotItem, list[str]] = {}
@@ -104,6 +123,10 @@ class CombinedTab(QWidget):
         root.setSpacing(4)
 
         desc = "simulated" if self._is_simulation else "real-time"
+        self._header_desc = desc
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
+
         hdr = QLabel(
             f"<b>{self._title}</b>"
             f"<span style='color:#888; font-size:11px'>"
@@ -111,27 +134,41 @@ class CombinedTab(QWidget):
         )
         hdr.setTextFormat(Qt.TextFormat.RichText)
         hdr.setStyleSheet("font-size:13px; padding:4px 4px 0px 4px;")
-        root.addWidget(hdr)
+        self._header_label = hdr
+        header_row.addWidget(hdr, 1)
 
-        middle = QHBoxLayout()
-        middle.setSpacing(6)
+        self._poll_commands_btn = QPushButton("Poll Commands")
+        self._poll_commands_btn.setToolTip("Choose which commands are polled for the gauges shown here")
+        self._poll_commands_btn.setStyleSheet(
+            "QPushButton { background:#1F4C72; color:#F4FBFF; border:1px solid #4DB2FF; "
+            "border-radius:6px; padding:6px 12px; font-weight:600; }"
+            "QPushButton:hover { background:#285C88; }"
+        )
+        self._poll_commands_btn.clicked.connect(self._on_poll_commands_clicked)
+        header_row.addWidget(self._poll_commands_btn, 0)
+        root.addLayout(header_row)
 
+        middle = QSplitter(Qt.Orientation.Horizontal)
+        middle.setChildrenCollapsible(False)
+
+        plot_widget = QWidget()
         plot_col = QVBoxLayout()
+        plot_col.setContentsMargins(0, 0, 0, 0)
         plot_col.setSpacing(2)
+        plot_widget.setLayout(plot_col)
+        plot_widget.setMinimumWidth(360)
 
         self._glw = pg.GraphicsLayoutWidget()
-        self._glw.setBackground("#1E1E1E")
+        themed_graphics_layout(self._glw)
         self._glw.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
+        self._glw.setMinimumSize(320, 260)
         plot_col.addWidget(self._glw, 1)
 
         self._value_bar = QLabel()
         self._value_bar.setTextFormat(Qt.TextFormat.RichText)
-        self._value_bar.setStyleSheet(
-            "color:#CCCCCC; font-size:11px; padding:1px 6px;"
-            "background:#2A2A2A; border-top:1px solid #3A3A3A;"
-        )
+        self._value_bar.setStyleSheet(value_bar_style())
         self._value_bar.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
@@ -139,7 +176,7 @@ class CombinedTab(QWidget):
         self._value_bar.hide()
         plot_col.addWidget(self._value_bar)
 
-        middle.addLayout(plot_col, 1)
+        middle.addWidget(plot_widget)
         self._controls_panel = self._build_controls_panel()
         controls_scroll = QScrollArea()
         controls_scroll.setWidgetResizable(True)
@@ -147,9 +184,17 @@ class CombinedTab(QWidget):
         controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         controls_scroll.setWidget(self._controls_panel)
+        controls_scroll.setMinimumWidth(_CONTROL_PANEL_MIN_WIDTH + 8)
+        controls_scroll.setMaximumWidth(_CONTROL_PANEL_MAX_WIDTH + 8)
+        controls_scroll.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self._controls_panel.setMinimumWidth(_CONTROL_PANEL_MIN_WIDTH)
+        self._controls_panel.setMaximumWidth(_CONTROL_PANEL_MAX_WIDTH)
         self._controls_scroll = controls_scroll
-        middle.addWidget(self._controls_scroll, 0)
-        root.addLayout(middle, 1)
+        middle.addWidget(self._controls_scroll)
+        middle.setStretchFactor(0, 1)
+        middle.setStretchFactor(1, 0)
+        middle.setSizes([760, _CONTROL_PANEL_WIDTH + 8])
+        root.addWidget(middle, 1)
 
         self._gauge_row_inner = QWidget()
         self._gauge_row_layout = QHBoxLayout(self._gauge_row_inner)
@@ -178,13 +223,14 @@ class CombinedTab(QWidget):
         root.addWidget(self._empty_label)
 
         self._rebuild_plot_layout()
+        self.apply_theme()
 
     def _build_controls_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("CombinedPlotControls")
         panel.setFrameShape(QFrame.Shape.StyledPanel)
-        panel.setMinimumWidth(210)
-        panel.setMaximumWidth(360)
+        panel.setMinimumWidth(_CONTROL_PANEL_MIN_WIDTH)
+        panel.setMaximumWidth(_CONTROL_PANEL_MAX_WIDTH)
         panel.setStyleSheet(
             "QFrame#CombinedPlotControls {"
             "  background: #252525;"
@@ -227,6 +273,7 @@ class CombinedTab(QWidget):
 
         title = QLabel("Plot Controls")
         title.setStyleSheet("color:#FFFFFF; font-weight:600; font-size:13px;")
+        self._controls_title = title
         v.addWidget(title)
 
         plot_btn_row = QHBoxLayout()
@@ -237,12 +284,18 @@ class CombinedTab(QWidget):
         self._clear_btn.clicked.connect(self.clear_data)
         plot_btn_row.addWidget(self._clear_btn, 1)
 
+        self._export_btn = QPushButton("Export")
+        self._export_btn.setObjectName("SyncBtn")
+        self._export_btn.setToolTip("Export data from the currently visible plot series")
+        self._export_btn.clicked.connect(self._on_export_clicked)
+        plot_btn_row.addWidget(self._export_btn, 1)
+
         self._pause_plot_btn = QPushButton("Pause Plot")
         self._pause_plot_btn.setObjectName("SyncBtn")
         self._pause_plot_btn.clicked.connect(self._on_pause_plot_clicked)
-        plot_btn_row.addWidget(self._pause_plot_btn, 1)
 
         v.addLayout(plot_btn_row)
+        v.addWidget(self._pause_plot_btn)
 
         v.addWidget(_hline())
 
@@ -358,11 +411,26 @@ class CombinedTab(QWidget):
         self._set_layout_button_state()
         return panel
 
+    def apply_theme(self) -> None:
+        theme = current_theme(self)
+        self._header_label.setText(
+            f"<b>{self._title}</b>"
+            f"<span style='color:{theme.muted}; font-size:11px'>"
+            f"  -  combined {self._header_desc} pressure view</span>"
+        )
+        themed_graphics_layout(self._glw)
+        self._value_bar.setStyleSheet(value_bar_style())
+        self._empty_label.setStyleSheet(f"color:{theme.muted}; font-size:13px; padding:16px;")
+        self._controls_panel.setStyleSheet(_controls_panel_style(theme))
+        self._controls_title.setStyleSheet(f"color:{theme.text}; font-weight:600; font-size:13px;")
+        self._compare_help.setStyleSheet(f"color:{theme.muted}; font-size:10px;")
+        self._y_min_edit.setStyleSheet(line_edit_style())
+        self._y_max_edit.setStyleSheet(line_edit_style())
+        for plot in self._plots:
+            style_plot_item(plot)
+
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        panel_width = max(210, min(360, int(self.width() * 0.24)))
-        self._controls_scroll.setFixedWidth(panel_width + 8)
-        self._controls_panel.setFixedWidth(panel_width)
         self._gauge_scroll.setFixedHeight(46 if self.height() > 520 else 56)
 
     def _make_layout_btn(self, text: str, mode: str) -> QPushButton:
@@ -383,41 +451,81 @@ class CombinedTab(QWidget):
         color: str,
         full_scale_mbar: float | None = None,
     ) -> None:
-        if device_id in self._gauges:
+        if device_id in self._devices:
             return
-        self._gauges[device_id] = {
+        fs = float(full_scale_mbar) if full_scale_mbar else None
+        self._devices[device_id] = {
             "name": display_name,
+            "color": color,
+            "full_scale_mbar": fs,
+        }
+        self._device_series.setdefault(device_id, set())
+        self._active_commands.setdefault(device_id, {"pressure"})
+        self._visible.setdefault(device_id, True)
+        self._empty_label.hide()
+
+    def remove_gauge(self, device_id: str) -> None:
+        series_ids = list(self._device_series.pop(device_id, set()))
+        if device_id not in self._devices and not series_ids:
+            return
+        self._devices.pop(device_id, None)
+        self._active_commands.pop(device_id, None)
+        self._visible.pop(device_id, None)
+        for series_id in series_ids:
+            series = self._gauges.pop(series_id, None)
+            if series is None:
+                continue
+            self._visible.pop(series_id, None)
+            series["toggle_btn"] = None
+            series["color_btn"] = None
+        self._rebuild_plot_layout()
+        self._rebuild_chip_row()
+        self._refresh_comparison_sources()
+        if not self._devices:
+            self._empty_label.show()
+        self._refresh_y_axis()
+
+    def _series_id(self, device_id: str, command: str) -> str:
+        return f"{device_id}\x1f{command}"
+
+    def _ensure_series(self, device_id: str, command: str) -> str | None:
+        device = self._devices.get(device_id)
+        if device is None:
+            return None
+        command = command or "pressure"
+        series_id = self._series_id(device_id, command)
+        if series_id in self._gauges:
+            return series_id
+        series_ids = self._device_series.setdefault(device_id, set())
+        series_index = len(series_ids)
+        label = device["name"] if command == "pressure" else f"{device['name']} - {command_display_name(command)}"
+        color = str(device["color"]) if series_index == 0 else _series_color(str(device["color"]), series_index)
+        self._gauges[series_id] = {
+            "device_id": device_id,
+            "command": command,
+            "name": device["name"],
+            "label": label,
             "color": color,
             "time_buf": deque(maxlen=_MAX_POINTS),
             "val_buf": deque(maxlen=_MAX_POINTS),
             "curve": None,
             "color_btn": None,
             "toggle_btn": None,
-            "full_scale_mbar": float(full_scale_mbar) if full_scale_mbar else None,
+            "full_scale_mbar": device.get("full_scale_mbar"),
         }
-        self._visible.setdefault(device_id, True)
+        series_ids.add(series_id)
+        self._visible.setdefault(series_id, self._visible.get(device_id, True))
         self._rebuild_plot_layout()
         self._rebuild_chip_row()
         self._refresh_comparison_sources()
-        self._empty_label.hide()
         self._refresh_y_axis()
+        return series_id
 
-    def remove_gauge(self, device_id: str) -> None:
-        g = self._gauges.pop(device_id, None)
-        if g is None:
+    def feed(self, device_id: str, t_mono: float, value: float, command: str = "pressure") -> None:
+        series_id = self._ensure_series(device_id, command)
+        if series_id is None:
             return
-        self._visible.pop(device_id, None)
-        g["toggle_btn"] = None
-        g["color_btn"] = None
-        self._rebuild_plot_layout()
-        self._rebuild_chip_row()
-        self._refresh_comparison_sources()
-        if not self._gauges:
-            self._empty_label.show()
-        self._refresh_y_axis()
-
-    def feed(self, device_id: str, t_mono: float, value: float) -> None:
-        g = self._gauges.get(device_id)
+        g = self._gauges.get(series_id)
         if g is None:
             return
         if self._t0 is None:
@@ -439,14 +547,31 @@ class CombinedTab(QWidget):
             t_arr = np.array(tb, dtype=float)
             v_arr = np.where(np.array(vb, dtype=float) > 0, np.array(vb, dtype=float), 1e-12)
             curve.setData(t_arr, v_arr)
-            curve.setVisible(self._visible.get(device_id, True))
+            curve.setVisible(self._visible.get(series_id, True))
 
-        self._refresh_x_axis()
-        if self._y_mode == "auto_center":
+        self._request_axis_refresh(x=True, y=self._y_mode == "auto_center")
+
+    def set_active_commands(self, device_id: str, commands: list[str]) -> None:
+        self._active_commands[device_id] = set(commands or ["pressure"])
+
+    def _request_axis_refresh(self, *, x: bool = False, y: bool = False) -> None:
+        self._pending_x_refresh = self._pending_x_refresh or x
+        self._pending_y_refresh = self._pending_y_refresh or y
+        if not self._axis_refresh_timer.isActive():
+            self._axis_refresh_timer.start()
+
+    def _apply_deferred_axis_refresh(self) -> None:
+        refresh_x = self._pending_x_refresh
+        refresh_y = self._pending_y_refresh
+        self._pending_x_refresh = False
+        self._pending_y_refresh = False
+        if refresh_x:
+            self._refresh_x_axis()
+        if refresh_y:
             self._refresh_y_axis()
 
     def _refresh_all_curves(self) -> None:
-        for device_id, g in self._gauges.items():
+        for series_id, g in self._gauges.items():
             curve = g.get("curve")
             if curve is None:
                 continue
@@ -455,7 +580,7 @@ class CombinedTab(QWidget):
             t_arr = np.array(tb, dtype=float)
             v_arr = np.where(np.array(vb, dtype=float) > 0, np.array(vb, dtype=float), 1e-12)
             curve.setData(t_arr, v_arr)
-            curve.setVisible(self._visible.get(device_id, True))
+            curve.setVisible(self._visible.get(series_id, True))
 
     def _on_pause_plot_clicked(self) -> None:
         self._plot_paused = not self._plot_paused
@@ -469,27 +594,71 @@ class CombinedTab(QWidget):
         if self._y_mode == "auto_center":
             self._refresh_y_axis()
 
+    def _on_export_clicked(self) -> None:
+        visible_ids = {
+            g["device_id"] for series_id, g in self._gauges.items()
+            if self._visible.get(series_id, True)
+        }
+        self.export_requested.emit(visible_ids or set(self._devices.keys()))
+
+    def _on_poll_commands_clicked(self) -> None:
+        visible_ids = {
+            g["device_id"] for series_id, g in self._gauges.items()
+            if self._visible.get(series_id, True)
+        }
+        self.poll_commands_requested.emit(visible_ids or set(self._devices.keys()))
+
     def clear_data(self) -> None:
-        for g in self._gauges.values():
+        removed = False
+        for series_id, g in list(self._gauges.items()):
+            active = self._active_commands.get(g["device_id"])
+            if active is not None and g.get("command", "pressure") not in active:
+                self._remove_series(series_id)
+                removed = True
+                continue
             g["time_buf"].clear()
             g["val_buf"].clear()
             curve = g.get("curve")
             if curve is not None:
                 curve.setData([], [])
+        if removed:
+            self._rebuild_plot_layout()
+            self._rebuild_chip_row()
+            self._refresh_comparison_sources()
         self._t0 = None
         self._latest_t = 0.0
         self._value_bar.hide()
         self._refresh_x_axis()
         self._refresh_y_axis()
 
-    def set_gauge_color(self, device_id: str, color: str) -> None:
-        g = self._gauges.get(device_id)
+    def _remove_series(self, series_id: str) -> None:
+        g = self._gauges.pop(series_id, None)
         if g is None:
             return
-        g["color"] = color
+        self._visible.pop(series_id, None)
+        device_id = str(g.get("device_id", ""))
+        self._device_series.get(device_id, set()).discard(series_id)
         curve = g.get("curve")
         if curve is not None:
-            curve.setPen(pg.mkPen(color, width=2))
+            try:
+                curve.clear()
+            except Exception:
+                logger.debug("Could not clear removed series %s", series_id, exc_info=True)
+
+    def set_gauge_color(self, device_id: str, color: str) -> None:
+        device = self._devices.get(device_id)
+        if device is None:
+            return
+        device["color"] = color
+        for index, series_id in enumerate(sorted(self._device_series.get(device_id, set()))):
+            g = self._gauges.get(series_id)
+            if g is None:
+                continue
+            series_color = color if index == 0 else _series_color(color, index)
+            g["color"] = series_color
+            curve = g.get("curve")
+            if curve is not None:
+                curve.setPen(pg.mkPen(series_color, width=2))
         self._rebuild_chip_row()
 
     def set_display_unit(self, unit: str) -> None:
@@ -511,9 +680,10 @@ class CombinedTab(QWidget):
         self._refresh_y_axis()
 
     def set_visible_filter(self, device_ids: set[str] | None) -> None:
-        for device_id, g in self._gauges.items():
+        for series_id, g in self._gauges.items():
+            device_id = g.get("device_id", series_id)
             should_show = (device_ids is None) or (device_id in device_ids)
-            self._visible[device_id] = should_show
+            self._visible[series_id] = should_show
             curve = g.get("curve")
             if curve is not None:
                 curve.setVisible(should_show)
@@ -557,8 +727,8 @@ class CombinedTab(QWidget):
         self._crosshair_lines.clear()
         self._legend = None
 
-        device_ids = list(self._gauges.keys())
-        if not device_ids:
+        series_ids = list(self._gauges.keys())
+        if not series_ids:
             plot = self._glw.addPlot(row=0, col=0)
             self._setup_plot_item(plot)
             self._plots = [plot]
@@ -572,18 +742,18 @@ class CombinedTab(QWidget):
             self._legend = plot.addLegend()
             self._legend.setOffset((10, 10))
             self._plots = [plot]
-            self._plot_to_devices[plot] = list(device_ids)
-            for did in device_ids:
+            self._plot_to_devices[plot] = list(series_ids)
+            for did in series_ids:
                 g = self._gauges[did]
-                curve = plot.plot(pen=pg.mkPen(g["color"], width=2), name=g["name"])
+                curve = plot.plot(pen=pg.mkPen(g["color"], width=2), name=g.get("label", g["name"]))
                 curve.setVisible(self._visible.get(did, True))
                 g["curve"] = curve
                 self._plot_for_device[did] = plot
         elif self._chart_layout == "stacked":
-            for idx, did in enumerate(device_ids):
+            for idx, did in enumerate(series_ids):
                 plot = self._glw.addPlot(row=idx, col=0)
-                self._setup_plot_item(plot, title=self._gauges[did]["name"])
-                if idx < len(device_ids) - 1:
+                self._setup_plot_item(plot, title=self._gauges[did].get("label", self._gauges[did]["name"]))
+                if idx < len(series_ids) - 1:
                     plot.getAxis("bottom").setStyle(showValues=False)
                 curve = plot.plot(pen=pg.mkPen(self._gauges[did]["color"], width=2))
                 curve.setVisible(self._visible.get(did, True))
@@ -592,11 +762,11 @@ class CombinedTab(QWidget):
                 self._plot_to_devices[plot] = [did]
                 self._plot_for_device[did] = plot
         else:  # grid
-            for idx, did in enumerate(device_ids):
+            for idx, did in enumerate(series_ids):
                 row = idx // 2
                 col = idx % 2
                 plot = self._glw.addPlot(row=row, col=col)
-                self._setup_plot_item(plot, title=self._gauges[did]["name"])
+                self._setup_plot_item(plot, title=self._gauges[did].get("label", self._gauges[did]["name"]))
                 curve = plot.plot(pen=pg.mkPen(self._gauges[did]["color"], width=2))
                 curve.setVisible(self._visible.get(did, True))
                 self._gauges[did]["curve"] = curve
@@ -614,17 +784,18 @@ class CombinedTab(QWidget):
         plot.setLabel("left", f"Pressure ({self._display_unit})", units="")
         plot.setLogMode(x=False, y=True)
         if title:
-            plot.setTitle(title, color="#AFC4D2", size="10pt")
+            plot.setTitle(title, color=current_theme(self).muted, size="10pt")
+        style_plot_item(plot)
 
     # ------------------------------------------------------------------
     # Internal — chips
     # ------------------------------------------------------------------
 
     def _rebuild_chip_row(self) -> None:
-        for device_id, g in self._gauges.items():
+        for series_id, g in self._gauges.items():
             toggle_widget = g["toggle_btn"]
             if toggle_widget is not None:
-                self._visible[device_id] = toggle_widget.isChecked()
+                self._visible[series_id] = toggle_widget.isChecked()
             g["toggle_btn"] = None
             g["color_btn"] = None
 
@@ -634,24 +805,24 @@ class CombinedTab(QWidget):
             if w is not None:
                 w.setParent(None)
 
-        for device_id, g in self._gauges.items():
+        for series_id, g in self._gauges.items():
             color = g["color"]
             color_btn = QPushButton()
             color_btn.setFixedSize(18, 26)
-            color_btn.setToolTip(f"Change colour for {g['name']}")
+            color_btn.setToolTip(f"Change colour for {g.get('label', g['name'])}")
             color_btn.setStyleSheet(
                 f"QPushButton {{ background: {color}; border: none; border-radius: 4px 0px 0px 4px; }}"
                 "QPushButton:hover { border: 1px solid rgba(255,255,255,180); }"
             )
-            color_btn.clicked.connect(lambda _=False, did=device_id: self._pick_color(did))
+            color_btn.clicked.connect(lambda _=False, sid=series_id: self._pick_color(sid))
 
-            prev_checked = self._visible.get(device_id, True)
-            toggle_btn = QPushButton(f"● {g['name']}")
+            prev_checked = self._visible.get(series_id, True)
+            toggle_btn = QPushButton(f"● {g.get('label', g['name'])}")
             toggle_btn.setCheckable(True)
             toggle_btn.setChecked(prev_checked)
             toggle_btn.setFixedHeight(26)
             toggle_btn.setStyleSheet(_chip_toggle_style(color))
-            toggle_btn.toggled.connect(lambda vis, did=device_id: self._toggle_gauge(did, vis))
+            toggle_btn.toggled.connect(lambda vis, sid=series_id: self._toggle_gauge(sid, vis))
 
             g["color_btn"] = color_btn
             g["toggle_btn"] = toggle_btn
@@ -669,25 +840,27 @@ class CombinedTab(QWidget):
 
         self._gauge_row_layout.addStretch()
 
-    def _pick_color(self, device_id: str) -> None:
-        g = self._gauges.get(device_id)
+    def _pick_color(self, series_id: str) -> None:
+        g = self._gauges.get(series_id)
         if g is None:
             return
-        new_color = QColorDialog.getColor(QColor(g["color"]), self, f"Choose colour for {g['name']}")
+        new_color = QColorDialog.getColor(QColor(g["color"]), self, f"Choose colour for {g.get('label', g['name'])}")
         if not new_color.isValid():
             return
         hex_color = new_color.name()
+        device_id = g.get("device_id", series_id)
         self.set_gauge_color(device_id, hex_color)
         self.color_changed.emit(device_id, hex_color)
 
-    def _toggle_gauge(self, device_id: str, visible: bool) -> None:
-        self._visible[device_id] = visible
-        g = self._gauges.get(device_id)
+    def _toggle_gauge(self, series_id: str, visible: bool) -> None:
+        self._visible[series_id] = visible
+        g = self._gauges.get(series_id)
         if g is None:
             return
         curve = g.get("curve")
         if curve is not None:
             curve.setVisible(visible)
+        device_id = g.get("device_id", series_id)
         self.gauge_toggled.emit(device_id, visible)
         self._refresh_y_axis()
 
@@ -788,7 +961,7 @@ class CombinedTab(QWidget):
 
     def _full_scale_range_display(self) -> tuple[float, float]:
         max_mbar = 0.0
-        for g in self._gauges.values():
+        for g in self._devices.values():
             fs = g.get("full_scale_mbar")
             if fs and fs > max_mbar:
                 max_mbar = float(fs)
@@ -827,8 +1000,9 @@ class CombinedTab(QWidget):
         self._compare_a.clear()
         self._compare_b.clear()
         for did, gauge in self._gauges.items():
-            self._compare_a.addItem(gauge["name"], did)
-            self._compare_b.addItem(gauge["name"], did)
+            label = gauge.get("label", gauge["name"])
+            self._compare_a.addItem(label, did)
+            self._compare_b.addItem(label, did)
         if self._compare_a.count() >= 1:
             idx_a = self._compare_a.findData(current_a)
             self._compare_a.setCurrentIndex(max(idx_a, 0))
@@ -901,12 +1075,12 @@ class CombinedTab(QWidget):
 
     def _update_value_bar(self, x: float, device_filter: list[str] | None = None) -> None:
         if device_filter is None:
-            device_ids = [did for did in self._gauges if self._visible.get(did, True)]
+            series_ids = [did for did in self._gauges if self._visible.get(did, True)]
         else:
-            device_ids = [did for did in device_filter if self._visible.get(did, True)]
+            series_ids = [did for did in device_filter if self._visible.get(did, True)]
 
         parts: list[str] = []
-        for did in device_ids:
+        for did in series_ids:
             g = self._gauges.get(did)
             if g is None:
                 continue
@@ -914,7 +1088,7 @@ class CombinedTab(QWidget):
             if v is None:
                 continue
             parts.append(
-                f"<span style='color:{g['color']}'><b>{g['name']}</b></span>: "
+                f"<span style='color:{g['color']}'><b>{g.get('label', g['name'])}</b></span>: "
                 f"{v:.3E} {self._display_unit}"
             )
 
@@ -931,9 +1105,12 @@ class CombinedTab(QWidget):
                         delta = va - vb
                         ratio = va / vb
                         pct = (delta / abs(vb)) * 100.0
+                        name_a = ga.get("label", ga["name"])
+                        name_b = gb.get("label", gb["name"])
                         parts.append(
-                            f"<span style='color:#E8D74C'><b>Compare</b></span>: "
-                            f"Δ={delta:.3E} {self._display_unit}, Δ%={pct:+.2f}%, A/B={ratio:.4g}"
+                            f"<span style='color:#E8D74C'><b>\u0394 ({name_a} \u2212 {name_b})</b></span>: "
+                            f"{delta:.3E} {self._display_unit},  \u0394% = {pct:+.2f}%,  "
+                            f"{name_a}/{name_b} = {ratio:.4g}"
                         )
 
         if parts:
@@ -991,6 +1168,18 @@ def _chip_toggle_style(color: str) -> str:
     )
 
 
+def _series_color(base_color: str, index: int) -> str:
+    color = QColor(base_color)
+    if not color.isValid():
+        return COLOR_PALETTE[index % len(COLOR_PALETTE)]
+    hue, sat, val, alpha = color.getHsv()
+    hue = (hue + index * 34) % 360 if hue >= 0 else (index * 34) % 360
+    sat = min(255, max(90, sat + 20))
+    val = min(255, max(130, val + (18 if index % 2 else -10)))
+    color.setHsv(hue, sat, val, alpha)
+    return color.name()
+
+
 def _value_at_x(time_buf: deque, val_buf: deque, x: float) -> float | None:
     if not time_buf:
         return None
@@ -1003,25 +1192,36 @@ def _value_at_x(time_buf: deque, val_buf: deque, x: float) -> float | None:
 def _hline() -> QFrame:
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
-    line.setStyleSheet("color: #3A3A3A; background: #3A3A3A; max-height: 1px;")
+    theme = current_theme()
+    line.setStyleSheet(f"color: {theme.border}; background: {theme.border}; max-height: 1px;")
     return line
 
 
 def _make_sci_edit(initial: str) -> QLineEdit:
     edit = QLineEdit(initial)
     edit.setFixedHeight(22)
-    edit.setStyleSheet(
-        "QLineEdit {"
-        "  background: #1B1B1B; color: #EEEEEE;"
-        "  border: 1px solid #444; border-radius: 3px;"
-        "  padding: 1px 4px; font-size: 11px;"
-        "}"
-        "QLineEdit:focus { border-color: #4C9BE8; }"
-    )
+    edit.setStyleSheet(line_edit_style())
     v = QDoubleValidator(1e-20, 1e20, 12, edit)
     v.setNotation(QDoubleValidator.Notation.ScientificNotation)
     edit.setValidator(v)
     return edit
+
+
+def _controls_panel_style(theme) -> str:
+    return (
+        "QFrame#CombinedPlotControls {"
+        f"background: {theme.panel}; border: 1px solid {theme.border}; border-radius: 8px;"
+        "}"
+        f"QLabel {{ color: {theme.text}; }}"
+        f"QLabel[section='true'] {{ color: {theme.text}; font-weight: 600; font-size: 12px; padding: 2px 0 0 0; }}"
+        f"QRadioButton {{ color: {theme.text}; font-size: 11px; }}"
+        f"QPushButton#ClearBtn {{ background: {theme.danger_bg}; color: {theme.danger_fg}; border: 1px solid {theme.border}; border-radius: 4px; padding: 6px 8px; font-weight: 600; }}"
+        f"QPushButton#ClearBtn:hover {{ background: {theme.control_hover}; }}"
+        f"QPushButton[layout='true'] {{ border: 1px solid {theme.border}; border-radius: 12px; padding: 2px 10px; color: {theme.text}; background: {theme.control}; }}"
+        "QPushButton[layout='true'][checked='true'] { border: 1px solid #4DB2FF; color: #FFFFFF; background: #1F6FA5; }"
+        f"QPushButton#SyncBtn {{ border: 1px solid {theme.border}; border-radius: 12px; padding: 4px 10px; color: {theme.text}; background: {theme.control}; }}"
+        f"QPushButton#SyncBtn[checked='true'] {{ border-color: #5BC38F; background: {theme.success_bg}; color: {theme.success_fg}; }}"
+    )
 
 
 def _parse_sci(text: str) -> float | None:

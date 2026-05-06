@@ -1,6 +1,7 @@
 from serial_comm.opg_spectrum import (
     SpectrumMode,
     identify_optical_species,
+    optical_signature_wavelengths,
     simulate_optical_spectrum,
 )
 
@@ -51,3 +52,8 @@ def test_auto_mode_changes_with_rising_pressure() -> None:
     calm_ratio = _peak_at_nm(calm, 630.0) / max(_peak_at_nm(calm, 742.0), 1e-9)
     leaking_ratio = _peak_at_nm(leaking, 630.0) / max(_peak_at_nm(leaking, 742.0), 1e-9)
     assert leaking_ratio > calm_ratio
+
+
+def test_signature_wavelengths_exposes_known_lines() -> None:
+    assert 656.0 in optical_signature_wavelengths("H2")
+    assert optical_signature_wavelengths("not-a-gas") == ()

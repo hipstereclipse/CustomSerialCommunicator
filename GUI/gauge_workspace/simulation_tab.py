@@ -36,6 +36,7 @@ from serial_comm.simulation_scenarios import SCENARIOS, scenario_by_key
 from serial_comm.units import convert_pressure, format_pressure
 
 from GUI.gauge_workspace.recipe_editor import RecipeEditorWidget
+from GUI.theme import current_theme
 
 
 INFICON_BLUE = "#009CDE"
@@ -77,6 +78,7 @@ class SimulationControlTab(QWidget):
 
         self._build_ui()
         self._wire()
+        self.apply_theme()
 
         # Refresh timer — the engine advances continuously; we repaint at 2 Hz.
         self._timer = QTimer(self)
@@ -208,6 +210,10 @@ class SimulationControlTab(QWidget):
         self._gas_combo.currentIndexChanged.connect(self._on_gas_changed)
         self._humidity_combo.currentIndexChanged.connect(self._on_humidity_changed)
         self._recipe_editor.steps_changed.connect(self._on_recipe_changed)
+
+    def apply_theme(self) -> None:
+        for button in (self._apply_profile_btn, self._restart_btn, self._pause_btn):
+            button.setStyleSheet(_button_style())
 
     # ------------------------------------------------------------------
     # Slots
@@ -380,10 +386,12 @@ class SimulationControlTab(QWidget):
 
 
 def _button_style() -> str:
+    theme = current_theme()
     return (
         f"QPushButton {{ background:{INFICON_BLUE}; color:white; "
         f"border-radius:5px; padding:4px 12px; font-weight:bold; }}"
         f"QPushButton:hover {{ background:{INFICON_BLUE_HOVER}; }}"
+        f"QPushButton:disabled {{ background:{theme.panel_alt}; color:{theme.disabled}; }}"
     )
 
 

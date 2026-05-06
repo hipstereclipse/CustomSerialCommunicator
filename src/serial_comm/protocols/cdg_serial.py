@@ -32,7 +32,7 @@ Error byte bits:
     0x02  overrange           (soft)
     0x04  zero adjust running (soft)
     0x08  fs adjust running   (soft)
-    0x10  sync / protocol     FATAL
+    0x10  extended status     (soft on observed CDG200D frames)
     0x20  bad measurement     FATAL
     0x40  sensor fault        FATAL
     0x80  sensor not ready    (soft — normal for unheated variants)
@@ -53,7 +53,7 @@ RESPONSE_SYNC = 0x07
 COMMAND_START = 0x03
 
 # Error-byte bits that invalidate a reading
-_STATUS_FATAL_MASK = 0x70  # sync | bad measurement | sensor fault
+_STATUS_FATAL_MASK = 0x60  # bad measurement | sensor fault
 
 # Sensor-type byte values -> nominal gauge family (advisory only).
 _GAUGE_TYPE_MAP: dict[int, str] = {
@@ -224,6 +224,8 @@ class CDGProtocol(GaugeProtocol):
             warnings.append("zero adjust running")
         if err_byte & 0x08:
             warnings.append("fs adjust running")
+        if err_byte & 0x10:
+            warnings.append("extended status")
         if err_byte & 0x80:
             warnings.append("sensor not ready")
 

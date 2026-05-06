@@ -1,46 +1,293 @@
 model: OPG550
 manufacturer: INFICON
-family: inficon_ascii
-protocol: inficon_ascii
+family: inficon_p3_v02
+protocol: inficon_p3_v02
 experimental: true
 transport:
-  default_baud: 9600
+  default_baud: 115200
   parity: N
   data_bits: 8
   stop_bits: 1
   rs_modes: [RS232, RS485]
-  default_address: 1
+  default_address: 0
   rs485_address_range: [1, 253]
 commands:
   pressure:
-    pid: 340
+    pid: 14000
     read: true
     write: false
-    data_type: u_expo_new
+    data_type: float32_be
+    request_data: [1]
     unit: mbar
     description: Optical Pirani pressure measurement
+  product_name:
+    pid: 10001
+    read: true
+    write: false
+    data_type: string
+    description: Product name
   software_version:
-    pid: 312
+    pid: 10004
     read: true
     write: false
     data_type: string
     description: Firmware version
+  bootloader_version:
+    pid: 10003
+    read: true
+    write: false
+    data_type: string
+    description: Bootloader firmware version
   serial_number:
-    pid: 349
+    pid: 10002
     read: true
     write: false
     data_type: string
     description: Device serial number
-  error_status:
-    pid: 303
+  manufacturer_name:
+    pid: 10000
     read: true
     write: false
     data_type: string
-    description: Error code
-  temperature:
-    pid: 216
+    description: Manufacturer name
+  error_status:
+    pid: 11000
     read: true
     write: false
-    data_type: u_real
-    unit: "°C"
-    description: Sensor temperature
+    data_type: enum_uint8
+    description: Self diagnostic state
+    options:
+      0: OK
+      1: Service recommended
+      2: Failure
+  error_history_size:
+    pid: 11001
+    read: true
+    write: false
+    data_type: uint32_be
+    description: Error history buffer size
+  error_count:
+    pid: 11002
+    read: true
+    write: false
+    data_type: uint32_be
+    description: Number of stored errors
+  plasma_interlock_state:
+    pid: 12001
+    read: true
+    write: false
+    data_type: enum_uint8
+    description: Plasma interlock state
+    options:
+      0: Not active
+      1: Active
+  plasma_interlock_enable:
+    pid: 12000
+    read: false
+    write: true
+    data_type: bool_uint8
+    description: Enable or disable plasma interlock
+    options:
+      0: Plasma interlock OFF
+      1: Plasma interlock ON
+  plasma_enable:
+    pid: 12002
+    read: false
+    write: true
+    data_type: bool_uint8
+    description: Enable or disable plasma ignition
+    options:
+      0: Plasma OFF
+      1: Plasma ON
+  plasma_state:
+    pid: 12003
+    read: true
+    write: false
+    data_type: enum_uint8
+    description: Plasma state
+    options:
+      0: Plasma OFF
+      1: Plasma ON, not ignited
+      2: Plasma ON and ignited
+  spectrometer_pixel_count:
+    pid: 13000
+    read: true
+    write: false
+    data_type: uint16_be
+    description: Spectrometer pixel count
+  master_data_unit:
+    pid: 14001
+    read: true
+    write: false
+    data_type: enum_uint8
+    description: Master pressure data unit
+    options:
+      1: mbar
+      2: Torr
+      3: Pascal
+      4: micron
+  operating_mode:
+    pid: 19000
+    read: true
+    write: false
+    data_type: enum_uint8
+    description: Current OPG operating mode
+    options:
+      0: Manual
+      1: Automatic SPEC
+      2: Automatic RoR
+      3: Automatic RGD
+  all_algorithms_off:
+    pid: 19100
+    read: false
+    write: true
+    data_type: opg_all_algorithms_off
+    description: Deactivate all OPG550 analysis algorithms
+  spec_state:
+    pid: 20001
+    read: true
+    write: false
+    data_type: enum_uint8
+    description: Spectrum measurement state
+    options:
+      0: Not selected
+      1: Not active (IDLE)
+      2: Active (SETUP)
+      3: Active (CAPTURE BACKGROUND)
+      4: Active (CAPTURE SPECTRUM)
+      5: Active (CLEANUP)
+      255: Not active (ERROR)
+  spec_enable:
+    pid: 20000
+    read: false
+    write: true
+    data_type: opg_spec_enable
+    description: Enable or disable SPEC measurement; value 1 starts endless acquisition, value 0 stops it
+  spec_buffer_size:
+    pid: 20002
+    read: true
+    write: false
+    data_type: uint32_be
+    description: Maximum number of SPEC records stored
+  spec_record_count:
+    pid: 20003
+    read: true
+    write: false
+    data_type: uint32_be
+    description: Number of captured SPEC records
+  spec_record:
+    pid: 20004
+    read: true
+    write: false
+    data_type: opg_spec_record
+    request_data: [0, 0, 0, 0, 0, 1, 1, 32, 0]
+    description: Read the latest SPEC optical spectrum record
+  ror_state:
+    pid: 21001
+    read: true
+    write: false
+    data_type: enum_uint8
+    description: Rate-of-rise measurement state
+    options:
+      0: Not selected
+      1: Not active (IDLE)
+      2: Active (SETUP)
+      3: Active (CAPTURE SPECTRUM)
+      4: Active (CLEANUP)
+      255: Not active (ERROR)
+  ror_enable:
+    pid: 21000
+    read: false
+    write: true
+    data_type: opg_ror_enable
+    description: Enable or disable RoR measurement; value 1 starts endless acquisition, value 0 stops it
+  ror_buffer_size:
+    pid: 21002
+    read: true
+    write: false
+    data_type: uint32_be
+    description: Maximum number of RoR records stored
+  ror_record_count:
+    pid: 21003
+    read: true
+    write: false
+    data_type: uint32_be
+    description: Number of captured RoR records
+  ror_record:
+    pid: 21004
+    read: true
+    write: false
+    data_type: opg_ror_record
+    request_data: [0, 0, 0, 0, 0, 1, 1, 32, 0, 1, 0, 6, 0]
+    description: Read the latest RoR record including spectrum, pressure rise, and leak-rate numbers
+  rgd_state:
+    pid: 22001
+    read: true
+    write: false
+    data_type: enum_uint8
+    description: Residual gas detection state
+    options:
+      0: Not selected
+      1: Not active (IDLE)
+      2: Active (SETUP)
+      3: Active (CAPTURE BACKGROUND)
+      4: Active (CAPTURE SPECTRUM)
+      5: Active (CLEANUP)
+      255: Not active (ERROR)
+  rgd_enable:
+    pid: 22000
+    read: false
+    write: true
+    data_type: opg_rgd_enable
+    description: Enable or disable RGD measurement; value 1 starts endless acquisition, value 0 stops it
+  rgd_buffer_size:
+    pid: 22002
+    read: true
+    write: false
+    data_type: uint32_be
+    description: Maximum number of RGD records stored
+  rgd_record_count:
+    pid: 22003
+    read: true
+    write: false
+    data_type: uint32_be
+    description: Number of captured RGD records
+  rgd_record:
+    pid: 22004
+    read: true
+    write: false
+    data_type: opg_rgd_record
+    request_data: [0, 0, 0, 0, 0, 1, 1, 32, 0, 1, 0, 10, 0, 1, 0, 8, 0]
+    description: Read the latest RGD record including spectrum, gas intensities, partial pressures, and ratios
+  analog_output_mode:
+    pid: 30000
+    read: true
+    write: false
+    data_type: enum_uint8
+    description: Current analog output mode
+    options:
+      0: None
+      1: Manual
+      2: Total Pressure
+      3: Total Pressure Switch
+      4: SPEC Power
+      5: SPEC Power Switch
+      6: ROR Leak Rate Number
+      7: ROR Leak Rate Number Switch
+      8: ROR Pressure Rise
+      9: ROR Pressure Rise Switch
+      10: RGD Power
+      11: RGD Power Switch
+      12: RGD Partial Pressure
+      13: RGD Partial Pressure Switch
+      14: RGD Gas Intensity
+      15: RGD Gas Intensity Switch
+      16: RGD Ratio
+      17: RGD Ratio Switch
+  analog_output_voltage:
+    pid: 30001
+    read: true
+    write: false
+    data_type: uint16_be
+    unit: mV
+    description: Analog output target voltage

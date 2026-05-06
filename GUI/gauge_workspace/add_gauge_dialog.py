@@ -23,13 +23,19 @@ from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtWidgets import (
     QButtonGroup, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QComboBox, QGroupBox, QHBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QPushButton, QRadioButton,
-    QSpinBox, QVBoxLayout, QWidget,
+    QLayout, QListWidget, QListWidgetItem, QPushButton, QRadioButton,
+    QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from serial_comm.device_registry import DeviceRegistry
 from serial_comm.models import DeviceSpec
+from serial_comm.command_utils import (
+    default_poll_commands,
+    is_pressure_command,
+    is_primary_pressure_command,
+)
 from GUI.gauge_workspace.port_scanner import PortScanner
+from GUI.theme import current_theme, list_style
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +45,52 @@ _MODEL_ALIASES = {
 }
 
 
+class _ScanResultWidget(QWidget):
+    """Compact two-line scan result card."""
+
+    def __init__(self, port: str, model_hint: str, description: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._port = port
+        self._model_hint = model_hint
+        self._description = description
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(3)
+
+        self._model_label = QLabel(model_hint or "Unknown gauge")
+        self._model_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._model_label.setWordWrap(False)
+        layout.addWidget(self._model_label)
+
+        detail = f"{port}  \u00b7  {description}" if description else port
+        self._detail_label = QLabel(detail)
+        self._detail_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._detail_label.setWordWrap(True)
+        layout.addWidget(self._detail_label)
+
+        self._model_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._detail_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(50)
+        self.apply_theme()
+
+    def apply_theme(self) -> None:
+        theme = current_theme(self)
+        self.setStyleSheet("background: transparent;")
+        self._model_label.setStyleSheet(f"font-weight:700; font-size:13px; color:{theme.text};")
+        self._detail_label.setStyleSheet(f"font-size:11px; color:{theme.muted};")
+
 class AddGaugeDialog(QDialog):
     """Modal dialog for selecting and configuring a gauge connection."""
 
     def __init__(self, registry: DeviceRegistry, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Add Gauge")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(500)
+        self.resize(520, 420)
         self._registry = registry
         self._spec: DeviceSpec | None = None
         self._scanner: PortScanner | None = None
@@ -53,6 +98,7 @@ class AddGaugeDialog(QDialog):
         self._build_ui()
         self._populate_models()
         self._populate_ports()
+        self.apply_theme()
 
     # ------------------------------------------------------------------
     # Build UI
@@ -60,7 +106,8 @@ class AddGaugeDialog(QDialog):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setSpacing(6)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
 
         # ── Model row ──
         model_form = QFormLayout()
@@ -96,7 +143,9 @@ class AddGaugeDialog(QDialog):
 
         self._scan_list = QListWidget()
         self._scan_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self._scan_list.setMaximumHeight(90)
+        self._scan_list.setMinimumHeight(96)
+        self._scan_list.setMaximumHeight(170)
+        self._scan_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._scan_list.hide()
         self._scan_list.itemSelectionChanged.connect(self._on_scan_selection_changed)
         layout.addWidget(self._scan_list)
@@ -152,9 +201,25 @@ class AddGaugeDialog(QDialog):
         # ── Commands group ──
         cmd_group = QGroupBox("Commands to poll")
         cmd_layout = QVBoxLayout(cmd_group)
+        cmd_layout.setContentsMargins(8, 8, 8, 8)
+        cmd_layout.setSpacing(4)
+
+        # Advanced toggle: show non-pressure commands
+        adv_cmd_row = QHBoxLayout()
+        adv_cmd_row.addWidget(QLabel("Pressure commands are selected by default."))
+        self._adv_cmd_check = QPushButton("Advanced Command Menu")
+        self._adv_cmd_check.setCheckable(True)
+        self._adv_cmd_check.setFlat(True)
+        self._adv_cmd_check.setStyleSheet("font-weight: bold; color: #4C9BE8;")
+        self._adv_cmd_check.toggled.connect(self._on_adv_cmd_toggled)
+        adv_cmd_row.addWidget(self._adv_cmd_check)
+        adv_cmd_row.addStretch()
+        cmd_layout.addLayout(adv_cmd_row)
+
         self._cmd_list = QListWidget()
-        self._cmd_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        self._cmd_list.setMaximumHeight(130)
+        self._cmd_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self._cmd_list.setMaximumHeight(150)
+        self._cmd_list.hide()  # hidden until advanced is toggled
         cmd_layout.addWidget(self._cmd_list)
         layout.addWidget(cmd_group)
 
@@ -171,7 +236,6 @@ class AddGaugeDialog(QDialog):
         layout.addLayout(bottom_form)
 
         self._exp_label = QLabel()
-        self._exp_label.setStyleSheet("color: orange;")
         self._exp_label.hide()
         layout.addWidget(self._exp_label)
 
@@ -182,6 +246,7 @@ class AddGaugeDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
 
     # ------------------------------------------------------------------
     # Populate
@@ -234,15 +299,26 @@ class AddGaugeDialog(QDialog):
 
         # Populate commands
         self._cmd_list.clear()
+        default_commands = set(default_poll_commands(spec))
         for cmd_name, cmd in spec.commands.items():
             if cmd.read:
+                kind = self._command_kind_label(cmd_name, cmd)
                 item = QListWidgetItem(
-                    f"{cmd_name}  —  {cmd.description}" if cmd.description else cmd_name
+                    f"[{kind}]  {cmd_name.replace('_', ' ')}"
+                    + (f"  -  {cmd.description}" if cmd.description else "")
                 )
                 item.setData(Qt.ItemDataRole.UserRole, cmd_name)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 self._cmd_list.addItem(item)
-                if cmd_name == "pressure" or spec.model.upper() == "OPG550":
-                    item.setSelected(True)
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if cmd_name in default_commands
+                    else Qt.CheckState.Unchecked
+                )
+
+        # Reset advanced toggle when model changes
+        self._adv_cmd_check.setChecked(False)
+        self._cmd_list.hide()
 
         if spec.experimental:
             self._exp_label.setText(
@@ -311,6 +387,30 @@ class AddGaugeDialog(QDialog):
             )
 
     # ------------------------------------------------------------------
+    # Advanced commands toggle
+    # ------------------------------------------------------------------
+
+    def _on_adv_cmd_toggled(self, checked: bool) -> None:
+        self._adv_cmd_check.setText(
+            "Hide Advanced Commands" if checked else "Advanced Command Menu"
+        )
+        self._cmd_list.setVisible(checked)
+        self.adjustSize()
+
+    @staticmethod
+    def _command_kind_label(cmd_name: str, cmd) -> str:
+        if is_primary_pressure_command(cmd_name, cmd):
+            return "Combined Pressure"
+        if is_pressure_command(cmd):
+            return "Subsensor Pressure"
+        data_type = (cmd.data_type or "").lower()
+        if "spectrum" in cmd_name.lower() or "array" in data_type:
+            return "Spectrum"
+        if cmd.unit or data_type in {"uint8", "uint16_be", "uint32_be", "int32_be", "float32_be", "u_real", "u_integer"}:
+            return "Numeric"
+        return "Status"
+
+    # ------------------------------------------------------------------
     # Advanced panel toggle
     # ------------------------------------------------------------------
 
@@ -328,59 +428,108 @@ class AddGaugeDialog(QDialog):
 
     @pyqtSlot()
     def _on_scan(self) -> None:
-        # Stop any previous scan (and disconnect its signals so stale
-        # 'scan_complete' events don't race with a new scan).
+        # If a scan is already running, act as a cancel button.
+        if self._scanner is not None and self._scanner.isRunning():
+            self._stop_scanner()
+            self._scan_btn.setText("Scan Ports")
+            self._scan_btn.setEnabled(True)
+            self._set_scan_status("Scan Stopped", "#C62828")
+            return
+
+        # Stop any stale scanner so its signals don't race with the new scan.
         self._stop_scanner()
 
         ports = [p.device for p in serial.tools.list_ports.comports()]
         if not ports:
-            self._scan_status.setText("No ports available to scan.")
+            self._set_scan_status(
+                "No serial ports are available. Check the USB/serial adapter connection, then scan again.",
+                "#C62828",
+            )
             self._scan_status.show()
             return
 
         self._scan_list.clear()
         self._scan_list.show()
-        self._scan_status.setText(f"Scanning {len(ports)} port(s)…")
+        self._set_scan_status(
+            f"Starting scan across {len(ports)} serial port(s). The scanner will try PPG ASCII, Pfeiffer ASCII, CDG/HPG binary, and OPG550 P3 V02 probes.",
+            "#333333",
+        )
         self._scan_status.show()
-        self._scan_btn.setEnabled(False)
+        self._scan_btn.setText("Stop")
+        self._scan_btn.setEnabled(True)
 
         self._scanner = PortScanner(ports=ports, parent=self)
         self._scanner.port_found.connect(self._on_port_found)
         self._scanner.scan_complete.connect(self._on_scan_complete)
+        self._scanner.port_scanning.connect(self._on_port_scanning)
         self._scanner.start()
 
     @pyqtSlot(str, str, str, object)
     def _on_port_found(self, port: str, description: str, model_hint: str, metadata: object) -> None:
-        short_desc = description[:50].strip()
-        item = QListWidgetItem(f"{port}  [{model_hint}]  {short_desc}")
+        details = description.strip()
+        item = QListWidgetItem()
         payload = {
             "port": port,
             "model_hint": model_hint,
             "metadata": metadata if isinstance(metadata, dict) else {},
         }
         item.setData(Qt.ItemDataRole.UserRole, payload)
+        widget = _ScanResultWidget(port, model_hint, details, self._scan_list)
+        item.setSizeHint(widget.sizeHint())
         self._scan_list.addItem(item)
+        self._scan_list.setItemWidget(item, widget)
 
     @pyqtSlot()
     def _on_scan_complete(self) -> None:
         self._scan_btn.setEnabled(True)
+        self._scan_btn.setText("Scan Ports")
         if self._scan_list.count() == 0:
             no_item = QListWidgetItem("No devices found")
             no_item.setFlags(Qt.ItemFlag.NoItemFlags)
             self._scan_list.addItem(no_item)
-            self._scan_status.setText("Scan complete — no devices found.")
+            self._set_scan_status(
+                "Scan complete. No gauges answered the probe sequence on the available ports.",
+                "#2E7D32",
+            )
         else:
             n = self._scan_list.count()
-            self._scan_status.setText(
-                f"Scan complete — {n} device(s) found. Select one or more, then click OK."
+            self._set_scan_status(
+                f"Scan complete. Found {n} device(s). Select one or more results, then click OK to add them.",
+                "#2E7D32",
             )
+        self._scanner = None
+
+    @pyqtSlot(str, int, int, str)
+    def _on_port_scanning(self, port: str, current: int, total: int, detail: str) -> None:
+        found = self._scan_list.count()
+        self._set_scan_status(
+            f"Scanning {port} ({current} of {total}): {detail}. Devices found so far: {found}.",
+            "#333333",
+        )
+
+    def _set_scan_status(self, text: str, color: str) -> None:
+        self._scan_status.setText(f"<span style='color: {color};'>{text}</span>")
+        self._scan_status.show()
+
+    def apply_theme(self) -> None:
+        theme = current_theme(self)
+        self._adv_toggle.setStyleSheet("text-align: left; font-weight: bold;")
+        self._adv_cmd_check.setStyleSheet("font-weight: bold; color: #2878B8;")
+        self._cmd_list.setStyleSheet(list_style(radius=8))
+        self._scan_list.setStyleSheet(list_style())
+        self._exp_label.setStyleSheet("color:#C77C02;" if theme.name == "light" else "color:#FFB454;")
+        for row in range(self._scan_list.count()):
+            widget = self._scan_list.itemWidget(self._scan_list.item(row))
+            hook = getattr(widget, "apply_theme", None)
+            if callable(hook):
+                hook()
 
     @pyqtSlot()
     def _on_scan_selection_changed(self) -> None:
-        selected = self._scan_list.selectedItems()
-        if not selected:
+        item = self._scan_list.currentItem()
+        if item is None or not item.isSelected():
             return
-        self._apply_scan_item(selected[0])
+        self._apply_scan_item(item)
 
     def _resolve_model_hint(self, model_hint: str, metadata: dict | None = None) -> str | None:
         hint_upper = (model_hint or "").upper().replace("INFICON", "").strip()
@@ -480,8 +629,17 @@ class AddGaugeDialog(QDialog):
         port: str,
         metadata: dict | None = None,
     ) -> dict | None:
+        # When this method is called from the scan-selection loop, ``metadata``
+        # is supplied (possibly as an empty dict). The dialog UI controls
+        # (baud combo, command checklist, RS-485 radios) only reflect the
+        # *currently active* model in ``self._model_combo`` — applying them to
+        # every scan-selected port would, for example, force a CDG opened
+        # alongside an OPG550 to use 115200 baud. So treat the presence of
+        # ``metadata`` as the signal to take per-spec defaults instead.
+        from_scan = metadata is not None
         metadata = metadata or {}
-        model_name = _MODEL_ALIASES.get(model_display, model_display)
+        normalized_model = model_display.replace(" (experimental)", "").strip()
+        model_name = _MODEL_ALIASES.get(normalized_model, normalized_model)
         try:
             spec = self._registry.get_spec(model_name)
         except Exception:
@@ -491,18 +649,30 @@ class AddGaugeDialog(QDialog):
         spec = self._clone_spec_with_scan_overrides(spec, metadata)
         spec = self._apply_cdg_full_scale_override(spec)
 
-        selected_cmds = [
-            item.data(Qt.ItemDataRole.UserRole)
-            for item in self._cmd_list.selectedItems()
-        ]
-        selected_cmds = [c for c in selected_cmds if c and c in spec.commands and spec.commands[c].read]
-        if not selected_cmds:
-            selected_cmds = [name for name, cmd in spec.commands.items() if cmd.read]
+        if from_scan:
+            selected_cmds = list(default_poll_commands(spec))
+        else:
+            selected_cmds = [
+                self._cmd_list.item(row).data(Qt.ItemDataRole.UserRole)
+                for row in range(self._cmd_list.count())
+                if self._cmd_list.item(row).checkState() == Qt.CheckState.Checked
+            ]
+            selected_cmds = [c for c in selected_cmds if c and c in spec.commands and spec.commands[c].read]
+            if not selected_cmds:
+                selected_cmds = default_poll_commands(spec)
 
-        try:
-            baud = int(self._baud_combo.currentText())
-        except (TypeError, ValueError):
+        if from_scan:
             baud = spec.default_baud
+        else:
+            try:
+                baud = int(self._baud_combo.currentText())
+            except (TypeError, ValueError):
+                baud = spec.default_baud
+
+        if from_scan:
+            rs485_enabled = bool(spec.rs_modes) and spec.rs_modes[0] == "RS485"
+        else:
+            rs485_enabled = self._rs485_radio.isChecked()
 
         address = self._address_spin.value()
         protocol = self._registry.make_protocol(spec, address=address)
@@ -513,7 +683,7 @@ class AddGaugeDialog(QDialog):
             "commands": selected_cmds,
             "poll_interval": float(self._interval_spin.value()),
             "baud_override": baud,
-            "rs485_enabled": self._rs485_radio.isChecked(),
+            "rs485_enabled": rs485_enabled,
         }
 
     def _apply_cdg_full_scale_override(self, spec: DeviceSpec) -> DeviceSpec:
@@ -603,12 +773,14 @@ class AddGaugeDialog(QDialog):
         except (TypeError, RuntimeError):
             pass
         try:
+            sc.port_scanning.disconnect(self._on_port_scanning)
+        except (TypeError, RuntimeError):
+            pass
+        try:
             if sc.isRunning():
                 sc.requestInterruption()
-                # Some serial drivers can block a probe for several seconds.
-                # Wait generously, then force-stop as a last resort so the
-                # dialog cannot be destroyed while the thread is still alive.
-                if not sc.wait(8000):
+                # With short per-read timeouts (50 ms) the thread exits quickly.
+                if not sc.wait(2000):
                     logger.warning("PortScanner did not stop in time; forcing thread termination")
                     sc.terminate()
                     sc.wait(1000)

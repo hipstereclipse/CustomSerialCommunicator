@@ -23,6 +23,7 @@ import logging
 from PyQt6.QtCore import Qt, QSettings, pyqtSlot
 from PyQt6.QtGui import QAction, QColor, QGuiApplication, QKeySequence
 from PyQt6.QtWidgets import (
+    QApplication,
     QMainWindow, QWidget, QSplitter, QVBoxLayout,
     QHBoxLayout, QPushButton, QListWidget, QListWidgetItem,
     QTabWidget, QTabBar, QLabel, QStatusBar, QToolBar, QMessageBox,
@@ -47,15 +48,19 @@ from GUI.gauge_workspace.combined_tab import CombinedTab, COLOR_PALETTE
 from GUI.gauge_workspace.gauge_tab import GaugeTab
 from GUI.gauge_workspace.simulation_tab import SimulationControlTab
 from GUI.gauge_workspace.export_dialog import ExportDialog
+from GUI.gauge_workspace.poll_commands_dialog import PollCommandsDialog, PollCommandsTarget
 from GUI.turbo_workspace.turbo_window import TurboWindow
 from GUI.settings_dialog import (
     SettingsDialog, apply_log_level, apply_log_file, get_display_unit,
     display_signals,
 )
+from GUI.theme import apply_theme, apply_theme_to_widget_tree, current_theme
 
 # Hard cap on concurrently-active simulated gauges — see spec §1.
 _MAX_SIMULATED_GAUGES: int = 12
 _SIM_SETTINGS_TITLE: str = "⊕ Simulation"
+CLAUDE_ORANGE: str = "#D9772F"
+CLAUDE_ORANGE_HOVER: str = "#B85F22"
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +91,7 @@ class MainWindow(QMainWindow):
         self._simulation_tab: SimulationControlTab | None = None
         self._turbo_window: TurboWindow | None = None
         self._settings = QSettings()
+        self._theme_name = current_theme().name
 
         # Colour management
         self._gauge_colors: dict[str, str] = {}  # device_id → hex colour
@@ -111,6 +117,7 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_central()
         self._build_status_bar()
+        self.apply_theme()
         self._restore_geometry()
 
     # ------------------------------------------------------------------
@@ -179,22 +186,37 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
 
-        add_gauge_btn = QAction("+ Gauge", self)
-        add_gauge_btn.setToolTip("Connect a new gauge")
-        add_gauge_btn.triggered.connect(self._on_add_gauge)
-        tb.addAction(add_gauge_btn)
+        add_gauge_act = QAction("\u2295  Gauge", self)
+        add_gauge_act.setToolTip("Connect a new gauge")
+        add_gauge_act.triggered.connect(self._on_add_gauge)
+        tb.addAction(add_gauge_act)
+        self._add_gauge_tb_btn = tb.widgetForAction(add_gauge_act)
 
         turbo_btn = QAction("Turbo", self)
         turbo_btn.setToolTip("Open Pfeiffer TC600 turbo controller window")
         turbo_btn.triggered.connect(self._on_open_turbo)
         tb.addAction(turbo_btn)
+        self._turbo_tb_btn = tb.widgetForAction(turbo_btn)
 
         tb.addSeparator()
 
-        export_btn = QAction("Export…", self)
+        export_btn = QAction("Export\u2026", self)
         export_btn.setToolTip("Export recorded data")
         export_btn.triggered.connect(self._on_export)
         tb.addAction(export_btn)
+        self._export_tb_btn = tb.widgetForAction(export_btn)
+
+        spacer = QWidget(self)
+        spacer.setObjectName("ToolbarSpacer")
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+
+        self._theme_action = QAction(self)
+        self._theme_action.setToolTip("Toggle light / dark mode")
+        self._theme_action.triggered.connect(self._on_toggle_theme)
+        tb.addAction(self._theme_action)
+        self._theme_tb_btn = tb.widgetForAction(self._theme_action)
+        self._refresh_theme_action()
 
     def _build_central(self) -> None:
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -205,25 +227,7 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(4, 4, 4, 4)
 
-        btn_row = QHBoxLayout()
-        add_gauge_btn = QPushButton("+ Gauge")
-        add_gauge_btn.clicked.connect(self._on_add_gauge)
-        btn_row.addWidget(add_gauge_btn)
-
-        turbo_btn = QPushButton("Turbo")
-        turbo_btn.clicked.connect(self._on_open_turbo)
-        btn_row.addWidget(turbo_btn)
-        left_layout.addLayout(btn_row)
-
-        # INFICON-blue "Simulate Gauge" button — visually distinct from the
-        # real-gauge add button, capped at _MAX_SIMULATED_GAUGES.
         self._add_sim_btn = QPushButton("⊕ Simulate Gauge")
-        self._add_sim_btn.setStyleSheet(
-            f"QPushButton {{ background:{INFICON_BLUE}; color:white; "
-            f"border-radius:6px; padding:6px 12px; font-weight:bold; }}"
-            f"QPushButton:hover {{ background:{INFICON_BLUE_HOVER}; }}"
-            f"QPushButton:disabled {{ background:#555; color:#CCC; }}"
-        )
         self._add_sim_btn.clicked.connect(self._on_add_simulated_gauge)
         left_layout.addWidget(self._add_sim_btn)
 
@@ -258,6 +262,8 @@ class MainWindow(QMainWindow):
         )
         self._main_tab.color_changed.connect(self._on_combined_color_changed)
         self._main_tab.gauge_toggled.connect(self._on_combined_gauge_toggled)
+        self._main_tab.export_requested.connect(self._on_export_filtered)
+        self._main_tab.poll_commands_requested.connect(self._on_combined_poll_commands_requested)
         display_signals.units_changed.connect(self._main_tab.set_display_unit)
         self._tab_widget.addTab(self._main_tab, "Main")
         self._hide_tab_close_button(0)
@@ -322,6 +328,8 @@ class MainWindow(QMainWindow):
         spec = cfg["spec"]
         protocol = cfg["protocol"]
         baud = cfg.get("baud_override", spec.default_baud)
+        if spec.protocol == "inficon_p3_v02":
+            baud = spec.default_baud
         rs485 = RS485Config() if cfg.get("rs485_enabled") else None
         transport_cfg = TransportConfig(
             port=cfg["port"],
@@ -353,6 +361,7 @@ class MainWindow(QMainWindow):
         # Assign colour before creating the tab
         color = self._next_gauge_color()
         self._gauge_colors[device_id] = color
+        display_name = f"{spec.model} {cfg['port']}"
 
         tab = GaugeTab(
             device_id=device_id,
@@ -360,18 +369,20 @@ class MainWindow(QMainWindow):
             worker=worker,
             parent=self,
             color=color,
+            display_name=display_name,
         )
         worker.reading_ready.connect(tab.on_reading)
         worker.error_occurred.connect(tab.on_error)
+        tab.poll_commands_changed.connect(self._on_poll_commands_changed)
         worker.connected.connect(lambda: self._on_gauge_connected(device_id))
         worker.disconnected.connect(lambda: self._on_gauge_disconnected(device_id))
 
         # Register in Main combined tab
-        display_name = f"{spec.model} {cfg['port']}"
         self._main_tab.add_gauge(
             device_id, display_name, color,
             full_scale_mbar=_spec_full_scale_mbar(spec),
         )
+        self._main_tab.set_active_commands(device_id, list(worker._commands))
         # Forward pressure readings to the combined view
         worker.reading_ready.connect(
             lambda reading, did=device_id: self._feed_main_tab(did, reading)
@@ -491,6 +502,7 @@ class MainWindow(QMainWindow):
         )
         worker.reading_ready.connect(tab.on_reading)
         worker.error_occurred.connect(tab.on_error)
+        tab.poll_commands_changed.connect(self._on_poll_commands_changed)
 
         # 1. Ensure Combined Simulation tab exists (inserts before sim gauge tabs)
         self._ensure_combined_sim_tab()
@@ -514,6 +526,7 @@ class MainWindow(QMainWindow):
             config.sim_id, config.display_name, color,
             full_scale_mbar=sim_full_scale,
         )
+        self._combined_sim_tab.set_active_commands(config.sim_id, list(worker._commands))
         worker.reading_ready.connect(
             lambda reading, did=config.sim_id: self._feed_combined_sim_tab(did, reading)
         )
@@ -561,6 +574,8 @@ class MainWindow(QMainWindow):
         )
         tab.color_changed.connect(self._on_combined_color_changed)
         tab.gauge_toggled.connect(self._on_combined_gauge_toggled)
+        tab.export_requested.connect(self._on_export_filtered)
+        tab.poll_commands_requested.connect(self._on_combined_poll_commands_requested)
         display_signals.units_changed.connect(tab.set_display_unit)
         # Position: after Main tab + all currently-connected real gauge tabs
         real_count = self._real_gauge_tab_count()
@@ -801,6 +816,75 @@ class MainWindow(QMainWindow):
         dlg = ExportDialog(all_readings, self)
         dlg.exec()
 
+    @pyqtSlot(object)
+    def _on_export_filtered(self, device_ids: object) -> None:
+        ids = set(device_ids or [])
+        readings: list[DeviceReading] = []
+        for device_id, tab in self._gauge_tabs.items():
+            if ids and device_id not in ids:
+                continue
+            readings.extend(tab.get_readings())
+
+        if not readings:
+            QMessageBox.information(self, "No data", "No readings recorded yet for the selected plot.")
+            return
+
+        pressure_commands = {
+            reading.command for reading in readings
+            if reading.unit in SUPPORTED_UNITS
+        }
+
+        dlg = ExportDialog(
+            readings,
+            self,
+            title="Export Plot Data",
+            preselected_devices=ids or None,
+            preselected_commands=pressure_commands or None,
+        )
+        dlg.exec()
+
+    @pyqtSlot(str, object)
+    def _on_poll_commands_changed(self, device_id: str, commands: object) -> None:
+        command_list = [str(command) for command in commands]
+        if device_id in self._sim_ids:
+            if self._combined_sim_tab is not None:
+                self._combined_sim_tab.set_active_commands(device_id, command_list)
+        elif self._main_tab is not None:
+            self._main_tab.set_active_commands(device_id, command_list)
+        command_text = ", ".join(str(command) for command in commands)
+        self._set_status(f"Updated poll commands for {device_id}: {command_text}")
+
+    @pyqtSlot(object)
+    def _on_combined_poll_commands_requested(self, device_ids: object) -> None:
+        ids = [str(device_id) for device_id in (device_ids or [])]
+        if not ids:
+            ids = [device_id for device_id in self._gauge_tabs]
+        targets = [self._gauge_tabs[device_id] for device_id in ids if device_id in self._gauge_tabs]
+        if not targets:
+            QMessageBox.information(self, "No gauges", "No gauges are available to edit.")
+            return
+        dialog_targets = [
+            PollCommandsTarget(
+                device_id=tab.device_id,
+                label=self._poll_commands_label_for_tab(tab),
+                spec=tab._spec,
+                selected_commands=tab.current_poll_commands(),
+            )
+            for tab in targets
+        ]
+        dlg = PollCommandsDialog(dialog_targets, parent=self)
+        if not dlg.exec():
+            return
+        selected_by_device = dlg.selected_commands_by_device()
+        for tab in targets:
+            commands = selected_by_device.get(tab.device_id, [])
+            tab.apply_poll_commands(commands)
+
+    def _poll_commands_label_for_tab(self, tab: GaugeTab) -> str:
+        if tab.is_simulated:
+            return f"⊕ {tab.display_name}"
+        return f"{tab._spec.model} {tab.device_id}"
+
     # ------------------------------------------------------------------
     # Settings
     # ------------------------------------------------------------------
@@ -809,6 +893,76 @@ class MainWindow(QMainWindow):
     def _on_open_settings(self) -> None:
         dlg = SettingsDialog(self)
         dlg.exec()
+
+    @pyqtSlot()
+    def _on_toggle_theme(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        next_theme = "light" if self._theme_name == "dark" else "dark"
+        apply_theme(app, next_theme)
+        self._theme_name = next_theme
+        self._refresh_theme_action()
+        apply_theme_to_widget_tree(self)
+        if self._turbo_window is not None:
+            apply_theme_to_widget_tree(self._turbo_window)
+        self._set_status(f"{next_theme.title()} mode enabled")
+
+    def _refresh_theme_action(self) -> None:
+        if not hasattr(self, "_theme_action"):
+            return
+        if self._theme_name == "dark":
+            self._theme_action.setText("\u2600\ufe0f  Light")
+        else:
+            self._theme_action.setText("\u263e  Dark")
+
+    def apply_theme(self) -> None:
+        theme = current_theme(self)
+        self._theme_name = theme.name
+        self._refresh_theme_action()
+        _primary_btn_ss = (
+            f"QPushButton {{ background:{INFICON_BLUE}; color:white; "
+            "border-radius:6px; padding:5px 12px; font-weight:bold; border:none; }"
+            f"QPushButton:hover {{ background:{INFICON_BLUE_HOVER}; }}"
+        )
+        if hasattr(self, "_add_gauge_btn"):
+            self._add_gauge_btn.setStyleSheet(_primary_btn_ss)
+        if hasattr(self, "_add_sim_btn"):
+            self._add_sim_btn.setStyleSheet(
+                f"QPushButton {{ background:{CLAUDE_ORANGE}; color:white; "
+                "border-radius:6px; padding:6px 12px; font-weight:bold; border:none; }"
+                f"QPushButton:hover {{ background:{CLAUDE_ORANGE_HOVER}; }}"
+                f"QPushButton:disabled {{ background:{theme.panel_alt}; color:{theme.disabled}; }}"
+            )
+        if hasattr(self, "_device_list"):
+            self._device_list.setStyleSheet(
+                f"QListWidget {{ background:{theme.panel}; color:{theme.text}; "
+                f"border:1px solid {theme.border}; border-radius:6px; }}"
+                "QListWidget::item { padding:2px; background:transparent; }"
+                "QListWidget::item:selected { background:transparent; }"
+            )
+        if hasattr(self, "_left_panel"):
+            self._left_panel.setStyleSheet("QWidget { background: transparent; }")
+        toolbar_style = (
+            f"QToolBar#MainToolBar {{ background:transparent; border-bottom:1px solid {theme.border}; spacing:3px; }}"
+            "QToolBar#MainToolBar QWidget#ToolbarSpacer { background:transparent; }"
+            f"QToolBar#MainToolBar QToolButton {{ background:{theme.control}; color:{theme.text}; "
+            f"border:1px solid {theme.border}; border-radius:4px; padding:4px 8px; "
+            "min-height:24px; margin:1px; font-weight:600; }"
+            f"QToolBar#MainToolBar QToolButton:hover {{ background:{theme.control_hover}; }}"
+            "QToolBar#MainToolBar::separator { background:transparent; width:6px; margin:0 2px; }"
+        )
+        toolbar = self.findChild(QToolBar, "MainToolBar")
+        if toolbar is not None:
+            toolbar.setStyleSheet(toolbar_style)
+        if hasattr(self, "_add_gauge_tb_btn") and self._add_gauge_tb_btn:
+            self._add_gauge_tb_btn.setStyleSheet(
+                f"QToolButton {{ background:{INFICON_BLUE}; color:white; "
+                "border-radius:4px; padding:4px 8px; min-height:24px; font-weight:bold; border:none; }"
+                f"QToolButton:hover {{ background:{INFICON_BLUE_HOVER}; }}"
+            )
+        for widget in self._list_entry_widgets.values():
+            widget.apply_theme()
 
     # ------------------------------------------------------------------
     # About
@@ -852,7 +1006,8 @@ class MainWindow(QMainWindow):
             return
         display_unit = get_display_unit()
         value = convert_pressure(reading.value, reading.unit, display_unit)
-        self._main_tab.feed(device_id, reading.timestamp_mono, value)
+        self._main_tab.feed(device_id, reading.timestamp_mono, value, reading.command)
+        self._broadcast_opg_peer_reading(device_id, reading)
 
     def _feed_combined_sim_tab(
         self, device_id: str, reading: DeviceReading
@@ -864,7 +1019,19 @@ class MainWindow(QMainWindow):
             return
         display_unit = get_display_unit()
         value = convert_pressure(reading.value, reading.unit, display_unit)
-        self._combined_sim_tab.feed(device_id, reading.timestamp_mono, value)
+        self._combined_sim_tab.feed(device_id, reading.timestamp_mono, value, reading.command)
+        self._broadcast_opg_peer_reading(device_id, reading)
+
+    def _broadcast_opg_peer_reading(self, device_id: str, reading: DeviceReading) -> None:
+        """Send live pressure from one gauge to every other OPG550 analysis tab."""
+        source_tab = self._gauge_tabs.get(device_id)
+        display_name = source_tab.display_name if source_tab is not None else device_id
+        for tab_id, tab in self._gauge_tabs.items():
+            if tab_id == device_id:
+                continue
+            panel = getattr(tab, "_opg_panel", None)
+            if panel is not None and hasattr(panel, "on_peer_reading"):
+                panel.on_peer_reading(device_id, display_name, reading)
 
     # ------------------------------------------------------------------
     # Colour propagation
@@ -1002,13 +1169,13 @@ class MainWindow(QMainWindow):
         if target_item is None:
             return
 
-        # Block list signals to avoid re-triggering _on_selection_changed.
         self._device_list.blockSignals(True)
         if visible:
             target_item.setSelected(True)
         else:
             target_item.setSelected(False)
         self._device_list.blockSignals(False)
+        self._on_selection_changed()
 
     # ------------------------------------------------------------------
     # Geometry persistence
@@ -1079,7 +1246,7 @@ class _GaugeListEntryWidget(QWidget):
         self.setObjectName("gaugeEntry")
 
         self._title.setStyleSheet("font-weight: 600;")
-        self._subtitle.setStyleSheet("color: #A9A9A9; font-size: 11px;")
+        self._subtitle.setStyleSheet(f"color: {current_theme(self).muted}; font-size: 11px;")
 
         self._dot.setObjectName("gaugeColorDot")
         self._dot.setFixedSize(self._DOT_SIZE, self._DOT_SIZE)
@@ -1101,16 +1268,22 @@ class _GaugeListEntryWidget(QWidget):
 
         self.set_color(color)
 
+    def apply_theme(self) -> None:
+        self._subtitle.setStyleSheet(f"color: {current_theme(self).muted}; font-size: 11px;")
+        self.set_color(self._color)
+
     def set_color(self, color: str) -> None:
         self._color = color
-        bg = "rgba(0,156,222,26)" if self._simulated else "rgba(60,60,60,120)"
         radius = self._DOT_SIZE // 2
+        theme = current_theme(self)
+        sim_border = "rgba(0,156,222,210)" if self._simulated else color
         self.setStyleSheet(
             "QWidget#gaugeEntry {"
-            f"background: {bg};"
-            f"border: 2px solid {color};"
+            "background: transparent;"
+            f"border: 2px solid {sim_border};"
             "border-radius: 7px;"
             "}"
+            "QWidget#gaugeEntry QLabel { background: transparent; }"
             "QWidget#gaugeEntry QPushButton#gaugeColorDot {"
             f"background: {color};"
             "border: 2px solid rgba(255,255,255,55);"

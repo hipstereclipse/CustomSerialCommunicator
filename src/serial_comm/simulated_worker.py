@@ -21,6 +21,7 @@ import logging
 import math
 import queue as _queue
 import random
+import struct
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -57,6 +58,9 @@ _CC_UNDERRANGE: float = 0.0
 # Noise model tuning — chosen to match spec bullet-point requirements:
 # CDG ±0.05 %, CC ±5 % log-space, Pirani ±1 % mid-range.
 _CC_LOG_NOISE_SIGMA: float = 0.05
+
+# Units considered pressure measurements (mirrors command_utils.PRESSURE_UNITS).
+_PRESSURE_UNITS: frozenset[str] = frozenset({"mbar", "Torr", "torr", "Pa", "hPa", "psi"})
 
 
 class SimulatedGaugeWorker(QThread):
@@ -109,6 +113,7 @@ class SimulatedGaugeWorker(QThread):
         # Keeps the terminal readable without flooding it at high poll rates.
         self._mock_terminal_every: int = max(1, round(2.0 / max(self._poll_interval, 0.05)))
         self._poll_count: int = 0
+        self._cycle_count: int = 0
         self._sim_command_state: dict[str, str] = {}
 
         # Fixed per-sensor calibration-like bias for realism.
@@ -120,6 +125,12 @@ class SimulatedGaugeWorker(QThread):
         # readable command if the spec uses different naming.
         self._primary_command, self._primary_unit = self._pick_primary_command()
         self._init_sim_command_state()
+
+        # Mirror GaugeWorker._commands so callers can duck-type the two workers.
+        self._commands: list[str] = [
+            name for name, cs in self._spec.commands.items()
+            if getattr(cs, "read", False)
+        ]
 
     # ------------------------------------------------------------------
     # Convenience accessors (mirror GaugeWorker so callers can duck-type)
@@ -163,6 +174,13 @@ class SimulatedGaugeWorker(QThread):
         """Pause/resume automatic polling (fake terminal commands still run)."""
         self._polling_enabled = bool(enabled)
 
+    def set_commands(self, commands) -> None:
+        """Replace the automatic polling command list (mirrors GaugeWorker)."""
+        self._commands = [
+            cmd for cmd in commands
+            if cmd in self._spec.commands and getattr(self._spec.commands[cmd], "read", False)
+        ]
+
     # ------------------------------------------------------------------
     # QThread.run — runs on the worker thread
     # ------------------------------------------------------------------
@@ -180,18 +198,21 @@ class SimulatedGaugeWorker(QThread):
             while not self.isInterruptionRequested():
                 self._drain_terminal_queue()
                 if self._polling_enabled:
-                    try:
-                        reading = self._build_reading()
-                        if reading is not None:
-                            self.reading_ready.emit(reading)
-                            self._poll_count += 1
-                            if self._poll_count % self._mock_terminal_every == 0:
-                                self._emit_auto_poll_entry(
-                                    reading.raw, self._primary_command
-                                )
-                    except Exception as exc:                       # pragma: no cover
-                        logger.exception("[%s] simulation error", self._device_id)
-                        self._emit_error(f"Simulation error: {exc}", recoverable=True)
+                    self._cycle_count += 1
+                    emit_terminal = (self._cycle_count % self._mock_terminal_every == 0)
+                    for command in list(self._commands) or [self._primary_command]:
+                        if self.isInterruptionRequested():
+                            break
+                        try:
+                            reading = self._build_reading(command)
+                            if reading is not None:
+                                self.reading_ready.emit(reading)
+                                self._poll_count += 1
+                                if emit_terminal:
+                                    self._emit_auto_poll_entry(reading.raw, command)
+                        except Exception as exc:                   # pragma: no cover
+                            logger.exception("[%s] simulation error", self._device_id)
+                            self._emit_error(f"Simulation error: {exc}", recoverable=True)
                 self._sleep_interruptible(self._poll_interval)
         finally:
             self.disconnected.emit()
@@ -201,22 +222,56 @@ class SimulatedGaugeWorker(QThread):
     # Reading construction
     # ------------------------------------------------------------------
 
-    def _build_reading(self) -> DeviceReading | None:
-        """Sample the engine and build a :class:`DeviceReading`."""
+    def _build_reading(self, command: str | None = None) -> DeviceReading | None:
+        """Sample the engine and build a :class:`DeviceReading` for *command*.
+
+        When *command* is ``None`` the primary command is used (backwards-
+        compatible with callers that were written before multi-command polling).
+        """
+        if command is None:
+            command = self._primary_command
         real_mbar = self._engine.current_real_pressure()
         gas = self._engine.current_gas()
-        modelled = self._apply_response_model(real_mbar, gas, self._primary_command)
         now_mono = time.monotonic()
-        modelled = self._apply_sensor_dynamics(modelled, now_mono)
+
+        cs = self._spec.commands.get(command)
+        unit = (cs.unit if cs is not None else None) or "mbar"
+        is_pressure = unit in _PRESSURE_UNITS
+
+        if is_pressure:
+            value = self._apply_response_model(real_mbar, gas, command)
+            # Apply first-order sensor lag only to the primary command so
+            # multiple sub-sensor reads don't interfere with the lag state.
+            if command == self._primary_command:
+                value = self._apply_sensor_dynamics(value, now_mono)
+        else:
+            value = self._synthesize_non_pressure_value(command, real_mbar)
+
         return DeviceReading(
             device_id=self._device_id,
             timestamp_mono=now_mono,
             timestamp_wall=datetime.now(tz=timezone.utc),
-            value=modelled,
-            unit=self._primary_unit,
-            command=self._primary_command,
-            raw=self._fake_response_bytes(modelled),
+            value=value,
+            unit=unit,
+            command=command,
+            raw=self._fake_response_bytes(value if is_pressure else real_mbar),
         )
+
+    def _synthesize_non_pressure_value(self, command: str, real_mbar: float) -> float:
+        """Return a plausible simulated float for non-pressure telemetry commands."""
+        lname = command.lower()
+        # Temperature: rises slightly with pump-down workload (28–50 °C range).
+        if "temperature" in lname:
+            p = max(real_mbar, 1e-9)
+            norm = max(0.0, min(1.0, (math.log10(p) + 9.0) / 12.0))
+            return 28.0 + norm * 22.0
+        # Status / error / alarm fields: report OK (0).
+        if any(tok in lname for tok in ("error", "status", "fault", "alarm", "state")):
+            return 0.0
+        # Serial / firmware strings: fixed pseudo-unique integer.
+        if any(tok in lname for tok in ("serial", "version", "firmware", "product", "manufacturer")):
+            return float(abs(hash(self._device_id)) % 1_000_000)
+        return 0.0
 
     # ------------------------------------------------------------------
     # Family-specific response models
@@ -477,7 +532,64 @@ class SimulatedGaugeWorker(QThread):
         if protocol == "cdg_serial":
             return self._build_cdg_frame(value)
 
+        if protocol == "inficon_p3_v02":
+            cmd_name = command or self._primary_command
+            cs = self._spec.commands.get(cmd_name)
+            unit = (cs.unit if cs is not None else None) or "mbar"
+            if unit in _PRESSURE_UNITS:
+                display_value = self._apply_response_model(
+                    real, self._engine.current_gas(), cmd_name
+                )
+            else:
+                display_value = self._synthesize_non_pressure_value(cmd_name, real)
+            return self._build_p3v02_fake_response(cmd_name, display_value)
+
         return self._fake_response_bytes(value)
+
+    def _build_p3v02_fake_response(self, command: str, value: float) -> bytes:
+        """Build a valid INFICON P3 V02 read-response frame for *command*."""
+        from serial_comm.protocols.inficon_p3_v02 import (
+            build_frame as _p3_build,
+            CMD_READ_RESP as _P3_RESP,
+        )
+        cs = self._spec.commands.get(command)
+        pid = int(getattr(cs, "pid", 0) or 0) if cs is not None else 0
+        data_type = (
+            (getattr(cs, "data_type", None) or "float32_be").lower()
+            if cs is not None
+            else "float32_be"
+        )
+        payload = self._encode_p3v02_payload(value, data_type, command)
+        # sender_id=0x0B is the OPG550 slave ID; ack=1 marks a slave response.
+        return _p3_build(_P3_RESP, pid, payload, addr=0x00, sender_id=0x0B, ack=1)
+
+    def _encode_p3v02_payload(self, value: float, data_type: str, command: str = "") -> bytes:
+        """Encode *value* as *data_type* bytes for a P3 V02 response payload."""
+        lname = command.lower()
+        if data_type == "float32_be":
+            return struct.pack(">f", float(value))
+        if data_type in ("uint8", "enum_uint8", "bool_uint8"):
+            return bytes([max(0, min(255, int(round(value))))])
+        if data_type == "uint16_be":
+            return struct.pack(">H", max(0, min(65535, int(round(value)))))
+        if data_type == "uint32_be":
+            return struct.pack(">I", max(0, int(round(value))))
+        if data_type == "int32_be":
+            return struct.pack(">i", int(round(value)))
+        if data_type == "string":
+            if any(tok in lname for tok in ("product", "manufacturer")):
+                return f"{self._config.model}".encode("ascii") + b"\x00"
+            if "version" in lname:
+                return b"SIM-1.0\x00"
+            if "serial" in lname:
+                serial = f"SIM{abs(hash(self._device_id)) % 1_000_000:06d}"
+                return serial.encode("ascii") + b"\x00"
+            return b"SIM\x00"
+        if data_type == "uint16_be_array":
+            # Return a minimal 2-element array so the parser sees valid data.
+            return struct.pack(">HH", 0, 0)
+        # Fallback: encode as float32
+        return struct.pack(">f", float(value))
 
     def _init_sim_command_state(self) -> None:
         for name in self._spec.commands:
@@ -621,7 +733,14 @@ class SimulatedGaugeWorker(QThread):
 
         Mirrors the real protocol ``build_request`` framing so the terminal
         displays convincing TX bytes without needing a live serial port.
+        When a real protocol codec is attached to this worker it is used
+        directly so the bytes are byte-perfect.
         """
+        if self._protocol is not None:
+            try:
+                return self._protocol.build_request(command)
+            except Exception:
+                pass  # fall through to manual framing below
         protocol = (self._spec.protocol or "").lower()
         addr = self._spec.default_address
 
@@ -649,7 +768,7 @@ class SimulatedGaugeWorker(QThread):
             # 5-byte read command: START=0x03, service=0x00, addr=0x00, data=0x00, checksum=0x00
             return bytes([0x03, 0x00, 0x00, 0x00, 0x00])
 
-        return f"READ:{command}".encode("ascii")
+        return f"CMD:{command}".encode("ascii")
 
     def _emit_auto_poll_entry(self, response_bytes: bytes, command: str) -> None:
         """Emit a synthetic TX+RX terminal entry representing an automatic poll."""

@@ -14,6 +14,7 @@ import traceback
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from GUI.main_window import MainWindow
+from GUI.theme import apply_theme, saved_theme_name
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -55,6 +56,7 @@ def main() -> None:
     app.setApplicationName("Serial Communicator")
     app.setOrganizationName("INFICON")
     app.setApplicationVersion("2.0.0")
+    apply_theme(app, saved_theme_name())
 
     # Apply persisted settings before creating any windows
     from GUI.settings_dialog import apply_log_level, apply_log_file

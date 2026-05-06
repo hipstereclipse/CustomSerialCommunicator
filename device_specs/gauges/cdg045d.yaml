@@ -6,7 +6,7 @@ protocol: cdg_serial
 # offered in both Torr-native heads (0.1–1000 Torr) and mbar-native heads
 # (0.1–1100 mbar) as distinct calibrations.
 # Change full_scale_mbar to match the actual head installed in your unit.
-full_scale_mbar: 133.3  # default: 100 Torr head (≈133.3 mbar)
+full_scale_mbar: 1.3332  # default: 1 Torr head (≈1.333 mbar)
 # Keep full_scale_options_mbar in sync with the heads actually available;
 # the simulation dialog uses cdg_full_scale_options() from simulation_models.py
 # for the canonical list, so this YAML field is used only by the CDG serial protocol driver.

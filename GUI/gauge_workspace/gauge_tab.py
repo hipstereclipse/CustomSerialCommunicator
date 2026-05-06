@@ -1,40 +1,56 @@
 """
 GaugeTab — one tab in the main window's QTabWidget, per connected gauge.
 
-Contains two sub-tabs:
+Contains sub-tabs:
   "Live View"  — pyqtgraph multi-plot panel with interactive crosshair +
                  per-trace toggle buttons
+    "Command Displays" — dedicated displays for non-pressure polled commands
   "Terminal"   — interactive serial terminal with format selector
 """
 
 from __future__ import annotations
 
+import csv
 import logging
 import math
 import time
 from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QSettings, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QPushButton, QScrollArea, QSizePolicy,
     QProgressBar, QSlider, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
+    QFileDialog, QMessageBox,
     QVBoxLayout, QWidget,
 )
 
-from serial_comm.models import DeviceError, DeviceReading, DeviceSpec
+from serial_comm.models import DeviceError, DeviceReading, DeviceSpec, TerminalEntry
 from serial_comm.opg_spectrum import (
     OPG_ANALYSIS_MAX_PRESSURE_MBAR,
     SpectrumMode,
     identify_optical_species,
+    optical_signature_wavelengths,
     simulate_optical_spectrum,
 )
+from serial_comm.command_utils import command_display_name
 from serial_comm.units import SUPPORTED_UNITS, convert_pressure
+from GUI.gauge_workspace.command_display_panel import CommandDisplayPanel
+from GUI.gauge_workspace.export_dialog import ExportDialog
+from GUI.gauge_workspace.poll_commands_dialog import PollCommandsDialog
 from GUI.gauge_workspace.terminal_widget import TerminalWidget
-from GUI.settings_dialog import display_signals, get_display_unit
+from GUI.settings_dialog import (
+    display_signals,
+    get_display_unit,
+    get_opg_spectrum_verbose_diagnostics,
+    get_setting,
+)
+from GUI.theme import current_theme, style_plot_item, themed_graphics_layout, themed_plot, value_bar_style
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +65,11 @@ _TRACE_COLOURS = [
 _PRESSURE_UNITS = {"mbar", "Torr", "torr", "Pa", "hPa", "psi"}
 _PLOT_HISTORY_S = 120.0
 _MAX_POINTS = 2000
+# Maximum samples retained per peer-pressure trace inside the OPG550
+# Spectrum Studio panel. Streaming gauges such as the CDG can emit >100
+# frames per second, so an unbounded deque previously grew large enough
+# to make every advanced-plot redraw block the GUI thread.
+_PEER_PRESSURE_MAXLEN = 30000
 
 
 # ---------------------------------------------------------------------------
@@ -126,10 +147,7 @@ class PlotPanel(QWidget):
         # ── Crosshair value bar (hidden until mouse hovers) ────────────
         self._value_bar = QLabel()
         self._value_bar.setTextFormat(Qt.TextFormat.RichText)
-        self._value_bar.setStyleSheet(
-            "color:#CCCCCC; font-size:11px; padding:1px 6px;"
-            "background:#2A2A2A; border-top:1px solid #3A3A3A;"
-        )
+        self._value_bar.setStyleSheet(value_bar_style())
         self._value_bar.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._value_bar.setFixedHeight(18)
         self._value_bar.hide()
@@ -137,7 +155,7 @@ class PlotPanel(QWidget):
 
         # ── Plot widget ────────────────────────────────────────────────
         self._glw = pg.GraphicsLayoutWidget()
-        self._glw.setBackground("#1E1E1E")
+        themed_graphics_layout(self._glw)
         self._glw.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
@@ -161,6 +179,12 @@ class PlotPanel(QWidget):
 
         self._plots:  dict[str, pg.PlotItem]     = {}
         self._curves: dict[str, pg.PlotDataItem] = {}
+
+    def apply_theme(self) -> None:
+        themed_graphics_layout(self._glw)
+        self._value_bar.setStyleSheet(value_bar_style())
+        for plot in set(self._plots.values()):
+            style_plot_item(plot)
 
     # ------------------------------------------------------------------
     # Public API
@@ -276,6 +300,7 @@ class PlotPanel(QWidget):
         else:
             label = command.replace("_", " ").title() if command else "Value"
             pi.setLabel("left", label, units=unit)
+        style_plot_item(pi)
 
     def _replay(self) -> None:
         for cmd in self._commands:
@@ -598,9 +623,7 @@ class GaugeSettingsPanel(QWidget):
 
         # ── Fixed top section: polling + auto-query (never scrolls away) ─
         fixed_top = QWidget()
-        fixed_top.setStyleSheet(
-            "QWidget { background: #1A1A1A; border-bottom: 1px solid #333; }"
-        )
+        self._fixed_top = fixed_top
         top_layout = QVBoxLayout(fixed_top)
         top_layout.setContentsMargins(8, 6, 8, 6)
         top_layout.setSpacing(6)
@@ -840,7 +863,7 @@ class GaugeSettingsPanel(QWidget):
         self._setpoint_plot = pg.PlotWidget()
         self._setpoint_plot.setMinimumHeight(260)
         self._setpoint_plot.setMinimumWidth(320)
-        self._setpoint_plot.setBackground("#1E1E1E")
+        themed_plot(self._setpoint_plot)
         # Avoid SI prefix scaling (GTorr/Gmbar)
         self._setpoint_plot.setLabel("left", f"Pressure ({self._display_unit})", units="")
         self._setpoint_plot.setLabel(
@@ -944,7 +967,7 @@ class GaugeSettingsPanel(QWidget):
     def _build_pin_setpoint_preview(self, root: QVBoxLayout) -> None:
         self._pin_setpoint_plot = pg.PlotWidget()
         self._pin_setpoint_plot.setMinimumHeight(200)
-        self._pin_setpoint_plot.setBackground("#181818")
+        themed_plot(self._pin_setpoint_plot)
         self._pin_setpoint_plot.setLabel("bottom", "Index")
         # Avoid SI prefix scaling (GTorr/Gmbar)
         self._pin_setpoint_plot.setLabel("left", f"Pressure ({self._setpoint_preview_unit})", units="")
@@ -958,6 +981,19 @@ class GaugeSettingsPanel(QWidget):
         root.addWidget(self._pin_setpoint_status)
 
         self._refresh_pin_setpoint_plot()
+
+    def apply_theme(self) -> None:
+        theme = current_theme(self)
+        fixed_top = getattr(self, "_fixed_top", None)
+        if fixed_top is not None:
+            fixed_top.setStyleSheet(f"QWidget {{ background: {theme.panel}; border-bottom: 1px solid {theme.border}; }}")
+        if self._setpoint_plot is not None:
+            themed_plot(self._setpoint_plot)
+        if self._pin_setpoint_plot is not None:
+            themed_plot(self._pin_setpoint_plot)
+        self._pin_setpoint_status.setStyleSheet(
+            f"color:{theme.muted}; font-size:11px; font-family: Consolas, monospace;"
+        )
 
     def _refresh_pin_setpoint_plot(self) -> None:
         if self._pin_setpoint_plot is None:
@@ -1760,13 +1796,72 @@ class GaugeSettingsPanel(QWidget):
             self._apply_status_ui("Setpoint 2", sp2_trig, "2", sp2_region)
 
 
-class OPG550ControlPanel(QWidget):
-    """Dedicated OPG550 controls and visual telemetry.
+class OPG550SpectrumStudio(QWidget):
+    """Advanced OPG550 analysis workspace built around the P3 V02 command set."""
 
-    This panel is only attached to OPG550 tabs and surfaces high-value
-    metadata/status commands with one-click actions, plus compact visual
-    indicators tailored to optical Pirani behavior.
-    """
+    _CLAUDE_ORANGE = "#D9772F"
+    _GASES = ("OH", "H2O", "H2", "N2", "O2", "Ar", "He", "CO", "CO2", "CH4")
+    _GAS_COLORS = {
+        "OH": "#FF5B5B",
+        "H2O": "#43C5FF",
+        "H2": "#A18CFF",
+        "N2": "#E8D74C",
+        "O2": "#90D98E",
+        "Ar": "#FFAD5B",
+        "He": "#59E0D6",
+        "CO": "#C48DFF",
+        "CO2": "#C8E07A",
+        "CH4": "#F08AC0",
+    }
+
+    _ANALYSIS_MODES = (
+        "Raw Spectrum",
+        "Rate of Rise",
+        "Residual Gas Detection",
+        "Advanced Analysis",
+    )
+    _RECORD_COMMANDS = {"spec_record", "ror_record", "rgd_record"}
+
+    _POLL_GROUPS = {
+        "Raw Spectrum": (
+            "pressure",
+            "operating_mode",
+            "spectrometer_pixel_count",
+            "spec_state",
+            "spec_record_count",
+            "spec_buffer_size",
+            "spec_record",
+        ),
+        "Rate of Rise": (
+            "pressure",
+            "operating_mode",
+            "ror_state",
+            "ror_record_count",
+            "ror_buffer_size",
+            "ror_record",
+        ),
+        "Residual Gas Detection": (
+            "pressure",
+            "operating_mode",
+            "rgd_state",
+            "rgd_record_count",
+            "rgd_buffer_size",
+            "rgd_record",
+            "analog_output_mode",
+            "analog_output_voltage",
+        ),
+        "Advanced Analysis": (
+            "pressure",
+            "operating_mode",
+            "spec_state",
+            "ror_state",
+            "rgd_state",
+            "spec_record",
+            "analog_output_mode",
+            "analog_output_voltage",
+            "error_status",
+        ),
+    }
 
     def __init__(self, spec: DeviceSpec, worker, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1780,40 +1875,141 @@ class OPG550ControlPanel(QWidget):
         self._pressure_value = QLabel(f"- {self._display_unit}")
         self._temperature_value = QLabel("- °C")
         self._pressure_quality = QLabel("Vacuum quality: -")
-        self._molecule_label = QLabel("Likely molecules: -")
+        self._molecule_label = QLabel("Likely optical gas signatures: -")
+        self._mode_status = QLabel("Mode status: -")
+        self._delta_label = QLabel("Delta: -")
+        self._plasma_status = QLabel("Plasma: -")
 
         self._vacuum_bar = QProgressBar()
         self._temperature_bar = QProgressBar()
         self._spectrum_mode = SpectrumMode.AUTO
+        self._analysis_mode = "Raw Spectrum"
 
-        self._trend_t: deque[float] = deque(maxlen=360)
-        self._trend_p: deque[float] = deque(maxlen=360)
+        # Time/value buffers are intentionally unbounded so the user keeps the
+        # complete session history (matches the explicit request to plot all
+        # samples instead of dropping the oldest).
+        self._trend_t: deque[float] = deque()
+        self._trend_p: deque[float] = deque()
         self._trend_t0: float | None = None
+        self._gas_t: deque[float] = deque()
+        self._gas_pct: dict[str, deque[float]] = {
+            gas: deque() for gas in self._GASES
+        }
+        self._gas_partial_mbar: dict[str, deque[float]] = {
+            gas: deque() for gas in self._GASES
+        }
+        self._gas_rate_mbar_s: dict[str, deque[float]] = {
+            gas: deque() for gas in self._GASES
+        }
+        self._peer_t0: float | None = None
+        self._peer_pressures: dict[str, dict[str, object]] = {}
+        self._latest_gas_pct: dict[str, float] = {gas: 0.0 for gas in self._GASES}
+
         self._trend_plot: pg.PlotWidget | None = None
         self._trend_curve: pg.PlotDataItem | None = None
+        self._trend_gas_curves: dict[str, pg.PlotDataItem] = {}
+        self._trend_right_view: pg.ViewBox | None = None
+        self._trend_pressure_curve: pg.PlotDataItem | None = None
         self._spectrum_plot: pg.PlotWidget | None = None
         self._spectrum_curve: pg.PlotDataItem | None = None
+        self._spectrum_right_view: pg.ViewBox | None = None
+        self._spectrum_pressure_curve: pg.PlotDataItem | None = None
+        self._spectrum_gas_markers: list[pg.InfiniteLine] = []
+        self._gas_plot: pg.PlotWidget | None = None
+        self._gas_curves: dict[str, pg.PlotDataItem] = {}
+        self._gas_right_view: pg.ViewBox | None = None
+        self._gas_pressure_curve: pg.PlotDataItem | None = None
+        self._advanced_plot: pg.PlotWidget | None = None
+        self._advanced_curve_a: pg.PlotDataItem | None = None
+        self._advanced_curve_b: pg.PlotDataItem | None = None
+        self._advanced_fill: pg.FillBetweenItem | None = None
+        self._advanced_right_view: pg.ViewBox | None = None
+        self._advanced_gas_curve: pg.PlotDataItem | None = None
+        self._advanced_legend: pg.LegendItem | None = None
+
+        self._analysis_combo: QComboBox | None = None
+        self._compare_a_label: QLabel | None = None
+        self._compare_a_combo: QComboBox | None = None
+        self._compare_b_label: QLabel | None = None
+        self._compare_b_combo: QComboBox | None = None
+        self._correlation_gas_label: QLabel | None = None
+        self._correlation_gas_combo: QComboBox | None = None
+        self._gas_checks: dict[str, QCheckBox] = {}
+        self._telemetry_rows: dict[str, QLabel] = {}
         self._spectrum_user_zoomed: bool = False
         self._spectrum_reset_btn: QPushButton | None = None
         self._spectrum_mode_desc: QLabel | None = None
         self._last_pressure_mbar: float | None = None
         self._last_pressure_t: float | None = None
+        # Rolling window of recent mbar readings used for spike rejection.
+        self._pressure_mbar_window: deque[float] = deque(maxlen=5)
+        self._latest_spectrum_x: np.ndarray | None = None
+        self._latest_spectrum_y: np.ndarray | None = None
+        self._live_spectrum_x: np.ndarray | None = None
+        self._live_spectrum_y: np.ndarray | None = None
+        self._opg_export_samples: list[dict[str, object]] = []
+        self._chart_boxes: dict[str, QWidget] = {}
+        self._gas_box: QWidget | None = None
+        self._studio_title: QLabel | None = None
+        self._studio_subtitle: QLabel | None = None
+        self._section_frames: list[QFrame] = []
+        self._metric_title_labels: list[QLabel] = []
+        self._metric_value_labels: list[QLabel] = []
+        self._studio_value_bar: QLabel | None = None
+        self._studio_crosshairs: dict[int, pg.InfiniteLine] = {}  # id(PlotWidget) -> line
+        self._studio_proxies: list[pg.SignalProxy] = []
+        self._last_spec_request_t: float | None = None
+        self._active_opg_algorithm: str | None = None
+        self._last_opg_activation_t: float | None = None
+        self._opg_record_counts: dict[str, int | None] = {
+            "spec_record": None,
+            "ror_record": None,
+            "rgd_record": None,
+        }
+        self._live_spec_timer = QTimer(self)
+        self._live_spec_timer.setInterval(2000)
+        self._live_spec_timer.timeout.connect(self._request_live_spec_if_due)
+
+        # Coalesced chart-refresh scheduler. Multiple calls to
+        # _refresh_mode_plots inside a single Qt event-loop tick collapse to
+        # one redraw, which keeps the UI responsive when many tracked gases
+        # are enabled.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(120)
+        self._refresh_timer.timeout.connect(self._do_refresh_mode_plots)
+        self._refresh_pending: bool = False
+
+        # Auto-plasma state. Defaults are loaded from QSettings ("opg/...")
+        # and the user can override them per-session via the Spectrum Studio
+        # "Plasma Ignition" panel.
+        self._auto_plasma_enabled: bool = bool(get_setting("opg/auto_plasma_enabled"))
+        self._auto_plasma_min_mbar: float = float(get_setting("opg/min_ignition_pressure_mbar"))
+        self._auto_plasma_max_mbar: float = float(get_setting("opg/max_safe_pressure_mbar"))
+        self._last_plasma_state: int | None = None  # 0=off, 1=on-not-ignited, 2=ignited
+        self._auto_plasma_last_action_t: float = 0.0
+        self._initial_plasma_read_done: bool = False
+        self._pending_plasma_target: int | None = None
+        self._auto_plasma_chk: QCheckBox | None = None
+        self._auto_plasma_min_spin: QDoubleSpinBox | None = None
+        self._auto_plasma_max_spin: QDoubleSpinBox | None = None
 
         self._build_ui()
+        self._live_spec_timer.start()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        title = QLabel("OPG550 Optical Pirani Studio")
-        title.setStyleSheet("font-size: 14px; font-weight: 700; color: #E6F4FF;")
-        subtitle = QLabel(
-            "Fast access to identity, diagnostics, thermal state, and vacuum regime."
+        self._studio_title = QLabel("Spectrum Studio")
+        self._studio_title.setStyleSheet("font-size: 14px; font-weight: 700;")
+        self._studio_subtitle = QLabel(
+            "OPG550 SPEC, RoR, RGD, analog-output, and pressure-correlation analysis."
         )
-        subtitle.setStyleSheet("font-size: 11px; color: #8FA9BA;")
-        root.addWidget(title)
-        root.addWidget(subtitle)
+        self._studio_subtitle.setStyleSheet("font-size: 11px;")
+        root.addWidget(self._studio_title)
+        root.addWidget(self._studio_subtitle)
 
         body = QSplitter(Qt.Orientation.Horizontal)
         body.setChildrenCollapsible(False)
@@ -1825,59 +2021,74 @@ class OPG550ControlPanel(QWidget):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(6)
 
-        trend_box = QFrame()
-        trend_box.setStyleSheet(
-            "QFrame { background: #141414; border: 1px solid #2F3C47; border-radius: 8px; }"
-        )
-        trend_layout = QVBoxLayout(trend_box)
+        self._trend_box = QFrame()
+        trend_layout = QVBoxLayout(self._trend_box)
         trend_layout.setContentsMargins(10, 8, 10, 8)
         trend_layout.setSpacing(6)
-        trend_title = QLabel("Pressure Trend")
-        trend_title.setStyleSheet("font-weight: 600; color: #D8E2EA;")
-        trend_layout.addWidget(trend_title)
+        trend_title = QLabel("Rate of Rise / OPG550 Pressure")
+        trend_title.setStyleSheet("font-weight: 600;")
+        trend_hdr = QHBoxLayout()
+        trend_hdr.addWidget(trend_title)
+        trend_hdr.addStretch()
+        trend_export = QPushButton("Export CSV")
+        trend_export.setToolTip("Save the trend chart's pressure history to a CSV file")
+        trend_export.clicked.connect(self._export_trend_csv)
+        trend_hdr.addWidget(trend_export)
+        trend_layout.addLayout(trend_hdr)
 
         self._trend_plot = pg.PlotWidget()
         self._trend_plot.setMinimumHeight(170)
-        self._trend_plot.setBackground("#121619")
-        # Avoid SI prefix scaling by building our own label
-        self._trend_plot.setLabel("left", f"Pressure ({self._display_unit})", units="")
+        themed_plot(self._trend_plot)
+        self._pad_plot_axes(self._trend_plot)
+        self._trend_plot.setLabel("left", "Rate of rise", units=f"{self._display_unit}/s")
         self._trend_plot.setLabel("bottom", "Time", units="s")
-        self._trend_plot.setLogMode(y=True)
         self._trend_plot.showGrid(x=True, y=True, alpha=0.22)
         self._trend_curve = self._trend_plot.plot(
             pen=pg.mkPen("#43C5FF", width=2)
         )
+        for gas in self._GASES:
+            curve = self._trend_plot.plot(pen=pg.mkPen(self._GAS_COLORS[gas], width=2), name=gas)
+            curve.setVisible(False)
+            self._trend_gas_curves[gas] = curve
+        self._trend_right_view, self._trend_pressure_curve = self._setup_right_axis(
+            self._trend_plot,
+            f"OPG Pressure ({self._display_unit})",
+            "#43C5FF",
+        )
         trend_layout.addWidget(self._trend_plot)
 
-        spectrum_box = QFrame()
-        spectrum_box.setStyleSheet(
-            "QFrame { background: #121816; border: 1px solid #2F3C47; border-radius: 8px; }"
-        )
-        spectrum_layout = QVBoxLayout(spectrum_box)
+        self._spectrum_box = QFrame()
+        spectrum_layout = QVBoxLayout(self._spectrum_box)
         spectrum_layout.setContentsMargins(10, 8, 10, 8)
         spectrum_layout.setSpacing(6)
 
         spectrum_hdr = QHBoxLayout()
-        spectrum_title = QLabel("Virtual Spectrum")
-        spectrum_title.setStyleSheet("font-weight: 600; color: #D8E2EA;")
+        spectrum_title = QLabel("Raw Optical Spectrum")
+        spectrum_title.setStyleSheet("font-weight: 600;")
         spectrum_hdr.addWidget(spectrum_title)
         spectrum_hdr.addStretch()
-        spectrum_hdr.addWidget(QLabel("Mode"))
+        spectrum_hdr.addWidget(QLabel("Plot options"))
         self._spectrum_mode_combo = QComboBox()
         for mode in SpectrumMode:
-            self._spectrum_mode_combo.addItem(mode.value, mode)
+            label = "Live Data" if mode is SpectrumMode.AUTO else mode.value
+            self._spectrum_mode_combo.addItem(label, mode)
         self._spectrum_mode_combo.currentIndexChanged.connect(self._on_spectrum_mode_changed)
         spectrum_hdr.addWidget(self._spectrum_mode_combo)
+        spectrum_export = QPushButton("Export CSV")
+        spectrum_export.setToolTip("Save the most recent spectrum (wavelength vs intensity) to a CSV file")
+        spectrum_export.clicked.connect(self._export_spectrum_csv)
+        spectrum_hdr.addWidget(spectrum_export)
         spectrum_layout.addLayout(spectrum_hdr)
 
         self._spectrum_mode_desc = QLabel(self._spectrum_mode_description(SpectrumMode.AUTO))
-        self._spectrum_mode_desc.setStyleSheet("color:#7FAABB; font-size:10px; font-style:italic;")
+        self._spectrum_mode_desc.setStyleSheet("font-size:10px; font-style:italic;")
         self._spectrum_mode_desc.setWordWrap(True)
         spectrum_layout.addWidget(self._spectrum_mode_desc)
 
         self._spectrum_plot = pg.PlotWidget()
         self._spectrum_plot.setMinimumHeight(160)
-        self._spectrum_plot.setBackground("#101316")
+        themed_plot(self._spectrum_plot)
+        self._pad_plot_axes(self._spectrum_plot)
         self._spectrum_plot.setLabel("left", "Relative optical intensity")
         self._spectrum_plot.setLabel("bottom", "Wavelength", units="nm")
         self._spectrum_plot.showGrid(x=True, y=True, alpha=0.2)
@@ -1886,6 +2097,11 @@ class OPG550ControlPanel(QWidget):
             fillLevel=0.0,
             brush=pg.mkBrush(144, 217, 142, 90),
         )
+        self._spectrum_right_view, self._spectrum_pressure_curve = self._setup_right_axis(
+            self._spectrum_plot,
+            f"OPG Pressure ({self._display_unit})",
+            "#43C5FF",
+        )
         self._spectrum_user_zoomed = False
         self._spectrum_plot.getViewBox().sigRangeChangedManually.connect(
             self._on_spectrum_range_manual
@@ -1893,24 +2109,108 @@ class OPG550ControlPanel(QWidget):
         self._spectrum_reset_btn = QPushButton("A")
         self._spectrum_reset_btn.setToolTip("Reset spectrum view to auto-scale")
         self._spectrum_reset_btn.setFixedSize(24, 24)
-        self._spectrum_reset_btn.setStyleSheet(
-            "QPushButton { background: #2A3A2A; color: #90D98E; border: 1px solid #3E6E4D;"
-            " border-radius: 4px; font-weight: bold; font-size: 11px; }"
-            "QPushButton:hover { background: #3A5A3A; }"
-        )
         self._spectrum_reset_btn.hide()
         self._spectrum_reset_btn.clicked.connect(self._on_spectrum_reset_view)
         spectrum_hdr.addWidget(self._spectrum_reset_btn)
         spectrum_layout.addWidget(self._spectrum_plot)
 
+        self._gas_box = QFrame()
+        gas_layout = QVBoxLayout(self._gas_box)
+        gas_layout.setContentsMargins(10, 8, 10, 8)
+        gas_layout.setSpacing(6)
+        gas_title = QLabel("Tracked Gas Analysis")
+        gas_title.setStyleSheet("font-weight: 600;")
+        gas_hdr = QHBoxLayout()
+        gas_hdr.addWidget(gas_title)
+        gas_hdr.addStretch()
+        gas_export = QPushButton("Export CSV")
+        gas_export.setToolTip("Save the tracked-gas partial-pressure history to a CSV file")
+        gas_export.clicked.connect(self._export_gas_csv)
+        gas_hdr.addWidget(gas_export)
+        gas_layout.addLayout(gas_hdr)
+        self._gas_plot = pg.PlotWidget()
+        self._gas_plot.setMinimumHeight(135)
+        themed_plot(self._gas_plot)
+        self._pad_plot_axes(self._gas_plot)
+        self._gas_plot.setLabel("left", "Partial pressure", units=self._display_unit)
+        self._gas_plot.setLabel("bottom", "Time", units="s")
+        self._gas_plot.showGrid(x=True, y=True, alpha=0.18)
+        for gas in self._GASES:
+            curve = self._gas_plot.plot(
+                pen=pg.mkPen(self._GAS_COLORS[gas], width=2),
+                name=gas,
+            )
+            self._gas_curves[gas] = curve
+        self._gas_right_view, self._gas_pressure_curve = self._setup_right_axis(
+            self._gas_plot,
+            f"OPG Pressure ({self._display_unit})",
+            "#43C5FF",
+        )
+        gas_layout.addWidget(self._gas_plot)
+
+        self._advanced_box = QFrame()
+        advanced_layout = QVBoxLayout(self._advanced_box)
+        advanced_layout.setContentsMargins(10, 8, 10, 8)
+        advanced_layout.setSpacing(6)
+        advanced_title = QLabel("Advanced Gauge Correlation")
+        advanced_title.setStyleSheet("font-weight: 600;")
+        advanced_hdr = QHBoxLayout()
+        advanced_hdr.addWidget(advanced_title)
+        advanced_hdr.addStretch()
+        advanced_export = QPushButton("Export CSV")
+        advanced_export.setToolTip("Save the advanced correlation chart series to a CSV file")
+        advanced_export.clicked.connect(self._export_advanced_csv)
+        advanced_hdr.addWidget(advanced_export)
+        advanced_layout.addLayout(advanced_hdr)
+        self._advanced_plot = pg.PlotWidget()
+        self._advanced_plot.setMinimumHeight(170)
+        themed_plot(self._advanced_plot)
+        self._pad_plot_axes(self._advanced_plot)
+        self._advanced_plot.setLabel("left", f"Pressure ({self._display_unit})")
+        self._advanced_plot.setLabel("bottom", "Time", units="s")
+        self._advanced_plot.setLogMode(y=True)
+        self._advanced_plot.showGrid(x=True, y=True, alpha=0.18)
+        self._advanced_legend = self._advanced_plot.getPlotItem().addLegend(offset=(10, 10))
+        self._advanced_curve_a = self._advanced_plot.plot(pen=pg.mkPen("#43C5FF", width=2), name="Source A")
+        self._advanced_curve_b = self._advanced_plot.plot(pen=pg.mkPen("#E8D74C", width=2), name="Source B")
+        self._advanced_fill = pg.FillBetweenItem(
+            self._advanced_curve_a,
+            self._advanced_curve_b,
+            brush=pg.mkBrush(255, 91, 91, 45),
+        )
+        self._advanced_plot.addItem(self._advanced_fill)
+        self._setup_advanced_right_axis()
+        advanced_layout.addWidget(self._advanced_plot)
+        self._delta_label.setStyleSheet("font-weight:600;")
+        advanced_layout.addWidget(self._delta_label)
+
         charts_splitter = QSplitter(Qt.Orientation.Vertical)
         charts_splitter.setChildrenCollapsible(False)
-        charts_splitter.addWidget(trend_box)
-        charts_splitter.addWidget(spectrum_box)
-        charts_splitter.setStretchFactor(0, 3)
-        charts_splitter.setStretchFactor(1, 2)
-        charts_splitter.setSizes([320, 220])
+        charts_splitter.addWidget(self._advanced_box)
+        charts_splitter.addWidget(self._trend_box)
+        charts_splitter.addWidget(self._spectrum_box)
+        charts_splitter.addWidget(self._gas_box)
+        charts_splitter.setStretchFactor(0, 2)
+        charts_splitter.setStretchFactor(1, 3)
+        charts_splitter.setStretchFactor(2, 3)
+        charts_splitter.setStretchFactor(3, 2)
+        charts_splitter.setSizes([190, 260, 250, 170])
+
+        self._studio_value_bar = QLabel()
+        self._studio_value_bar.setTextFormat(Qt.TextFormat.RichText)
+        self._studio_value_bar.setStyleSheet(value_bar_style())
+        self._studio_value_bar.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._studio_value_bar.setFixedHeight(18)
+        self._studio_value_bar.hide()
         left_layout.addWidget(charts_splitter, 1)
+        left_layout.addWidget(self._studio_value_bar)
+        self._chart_boxes = {
+            "Rate of Rise": self._trend_box,
+            "Raw Spectrum": self._spectrum_box,
+            "Residual Gas Detection": self._gas_box,
+            "Advanced Analysis": self._advanced_box,
+        }
+        self._section_frames.extend([self._trend_box, self._spectrum_box, self._gas_box, self._advanced_box])
 
         # Right side: controls + device info.
         right_scroll = QScrollArea()
@@ -1922,26 +2222,166 @@ class OPG550ControlPanel(QWidget):
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(8)
 
-        actions = QFrame()
-        actions.setStyleSheet(
-            "QFrame { background: #1B232A; border: 1px solid #2E3F4D; border-radius: 8px; }"
-        )
-        actions_layout = QGridLayout(actions)
+        self._mode_box = QFrame()
+        mode_layout = QGridLayout(self._mode_box)
+        mode_layout.setContentsMargins(8, 8, 8, 8)
+        mode_layout.setHorizontalSpacing(6)
+        mode_layout.setVerticalSpacing(6)
+        mode_layout.addWidget(QLabel("Main plot"), 0, 0)
+        self._analysis_combo = QComboBox()
+        self._analysis_combo.addItems(self._ANALYSIS_MODES)
+        self._analysis_combo.currentTextChanged.connect(self._on_analysis_mode_changed)
+        mode_layout.addWidget(self._analysis_combo, 0, 1)
+        self._compare_a_label = QLabel("Compare A")
+        mode_layout.addWidget(self._compare_a_label, 1, 0)
+        self._compare_a_combo = QComboBox()
+        self._compare_a_combo.currentIndexChanged.connect(self._refresh_advanced_plot)
+        mode_layout.addWidget(self._compare_a_combo, 1, 1)
+        self._compare_b_label = QLabel("Compare B")
+        mode_layout.addWidget(self._compare_b_label, 2, 0)
+        self._compare_b_combo = QComboBox()
+        self._compare_b_combo.currentIndexChanged.connect(self._refresh_advanced_plot)
+        mode_layout.addWidget(self._compare_b_combo, 2, 1)
+        self._correlation_gas_label = QLabel("Right axis gas")
+        mode_layout.addWidget(self._correlation_gas_label, 3, 0)
+        self._correlation_gas_combo = QComboBox()
+        for gas in self._GASES:
+            self._correlation_gas_combo.addItem(gas, gas)
+        self._correlation_gas_combo.setCurrentText("OH")
+        self._correlation_gas_combo.currentIndexChanged.connect(self._refresh_advanced_plot)
+        mode_layout.addWidget(self._correlation_gas_combo, 3, 1)
+        self._mode_status.setWordWrap(True)
+        self._mode_status.setStyleSheet("font-size:11px;")
+        mode_layout.addWidget(self._mode_status, 4, 0, 1, 2)
+        right.addWidget(self._mode_box)
+
+        gas_select = QGroupBox("Track Gases")
+        gas_grid = QGridLayout(gas_select)
+        for idx, gas in enumerate(self._GASES):
+            check = QCheckBox(gas)
+            check.setChecked(False)
+            check.toggled.connect(self._refresh_mode_plots)
+            check.toggled.connect(lambda _checked: self._sync_chart_visibility())
+            self._gas_checks[gas] = check
+            gas_grid.addWidget(check, idx // 2, idx % 2)
+        right.addWidget(gas_select)
+
+        self._actions_box = QFrame()
+        actions_layout = QGridLayout(self._actions_box)
         actions_layout.setContentsMargins(8, 8, 8, 8)
         actions_layout.setHorizontalSpacing(6)
         actions_layout.setVerticalSpacing(6)
-        for idx, (label, command) in enumerate((
+        action_defs = [
+            ("Poll Mode", "_poll_mode"),
             ("Snapshot All", "_snapshot"),
+            ("Export CSV", "_export_opg_csv"),
             ("Read Error", "error_status"),
             ("Read Firmware", "software_version"),
             ("Read Serial", "serial_number"),
-            ("Read Temperature", "temperature"),
-        )):
+            ("Analog Out", "analog_output_voltage"),
+        ]
+        visible_actions = [
+            item for item in action_defs
+            if item[1] in {"_snapshot", "_poll_mode", "_export_opg_csv"}
+            or item[1] in self._spec.commands
+        ]
+        for idx, (label, command) in enumerate(visible_actions):
             btn = QPushButton(label)
             btn.setMinimumHeight(28)
             btn.clicked.connect(lambda _=False, c=command: self._on_action(c))
             actions_layout.addWidget(btn, idx // 2, idx % 2)
-        right.addWidget(actions)
+        right.addWidget(self._actions_box)
+
+        self._plasma_box = QFrame()
+        plasma_layout = QVBoxLayout(self._plasma_box)
+        plasma_layout.setContentsMargins(8, 8, 8, 8)
+        plasma_layout.setSpacing(6)
+        plasma_title = QLabel("Plasma Ignition")
+        plasma_title.setStyleSheet("font-weight:600;")
+        plasma_layout.addWidget(plasma_title)
+        self._plasma_status.setStyleSheet("font-size:11px;")
+        self._plasma_status.setWordWrap(True)
+        plasma_layout.addWidget(self._plasma_status)
+        plasma_row = QHBoxLayout()
+        plasma_on = QPushButton("On")
+        plasma_on.setEnabled("plasma_enable" in self._spec.commands)
+        plasma_on.clicked.connect(lambda _=False: self._on_action("_plasma_on"))
+        plasma_off = QPushButton("Off")
+        plasma_off.setEnabled("plasma_enable" in self._spec.commands)
+        plasma_off.clicked.connect(lambda _=False: self._on_action("_plasma_off"))
+        plasma_read = QPushButton("Read")
+        plasma_read.setEnabled("plasma_state" in self._spec.commands)
+        plasma_read.clicked.connect(lambda _=False: self._send_query("plasma_state"))
+        plasma_row.addWidget(plasma_on)
+        plasma_row.addWidget(plasma_off)
+        plasma_row.addWidget(plasma_read)
+        plasma_layout.addLayout(plasma_row)
+
+        # Auto-plasma controls. Defaults come from the global Settings dialog
+        # (opg/auto_plasma_enabled etc.) but the user can tweak per-session
+        # values here; changes are persisted back to QSettings.
+        self._auto_plasma_chk = QCheckBox("Auto plasma based on pressure")
+        self._auto_plasma_chk.setEnabled(
+            "plasma_enable" in self._spec.commands and "plasma_state" in self._spec.commands
+        )
+        self._auto_plasma_chk.setChecked(self._auto_plasma_enabled)
+        self._auto_plasma_chk.toggled.connect(self._on_auto_plasma_toggled)
+        plasma_layout.addWidget(self._auto_plasma_chk)
+
+        thresh_row = QGridLayout()
+        thresh_row.setHorizontalSpacing(6)
+        thresh_row.setVerticalSpacing(4)
+        thresh_row.addWidget(QLabel("Min ignite (mbar)"), 0, 0)
+        self._auto_plasma_min_spin = QDoubleSpinBox()
+        self._auto_plasma_min_spin.setDecimals(2)
+        self._auto_plasma_min_spin.setRange(1e-12, 1e3)
+        self._auto_plasma_min_spin.setStepType(
+            QDoubleSpinBox.StepType.AdaptiveDecimalStepType
+        )
+        self._auto_plasma_min_spin.setValue(self._auto_plasma_min_mbar)
+        self._auto_plasma_min_spin.valueChanged.connect(self._on_auto_plasma_min_changed)
+        thresh_row.addWidget(self._auto_plasma_min_spin, 0, 1)
+        thresh_row.addWidget(QLabel("Max safe (mbar)"), 1, 0)
+        self._auto_plasma_max_spin = QDoubleSpinBox()
+        self._auto_plasma_max_spin.setDecimals(2)
+        self._auto_plasma_max_spin.setRange(1e-12, 1e3)
+        self._auto_plasma_max_spin.setStepType(
+            QDoubleSpinBox.StepType.AdaptiveDecimalStepType
+        )
+        self._auto_plasma_max_spin.setValue(self._auto_plasma_max_mbar)
+        self._auto_plasma_max_spin.valueChanged.connect(self._on_auto_plasma_max_changed)
+        thresh_row.addWidget(self._auto_plasma_max_spin, 1, 1)
+        plasma_layout.addLayout(thresh_row)
+
+        right.insertWidget(0, self._plasma_box)
+
+        telemetry = QGroupBox("Manual Telemetry")
+        telemetry_layout = QGridLayout(telemetry)
+        telemetry_commands = [
+            "operating_mode",
+            "bootloader_version",
+            "spec_state",
+            "spec_record_count",
+            "ror_state",
+            "ror_record_count",
+            "rgd_state",
+            "rgd_record_count",
+            "analog_output_mode",
+            "analog_output_voltage",
+            "error_count",
+        ]
+        row = 0
+        for command in telemetry_commands:
+            if command not in self._spec.commands:
+                continue
+            label = QLabel(command.replace("_", " ").title())
+            value = QLabel("-")
+            value.setStyleSheet("font-family: Consolas, monospace;")
+            self._telemetry_rows[command] = value
+            telemetry_layout.addWidget(label, row, 0)
+            telemetry_layout.addWidget(value, row, 1)
+            row += 1
+        right.addWidget(telemetry)
 
         cards = QGridLayout()
         cards.setHorizontalSpacing(10)
@@ -1963,31 +2403,25 @@ class OPG550ControlPanel(QWidget):
         meta_layout.addWidget(self._sn_value, 1, 1)
         right.addWidget(compact_meta)
 
-        status_box = QFrame()
-        status_box.setStyleSheet(
-            "QFrame { background: #1B232A; border: 1px solid #2E3F4D; border-radius: 8px; }"
-        )
-        sv = QVBoxLayout(status_box)
+        self._status_box = QFrame()
+        sv = QVBoxLayout(self._status_box)
         sv.setContentsMargins(10, 8, 10, 8)
         sv.setSpacing(5)
         err_title = QLabel("Error Status")
-        err_title.setStyleSheet("font-weight: 600; color: #D8E2EA;")
-        self._err_value.setStyleSheet("font-family: Consolas, monospace; color: #F9C6C6;")
+        err_title.setStyleSheet("font-weight: 600;")
+        self._err_value.setStyleSheet("font-family: Consolas, monospace;")
         sv.addWidget(err_title)
         sv.addWidget(self._err_value)
         self._err_value.setVisible(False)
-        right.addWidget(status_box)
+        right.addWidget(self._status_box)
 
-        health = QFrame()
-        health.setStyleSheet(
-            "QFrame { background: #1A1A1A; border: 1px solid #333; border-radius: 8px; }"
-        )
-        hv = QVBoxLayout(health)
+        self._health_box = QFrame()
+        hv = QVBoxLayout(self._health_box)
         hv.setContentsMargins(10, 8, 10, 10)
         hv.setSpacing(8)
 
         vacuum_title = QLabel("Vacuum Regime")
-        vacuum_title.setStyleSheet("font-weight: 600; color: #D8E2EA;")
+        vacuum_title.setStyleSheet("font-weight: 600;")
         hv.addWidget(vacuum_title)
 
         self._vacuum_bar.setRange(0, 1000)
@@ -2005,11 +2439,11 @@ class OPG550ControlPanel(QWidget):
             "}"
         )
         hv.addWidget(self._vacuum_bar)
-        self._pressure_quality.setStyleSheet("color: #AFC7D6; font-size: 11px;")
+        self._pressure_quality.setStyleSheet("font-size: 11px;")
         hv.addWidget(self._pressure_quality)
 
         temp_title = QLabel("Sensor Thermal Load")
-        temp_title.setStyleSheet("font-weight: 600; color: #D8E2EA;")
+        temp_title.setStyleSheet("font-weight: 600;")
         hv.addWidget(temp_title)
         self._temperature_bar.setRange(0, 1200)
         self._temperature_bar.setValue(0)
@@ -2027,12 +2461,13 @@ class OPG550ControlPanel(QWidget):
         )
         hv.addWidget(self._temperature_bar)
 
-        self._molecule_label.setStyleSheet("color:#CFE6D5; font-size:11px;")
+        self._molecule_label.setStyleSheet("font-size:11px;")
         self._molecule_label.setWordWrap(True)
         hv.addWidget(self._molecule_label)
 
-        right.addWidget(health)
+        right.addWidget(self._health_box)
         right.addStretch()
+        self._section_frames.extend([self._mode_box, self._actions_box, self._plasma_box, self._status_box, self._health_box])
 
         right_scroll.setWidget(right_panel)
 
@@ -2043,13 +2478,408 @@ class OPG550ControlPanel(QWidget):
         body.setSizes([860, 420])
 
         root.addWidget(body, 1)
+        self._refresh_peer_combos()
+        self._on_analysis_mode_changed(self._analysis_mode)
+        self._setup_studio_crosshairs()
+        self.apply_theme()
+
+    @staticmethod
+    def _pad_plot_axes(plot: pg.PlotWidget) -> None:
+        plot_item = plot.getPlotItem()
+        try:
+            plot_item.setContentsMargins(10, 8, 18, 12)
+        except Exception:
+            pass
+        for axis_name, size in (("left", 74), ("right", 74), ("bottom", 34)):
+            try:
+                axis = plot_item.getAxis(axis_name)
+                if axis_name == "bottom":
+                    axis.setHeight(size)
+                else:
+                    axis.setWidth(size)
+            except Exception:
+                pass
+
+    def apply_theme(self) -> None:
+        theme = current_theme(self)
+        frame_style = (
+            f"QFrame {{ background:{theme.panel}; border:1px solid {theme.border}; border-radius:8px; }}"
+        )
+        for frame in self._section_frames:
+            frame.setStyleSheet(frame_style)
+        if self._studio_title is not None:
+            self._studio_title.setStyleSheet(f"font-size:14px; font-weight:700; color:{theme.text};")
+        if self._studio_subtitle is not None:
+            self._studio_subtitle.setStyleSheet(f"font-size:11px; color:{theme.muted};")
+        if self._spectrum_mode_desc is not None:
+            self._spectrum_mode_desc.setStyleSheet(f"color:{theme.muted}; font-size:10px; font-style:italic;")
+        if self._studio_value_bar is not None:
+            self._studio_value_bar.setStyleSheet(value_bar_style())
+        self._mode_status.setStyleSheet(f"color:{theme.muted}; font-size:11px;")
+        self._plasma_status.setStyleSheet(f"color:{theme.muted}; font-size:11px;")
+        self._pressure_quality.setStyleSheet(f"color:{theme.muted}; font-size:11px;")
+        self._molecule_label.setStyleSheet(f"color:{theme.success_fg}; font-size:11px;")
+        self._delta_label.setStyleSheet(f"color:{theme.danger_fg}; font-weight:600;")
+        self._err_value.setStyleSheet(f"font-family: Consolas, monospace; color:{theme.danger_fg};")
+        for value in self._telemetry_rows.values():
+            value.setStyleSheet(f"font-family: Consolas, monospace; color:{theme.text};")
+        for label in self._metric_title_labels:
+            label.setStyleSheet(f"font-size: 11px; color: {theme.muted};")
+        for label in self._metric_value_labels:
+            label.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {theme.text};")
+
+        if self._spectrum_reset_btn is not None:
+            self._spectrum_reset_btn.setStyleSheet(
+                f"QPushButton {{ background:{theme.control}; color:{theme.text}; border:1px solid {theme.border};"
+                " border-radius:4px; font-weight:bold; font-size:11px; }"
+                f"QPushButton:hover {{ background:{theme.control_hover}; }}"
+            )
+
+        for plot in (
+            self._trend_plot,
+            self._spectrum_plot,
+            self._gas_plot,
+            self._advanced_plot,
+        ):
+            if plot is not None:
+                themed_plot(plot)
+                self._pad_plot_axes(plot)
+
+        for gas, check in self._gas_checks.items():
+            gas_color = self._GAS_COLORS.get(gas, theme.text)
+            check.setStyleSheet(
+                f"QCheckBox {{ color:{theme.text}; font-weight:600; spacing:6px; }}"
+                f"QCheckBox::indicator {{ width:14px; height:14px; border:2px solid {gas_color};"
+                f" border-radius:3px; background:{theme.panel}; }}"
+                f"QCheckBox::indicator:checked {{ background:{gas_color}; border-color:{gas_color}; }}"
+            )
+
+        self._vacuum_bar.setStyleSheet(
+            f"QProgressBar {{ border:1px solid {theme.border}; border-radius:5px; background:{theme.control};"
+            f" text-align:center; color:{theme.text}; }}"
+            "QProgressBar::chunk {"
+            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            "    stop:0 #2E97D8, stop:0.55 #1FC39A, stop:1 #C7D941);"
+            "  border-radius: 4px;"
+            "}"
+        )
+        self._temperature_bar.setStyleSheet(
+            f"QProgressBar {{ border:1px solid {theme.border}; border-radius:5px; background:{theme.control};"
+            f" text-align:center; color:{theme.text}; }}"
+            "QProgressBar::chunk {"
+            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            "    stop:0 #E7B56A, stop:0.55 #E98645, stop:1 #D85B4A);"
+            "  border-radius: 4px;"
+            "}"
+        )
+
+    def _setup_advanced_right_axis(self) -> None:
+        if self._advanced_plot is None:
+            return
+        plot_item = self._advanced_plot.getPlotItem()
+        plot_item.showAxis("right")
+        right_axis = plot_item.getAxis("right")
+        right_axis.setLabel("Gas partial pressure", units=self._display_unit, color="#FF5B5B")
+        right_axis.setTextPen(pg.mkPen("#FF5B5B"))
+        self._advanced_right_view = pg.ViewBox()
+        plot_item.scene().addItem(self._advanced_right_view)
+        right_axis.linkToView(self._advanced_right_view)
+        self._advanced_right_view.setXLink(plot_item)
+        self._advanced_gas_curve = pg.PlotDataItem(pen=pg.mkPen("#FF5B5B", width=2))
+        self._advanced_right_view.addItem(self._advanced_gas_curve)
+        self._advanced_right_view.setYRange(0, 1e-12)
+
+        def update_views() -> None:
+            if self._advanced_right_view is not None:
+                self._advanced_right_view.setGeometry(plot_item.vb.sceneBoundingRect())
+                self._advanced_right_view.linkedViewChanged(plot_item.vb, self._advanced_right_view.XAxis)
+
+        plot_item.vb.sigResized.connect(update_views)
+        update_views()
+
+    def _gauge_pressure_min_display(self) -> float:
+        """Minimum physical pressure of this gauge in display units (always positive)."""
+        return max(convert_pressure(1e-10, "mbar", self._display_unit), 1e-20)
+
+    def _gauge_pressure_max_display(self) -> float:
+        """Maximum physical pressure of this gauge in display units."""
+        return convert_pressure(1.1e3, "mbar", self._display_unit)
+
+    def _clamp_right_view_to_gauge_range(self, right_view: pg.ViewBox | None) -> None:
+        """Set the Y range of a right pressure axis to the gauge's physical range."""
+        if right_view is None:
+            return
+        right_view.setYRange(
+            self._gauge_pressure_min_display(),
+            self._gauge_pressure_max_display(),
+            padding=0,
+        )
+
+    def _setup_right_axis(
+        self,
+        plot: pg.PlotWidget,
+        label: str,
+        color: str,
+    ) -> tuple[pg.ViewBox, pg.PlotDataItem]:
+        plot_item = plot.getPlotItem()
+        plot_item.showAxis("right")
+        right_axis = plot_item.getAxis("right")
+        right_axis.setLabel(label, color=color)
+        right_axis.setTextPen(pg.mkPen(color))
+        right_view = pg.ViewBox()
+        plot_item.scene().addItem(right_view)
+        right_axis.linkToView(right_view)
+        right_view.setXLink(plot_item)
+        curve = pg.PlotDataItem(pen=pg.mkPen(color, width=2, style=Qt.PenStyle.DashLine))
+        right_view.addItem(curve)
+
+        def update_views() -> None:
+            right_view.setGeometry(plot_item.vb.sceneBoundingRect())
+            right_view.linkedViewChanged(plot_item.vb, right_view.XAxis)
+
+        plot_item.vb.sigResized.connect(update_views)
+        update_views()
+        return right_view, curve
+
+    def _setup_studio_crosshairs(self) -> None:
+        """Wire a vertical crosshair and SignalProxy to each visible Spectrum Studio plot."""
+        for proxy in self._studio_proxies:
+            try:
+                proxy.disconnect()
+            except (AttributeError, RuntimeError):
+                pass
+        self._studio_proxies.clear()
+
+        for line in self._studio_crosshairs.values():
+            try:
+                line.getViewBox().removeItem(line)
+            except Exception:
+                pass
+        self._studio_crosshairs.clear()
+
+        studio_plots: list[tuple[pg.PlotWidget, str]] = [
+            (self._advanced_plot, "time"),
+            (self._trend_plot, "time"),
+            (self._spectrum_plot, "wavelength"),
+            (self._gas_plot, "time"),
+        ]
+        for plot, x_kind in studio_plots:
+            if plot is None:
+                continue
+            vline = pg.InfiniteLine(
+                angle=90,
+                movable=False,
+                pen=pg.mkPen(color=(220, 220, 220, 160), width=1),
+            )
+            vline.setVisible(False)
+            plot.addItem(vline, ignoreBounds=True)
+            self._studio_crosshairs[id(plot)] = vline
+
+            proxy = pg.SignalProxy(
+                plot.scene().sigMouseMoved,
+                rateLimit=60,
+                slot=lambda ev, p=plot, k=x_kind: self._on_studio_mouse_moved(ev, p, k),
+            )
+            self._studio_proxies.append(proxy)
+
+    def _on_studio_mouse_moved(self, event: tuple, plot: pg.PlotWidget, x_kind: str) -> None:
+        pos = event[0]
+        vb = plot.getViewBox()
+        if not vb.sceneBoundingRect().contains(pos):
+            for line in self._studio_crosshairs.values():
+                line.setVisible(False)
+            if self._studio_value_bar is not None:
+                self._studio_value_bar.hide()
+            return
+
+        mp = vb.mapSceneToView(pos)
+        x_val = mp.x()
+
+        # Move crosshair only on the active plot
+        for pid, line in self._studio_crosshairs.items():
+            if pid == id(plot):
+                line.setValue(x_val)
+                line.setVisible(True)
+            else:
+                line.setVisible(False)
+
+        self._update_studio_value_bar(plot, x_val, x_kind)
+
+    def _update_studio_value_bar(self, plot: pg.PlotWidget, x: float, x_kind: str) -> None:
+        if self._studio_value_bar is None:
+            return
+        parts: list[str] = []
+
+        if x_kind == "wavelength":
+            parts.append(f"<span style='color:#90D98E'><b>X</b></span>: {x:.1f} nm")
+        else:
+            parts.append(f"<span style='color:#D9D9D9'><b>X</b></span>: {x:.1f} s")
+
+        if x_kind == "wavelength":
+            # Spectrum plot: show wavelength + intensity
+            if self._latest_spectrum_x is not None and self._latest_spectrum_y is not None:
+                idx = int(np.searchsorted(self._latest_spectrum_x, x))
+                idx = min(max(idx, 0), len(self._latest_spectrum_x) - 1)
+                wl = float(self._latest_spectrum_x[idx])
+                intensity = float(self._latest_spectrum_y[idx])
+                parts.append(
+                    f"<span style='color:#90D98E'><b>Wavelength</b></span>: {wl:.1f} nm"
+                    f"  <span style='color:#90D98E'><b>Intensity</b></span>: {intensity:.4f}"
+                )
+            if self._last_pressure_mbar is not None:
+                p_disp = convert_pressure(self._last_pressure_mbar, "mbar", self._display_unit)
+                parts.append(
+                    f"<span style='color:#43C5FF'><b>OPG Pressure (right axis)</b></span>: {p_disp:.3E} {self._display_unit}"
+                )
+        else:
+            # Time-based plots: interpolate from stored data.
+            if plot is self._advanced_plot:
+                # Advanced Analysis: show the two peer pressure sources (A and B) and
+                # the correlated gas signal on the right axis.
+                source_a = self._compare_a_combo.currentData() if self._compare_a_combo is not None else ""
+                source_b = self._compare_b_combo.currentData() if self._compare_b_combo is not None else ""
+                name_a = self._compare_a_combo.currentText() if self._compare_a_combo is not None else "Source A"
+                name_b = self._compare_b_combo.currentText() if self._compare_b_combo is not None else "Source B"
+                peer_a = self._peer_pressures.get(str(source_a)) if source_a else None
+                peer_b = self._peer_pressures.get(str(source_b)) if source_b else None
+                value_a: float | None = None
+                value_b: float | None = None
+                if peer_a is not None and peer_a["t"]:
+                    ta = np.array(peer_a["t"], dtype=float)
+                    pa = np.array(peer_a["p"], dtype=float)
+                    idx = int(np.searchsorted(ta, x))
+                    idx = min(max(idx, 0), len(ta) - 1)
+                    value_a = float(pa[idx])
+                    parts.append(
+                        f"<span style='color:#43C5FF'><b>{name_a}</b></span>: "
+                        f"{value_a:.3E} {self._display_unit}"
+                    )
+                if peer_b is not None and peer_b["t"]:
+                    ta = np.array(peer_b["t"], dtype=float)
+                    pa = np.array(peer_b["p"], dtype=float)
+                    idx = int(np.searchsorted(ta, x))
+                    idx = min(max(idx, 0), len(ta) - 1)
+                    value_b = float(pa[idx])
+                    parts.append(
+                        f"<span style='color:#E8D74C'><b>{name_b}</b></span>: "
+                        f"{value_b:.3E} {self._display_unit}"
+                    )
+                if value_a is not None and value_b is not None:
+                    delta = value_a - value_b
+                    parts.append(
+                        f"<span style='color:#FF8C8C'><b>Δ(A−B)</b></span>: {delta:+.3E} {self._display_unit}"
+                    )
+                # Gas partial pressure on the right axis
+                gas = self._correlation_gas_combo.currentData() if self._correlation_gas_combo is not None else None
+                if gas and self._gas_t and gas in self._gas_partial_mbar and self._gas_partial_mbar[gas]:
+                    gt = np.array(self._gas_t, dtype=float)
+                    gd = self._gas_partial_mbar[gas]
+                    ga = np.fromiter(gd, dtype=float, count=len(gd))
+                    n = min(len(gt), len(ga))
+                    if n > 0:
+                        idx = int(np.searchsorted(gt[:n], x))
+                        idx = min(max(idx, 0), n - 1)
+                        val_disp = convert_pressure(float(ga[idx]), "mbar", self._display_unit)
+                        parts.append(
+                            f"<span style='color:#FF5B5B'><b>{gas} partial (right axis)</b></span>: "
+                            f"{val_disp:.3E} {self._display_unit}"
+                        )
+            else:
+                # Trend / gas plots: show OPG pressure and, for the gas plot, each tracked gas.
+                if self._trend_t and self._trend_p:
+                    ta = np.array(self._trend_t, dtype=float)
+                    pa = np.array(self._trend_p, dtype=float)
+                    idx = int(np.searchsorted(ta, x))
+                    idx = min(max(idx, 0), len(ta) - 1)
+                    p_val = float(pa[idx])
+                    t_val = float(ta[idx])
+
+                    if plot is self._trend_plot and self._analysis_mode == "Rate of Rise":
+                        # Left axis = dP/dt; right dashed curve = absolute OPG pressure.
+                        selected = self._selected_gases()
+                        if selected:
+                            # Per-gas rate traces on the left axis.
+                            if self._gas_t:
+                                gt = np.array(self._gas_t, dtype=float)
+                                for gas in sorted(selected):
+                                    rate_data = self._gas_rate_mbar_s.get(gas)
+                                    if not rate_data:
+                                        continue
+                                    ra = np.fromiter(rate_data, dtype=float, count=len(rate_data))
+                                    n = min(len(gt), len(ra))
+                                    if n == 0:
+                                        continue
+                                    g_idx = int(np.searchsorted(gt[:n], x))
+                                    g_idx = min(max(g_idx, 0), n - 1)
+                                    color = self._GAS_COLORS.get(gas, "#FFFFFF")
+                                    parts.append(
+                                        f"<span style='color:{color}'><b>{gas} RoR</b></span>: "
+                                        f"{float(ra[g_idx]):.3E} {self._display_unit}/s"
+                                    )
+                        else:
+                            # Single overall dP/dt on the left axis.
+                            if pa.size > 1:
+                                dt = np.diff(ta)
+                                dp = np.diff(pa)
+                                rates = np.concatenate([[0.0], np.divide(dp, np.maximum(dt, 1e-9))])
+                            else:
+                                rates = np.zeros_like(pa)
+                            ror_val = float(rates[idx])
+                            parts.append(
+                                f"<span style='color:#43C5FF'><b>Rate of Rise</b></span>: "
+                                f"{ror_val:.3E} {self._display_unit}/s"
+                            )
+                        # Right axis = absolute OPG pressure (dashed blue curve).
+                        parts.append(
+                            f"<span style='color:#43C5FF'><b>OPG Pressure (right axis)</b></span>: "
+                            f"{p_val:.3E} {self._display_unit}"
+                        )
+                    else:
+                        # Left axis = pressure (or partial pressures for gas plot).
+                        p_label = "OPG Pressure"
+                        parts.append(
+                            f"<span style='color:#43C5FF'><b>{p_label}</b></span>: "
+                            f"{p_val:.3E} {self._display_unit}"
+                        )
+
+                # Show individual gas values for the Residual Gas Detection plot.
+                # Left axis = partial pressures per gas; right dashed curve = OPG pressure.
+                if plot is self._gas_plot and self._gas_t:
+                    gt = np.array(self._gas_t, dtype=float)
+                    for gas in sorted(self._selected_gases()):
+                        gdata = self._gas_partial_mbar[gas]
+                        if not gdata:
+                            continue
+                        ga = np.array(gdata, dtype=float)
+                        idx = int(np.searchsorted(gt, x))
+                        idx = min(max(idx, 0), len(gt) - 1)
+                        val_disp = convert_pressure(float(ga[idx]), "mbar", self._display_unit)
+                        color = self._GAS_COLORS.get(gas, "#FFFFFF")
+                        parts.append(
+                            f"<span style='color:{color}'><b>{gas}</b></span>: {val_disp:.3E} {self._display_unit}"
+                        )
+                    # Right-axis curve on the gas plot is the OPG absolute pressure (dashed blue).
+                    if self._trend_t and self._trend_p:
+                        ta2 = np.array(self._trend_t, dtype=float)
+                        pa2 = np.array(self._trend_p, dtype=float)
+                        g_idx = int(np.searchsorted(ta2, x))
+                        g_idx = min(max(g_idx, 0), len(ta2) - 1)
+                        parts.append(
+                            f"<span style='color:#43C5FF'><b>OPG Pressure (right axis)</b></span>: "
+                            f"{float(pa2[g_idx]):.3E} {self._display_unit}"
+                        )
+
+        if parts:
+            self._studio_value_bar.setText("  |  ".join(parts))
+            self._studio_value_bar.show()
+        else:
+            self._studio_value_bar.hide()
 
     @staticmethod
     def _spectrum_mode_description(mode: SpectrumMode) -> str:
         return {
             SpectrumMode.AUTO: (
-                "Auto — composition derived from pressure level and trend. "
-                "N₂/O₂ dominate at higher pressures; H₂/H₂O/CO shift in at deep vacuum."
+                "Live Data — displays only the current spectrum data returned by the gauge."
             ),
             SpectrumMode.AIR_LEAK: (
                 "Air Leak — atmosphere ingress simulation. "
@@ -2057,7 +2887,7 @@ class OPG550ControlPanel(QWidget):
             ),
             SpectrumMode.WATER_LEAK: (
                 "Water Leak — humid atmosphere ingress. "
-                "H₂O dominates; thermal dissociation produces H₂ over time."
+                "H₂O/OH dominate; thermal dissociation produces H₂ over time."
             ),
             SpectrumMode.HELIUM_LEAK: (
                 "Helium Leak — He tracer simulation. "
@@ -2086,49 +2916,364 @@ class OPG550ControlPanel(QWidget):
             self._spectrum_mode_desc.setText(self._spectrum_mode_description(mode))
             self._update_spectrum_plot()
 
+    def _on_analysis_mode_changed(self, mode: str) -> None:
+        if mode not in self._ANALYSIS_MODES:
+            mode = "Raw Spectrum"
+        self._analysis_mode = mode
+        detail = {
+            "Raw Spectrum": "Polling SPEC state/counts and rendering the visible/near-UV spectrum.",
+            "Rate of Rise": "Polling RoR state/counts while plotting dP/dt from live pressure.",
+            "Residual Gas Detection": "Polling RGD state/counts and tracking selected gas signatures.",
+            "Advanced Analysis": "Compare two pressure sources and correlate their delta with a selected OPG gas signal.",
+        }[mode]
+        self._mode_status.setText(detail)
+        advanced = mode == "Advanced Analysis"
+        for widget in (
+            self._compare_a_label,
+            self._compare_a_combo,
+            self._compare_b_label,
+            self._compare_b_combo,
+            self._correlation_gas_label,
+            self._correlation_gas_combo,
+        ):
+            if widget is not None:
+                widget.setVisible(advanced)
+        self._sync_chart_visibility()
+        self._refresh_mode_plots()
+        self._ensure_opg_algorithm_active(force=True)
+
+    def _sync_chart_visibility(self) -> None:
+        any_gas_selected = bool(self._selected_gases())
+        for name, widget in self._chart_boxes.items():
+            if self._analysis_mode == "Residual Gas Detection":
+                if name == "Raw Spectrum":
+                    widget.setVisible(not any_gas_selected)
+                elif name == "Residual Gas Detection":
+                    widget.setVisible(any_gas_selected)
+                else:
+                    widget.setVisible(False)
+            elif name == "Residual Gas Detection":
+                widget.setVisible(self._analysis_mode == "Advanced Analysis" and any_gas_selected)
+            else:
+                widget.setVisible(self._analysis_mode == name)
+
+    def _refresh_mode_plots(self) -> None:
+        # Coalesce repeated requests inside the same event-loop tick to avoid
+        # O(N_gases * 4 charts) redraws per pressure/spectrum sample.
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        self._refresh_timer.start()
+
+    def _do_refresh_mode_plots(self) -> None:
+        self._refresh_pending = False
+        # Only refresh charts that are currently visible. With many tracked
+        # gases enabled, redrawing every chart per tick stalls the GUI
+        # thread because each call iterates over the full (unbounded)
+        # session history. _sync_chart_visibility hides everything except
+        # the chart for the active analysis mode (and the gas chart when
+        # gases are tracked), so honour that here.
+        trend_box = self._chart_boxes.get("Rate of Rise")
+        spectrum_box = self._chart_boxes.get("Raw Spectrum")
+        gas_box = self._chart_boxes.get("Residual Gas Detection")
+        advanced_box = self._chart_boxes.get("Advanced Analysis")
+        if trend_box is None or trend_box.isVisible():
+            self._refresh_trend()
+        if spectrum_box is None or spectrum_box.isVisible():
+            self._refresh_spectrum_gas_markers()
+        if gas_box is None or gas_box.isVisible():
+            self._refresh_gas_plot()
+        if advanced_box is None or advanced_box.isVisible():
+            self._refresh_advanced_plot()
+
     def _metric_card(self, title: str, value: QLabel) -> QFrame:
+        theme = current_theme(self)
         box = QFrame()
         box.setStyleSheet(
-            "QFrame { background: #1F2730; border: 1px solid #334452; border-radius: 8px; }"
+            f"QFrame {{ background: {theme.panel}; border: 1px solid {theme.border}; border-radius: 8px; }}"
         )
+        self._section_frames.append(box)
         v = QVBoxLayout(box)
         v.setContentsMargins(10, 8, 10, 8)
         v.setSpacing(2)
         t = QLabel(title)
-        t.setStyleSheet("font-size: 11px; color: #8FA9BA;")
-        value.setStyleSheet("font-size: 16px; font-weight: 700; color: #F3FAFF;")
+        t.setStyleSheet(f"font-size: 11px; color: {theme.muted};")
+        value.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {theme.text};")
+        self._metric_title_labels.append(t)
+        self._metric_value_labels.append(value)
         v.addWidget(t)
         v.addWidget(value)
         return box
 
     def _on_action(self, command: str) -> None:
-        if command == "_snapshot":
-            for cmd in (
-                "pressure",
-                "temperature",
-                "software_version",
-                "serial_number",
-                "error_status",
-            ):
+        if command == "_poll_mode":
+            self._ensure_opg_algorithm_active(force=True)
+            for cmd in self._POLL_GROUPS.get(self._analysis_mode, ("pressure",)):
                 self._send_query(cmd)
+            return
+        if command == "_snapshot":
+            for cmd in self._safe_snapshot_commands():
+                self._send_query(cmd)
+            return
+        if command == "_export_opg_csv":
+            self._export_opg_csv()
+            return
+        if command == "_plasma_on":
+            self._send_write("plasma_enable", 1)
+            # Track our intent so the response handler can auto-start the
+            # spectrum even if the device's reply value is ambiguous.
+            self._pending_plasma_target = 1
+            return
+        if command == "_plasma_off":
+            self._send_write("plasma_enable", 0)
+            self._pending_plasma_target = 0
             return
         self._send_query(command)
 
+    def _safe_snapshot_commands(self) -> tuple[str, ...]:
+        return tuple(
+            cmd for cmd in (
+                "pressure",
+                "product_name",
+                "software_version",
+                "bootloader_version",
+                "serial_number",
+                "manufacturer_name",
+                "error_status",
+                "error_count",
+                "plasma_state",
+                "spectrometer_pixel_count",
+                "spec_record",
+                "operating_mode",
+                "spec_state",
+                "spec_record_count",
+                "ror_state",
+                "ror_record_count",
+                "ror_record",
+                "rgd_state",
+                "rgd_record_count",
+                "rgd_record",
+                "analog_output_mode",
+                "analog_output_voltage",
+            ) if cmd in self._spec.commands
+        )
+
     def _send_query(self, command: str) -> None:
+        if command in self._RECORD_COMMANDS:
+            self._send_record_query(command)
+            return
+        self._send_command(command)
+
+    def _active_record_command(self) -> str:
+        return {
+            "Raw Spectrum": "spec_record",
+            "Rate of Rise": "ror_record",
+            "Residual Gas Detection": "rgd_record",
+            "Advanced Analysis": "spec_record",
+        }.get(self._analysis_mode, "spec_record")
+
+    def _ensure_opg_algorithm_active(self, *, force: bool = False) -> None:
+        target = {
+            "Raw Spectrum": "spec_enable",
+            "Rate of Rise": "ror_enable",
+            "Residual Gas Detection": "rgd_enable",
+            "Advanced Analysis": "spec_enable",
+        }.get(self._analysis_mode)
+        if target is None or target not in self._spec.commands:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and self._active_opg_algorithm == target
+            and self._last_opg_activation_t is not None
+            and now - self._last_opg_activation_t < 30.0
+        ):
+            return
+        if "all_algorithms_off" in self._spec.commands and self._active_opg_algorithm != target:
+            self._send_write("all_algorithms_off", 0)
+        self._send_write(target, 1)
+        self._active_opg_algorithm = target
+        self._last_opg_activation_t = now
+        self._last_spec_request_t = None
+        for record_command in self._opg_record_counts:
+            self._opg_record_counts[record_command] = None
+        self._emit_opg_spectrum_diag(
+            f"OPG550 activated {target} for {self._analysis_mode}; polling state/count before record reads"
+        )
+
+    def _request_live_spec_if_due(self) -> None:
+        if self._spectrum_mode is not SpectrumMode.AUTO:
+            return
+        record_command = self._active_record_command()
+        if record_command not in self._spec.commands:
+            return
+        now = time.monotonic()
+        if self._last_spec_request_t is not None and now - self._last_spec_request_t < 2.0:
+            return
+        self._last_spec_request_t = now
+        self._ensure_opg_algorithm_active()
+        count_command = {
+            "spec_record": "spec_record_count",
+            "ror_record": "ror_record_count",
+            "rgd_record": "rgd_record_count",
+        }.get(record_command)
+        state_command = {
+            "spec_record": "spec_state",
+            "ror_record": "ror_state",
+            "rgd_record": "rgd_state",
+        }.get(record_command)
+        if get_opg_spectrum_verbose_diagnostics() and state_command in self._spec.commands:
+            self._send_command(state_command)
+        if count_command in self._spec.commands:
+            self._send_command(count_command)
+        known_count = self._opg_record_counts.get(record_command)
+        if known_count is not None and known_count <= 0:
+            self._emit_opg_spectrum_diag(
+                f"OPG550 {record_command} skipped because record_count=0; waiting for algorithm capture"
+            )
+            return
+        self._send_query(record_command)
+
+    def _send_record_query(self, command: str) -> None:
+        if command not in self._spec.commands:
+            return
+        protocol = getattr(self._worker, "_protocol", None)
+        builder = getattr(protocol, "build_read_request", None)
+        if not callable(builder):
+            self._send_command(command)
+            return
+        try:
+            frame = builder(command)
+            self._emit_opg_spectrum_diag(
+                self._format_record_tx_diag(command, frame)
+            )
+            self._worker.send_terminal_command(frame, command)
+        except Exception:
+            logger.exception("OPG550 panel record query failed for %s", command)
+            self._emit_opg_spectrum_diag(f"OPG550 {command} TX failed while building/sending request")
+
+    def _emit_opg_spectrum_diag(self, message: str) -> None:
+        if not get_opg_spectrum_verbose_diagnostics():
+            return
+        signal = getattr(self._worker, "terminal_response", None)
+        if signal is None:
+            return
+        signal.emit(TerminalEntry(
+            request=b"",
+            response=message.encode("ascii", errors="replace"),
+            timestamp=datetime.now(tz=timezone.utc),
+            command="__opg_spectrum_diag__",
+            diagnostic=True,
+        ))
+
+    def _format_record_tx_diag(self, command: str, frame: bytes) -> str:
+        request_data = b""
+        protocol = getattr(self._worker, "_protocol", None)
+        params = getattr(protocol, "_params", {}) if protocol is not None else {}
+        command_spec = params.get(command, {}) if isinstance(params, dict) else {}
+        raw_request = command_spec.get("request_data") if isinstance(command_spec, dict) else None
+        try:
+            request_data = bytes(int(value) & 0xFF for value in raw_request or [])
+        except (TypeError, ValueError):
+            request_data = b""
+        return (
+            f"OPG550 {command} TX "
+            f"request_data={self._hex_bytes(request_data) or '(empty)'} "
+            f"frame_len={len(frame)} frame_hex={self._hex_bytes(frame)}"
+        )
+
+    def _format_record_rx_diag(self, entry, parsed=None, parse_error: Exception | None = None) -> str:
+        command = entry.command or "record"
+        parts = [
+            f"OPG550 {command} RX",
+            f"response_len={len(entry.response or b'')}",
+            f"response_hex={self._hex_bytes(entry.response or b'') or '(empty)'}",
+        ]
+        if entry.error:
+            parts.append(f"terminal_error={entry.error}")
+            return " ".join(parts)
+        if not entry.response:
+            parts.append("result=no_response")
+            return " ".join(parts)
+        if parse_error is not None:
+            parts.append(f"parse_exception={parse_error}")
+            return " ".join(parts)
+        if parsed is None:
+            parts.append("parse=not_attempted")
+            return " ".join(parts)
+        if not parsed.success:
+            parts.append(f"parse_fail={parsed.error or 'unknown'}")
+            return " ".join(parts)
+
+        pixel_data = parsed.extra.get("pixel_data") if parsed.extra else None
+        raw_array = parsed.extra.get("raw_array") if parsed.extra else None
+        if pixel_data is not None:
+            pixels = list(pixel_data)
+            nonzero = sum(1 for value in pixels if int(value) != 0)
+            first = pixels[:8]
+            last = pixels[-8:] if len(pixels) >= 8 else pixels
+            parts.extend([
+                "parse=ok",
+                f"pixels={len(pixels)}",
+                f"raw_values={len(raw_array) if raw_array is not None else 'n/a'}",
+                f"nonzero={nonzero}",
+                f"min={min(pixels, default=0)}",
+                f"max={max(pixels, default=0)}",
+                f"first8={first}",
+                f"last8={last}",
+            ])
+            if nonzero == 0:
+                parts.append("all_zero=true")
+            if parsed.extra:
+                if "record_id" in parsed.extra:
+                    parts.append(f"record_id={parsed.extra.get('record_id')}")
+                if "total_pressure_mbar" in parsed.extra:
+                    parts.append(f"pressure_mbar={float(parsed.extra.get('total_pressure_mbar', 0.0)):.6g}")
+                if "pressure_rise_mtorr_per_min" in parsed.extra:
+                    parts.append(f"pressure_rise_mtorr_min={float(parsed.extra.get('pressure_rise_mtorr_per_min', 0.0)):.6g}")
+                if "partial_pressures" in parsed.extra:
+                    partials = parsed.extra.get("partial_pressures") or []
+                    parts.append(f"partial_pressures={list(partials)[:10]}")
+            return " ".join(parts)
+
+        extra_keys = sorted(parsed.extra.keys()) if parsed.extra else []
+        parts.extend([
+            "parse=ok_no_pixel_data",
+            f"formatted={parsed.formatted or '(empty)'}",
+            f"value={parsed.value if parsed.value is not None else '(none)'}",
+            f"extra_keys={extra_keys}",
+        ])
+        return " ".join(parts)
+
+    @staticmethod
+    def _hex_bytes(data: bytes | bytearray) -> str:
+        return bytes(data).hex(" ").upper()
+
+    @staticmethod
+    def _pixel_data_has_signal(pixel_data: object) -> bool:
+        try:
+            return any(float(value) != 0.0 for value in pixel_data)  # type: ignore[union-attr]
+        except (TypeError, ValueError):
+            return False
+
+    def _send_write(self, command: str, value: object) -> None:
+        self._send_command(command, value)
+
+    def _send_command(self, command: str, value: object | None = None) -> None:
         if command not in self._spec.commands:
             return
         try:
             protocol = getattr(self._worker, "_protocol", None)
             if protocol is None:
                 return
-            frame = protocol.build_request(command)
+            frame = protocol.build_request(command, value)
             self._worker.send_terminal_command(frame, command)
         except Exception:
             logger.exception("OPG550 panel query failed for %s", command)
 
     def on_reading(self, reading: DeviceReading) -> None:
         if reading.command == "pressure":
-            self._update_pressure(reading.value, reading.unit, reading.timestamp_mono)
+            self._update_pressure(reading.value, reading.unit, reading.timestamp_mono, reading.timestamp_wall)
         elif reading.command == "temperature":
             self._update_temperature(reading.value)
 
@@ -2137,22 +3282,33 @@ class OPG550ControlPanel(QWidget):
         if command not in self._spec.commands:
             return
         if entry.error:
+            if command in self._RECORD_COMMANDS:
+                self._emit_opg_spectrum_diag(self._format_record_rx_diag(entry))
             if command == "error_status":
                 self._err_value.setText(f"ERR: {entry.error}")
             return
         if not entry.response:
+            if command in self._RECORD_COMMANDS:
+                self._emit_opg_spectrum_diag(self._format_record_rx_diag(entry))
             return
         protocol = getattr(self._worker, "_protocol", None)
         if protocol is None:
             return
         try:
             parsed = protocol.parse_response(entry.response, command)
-        except Exception:
+        except Exception as exc:
             logger.exception("OPG550 response decode failed for %s", command)
+            if command in self._RECORD_COMMANDS:
+                self._emit_opg_spectrum_diag(self._format_record_rx_diag(entry, parse_error=exc))
+                self._last_spec_request_t = None
             return
+        if command in self._RECORD_COMMANDS:
+            self._emit_opg_spectrum_diag(self._format_record_rx_diag(entry, parsed=parsed))
         if not parsed.success:
             if command == "error_status":
                 self._err_value.setText(parsed.error or "Decode failure")
+            elif command in self._RECORD_COMMANDS:
+                self._last_spec_request_t = None
             return
 
         if command == "software_version":
@@ -2162,10 +3318,112 @@ class OPG550ControlPanel(QWidget):
         elif command == "error_status":
             msg = parsed.formatted or "OK"
             self._err_value.setText(msg)
-        elif command == "temperature" and parsed.value is not None:
-            self._update_temperature(float(parsed.value))
+        elif command == "plasma_state":
+            self._plasma_status.setText(f"Plasma: {parsed.formatted or str(parsed.value or '-')}")
+            try:
+                if parsed.value is not None:
+                    self._last_plasma_state = int(parsed.value)
+            except (TypeError, ValueError):
+                pass
+        elif command == "plasma_enable":
+            self._plasma_status.setText("Plasma command accepted; reading state...")
+            self._send_query("plasma_state")
+            self._last_spec_request_t = None
+            self._request_live_spec_if_due()
+            # If the user just turned the plasma ON, automatically activate the
+            # configured live-spectrum algorithm so they don't have to press
+            # "Start spec" manually.
+            try:
+                target = self._pending_plasma_target
+                self._pending_plasma_target = None
+                if target == 1 or (parsed.value is not None and int(parsed.value) >= 1):
+                    self._ensure_opg_algorithm_active(force=True)
+                    if not self._live_spec_timer.isActive():
+                        self._live_spec_timer.start()
+            except (TypeError, ValueError):
+                pass
+        elif command in {"spec_enable", "ror_enable", "rgd_enable"}:
+            state_command = {
+                "spec_enable": "spec_state",
+                "ror_enable": "ror_state",
+                "rgd_enable": "rgd_state",
+            }.get(command)
+            count_command = {
+                "spec_enable": "spec_record_count",
+                "ror_enable": "ror_record_count",
+                "rgd_enable": "rgd_record_count",
+            }.get(command)
+            if state_command in self._spec.commands:
+                self._send_query(state_command)
+            if count_command in self._spec.commands:
+                self._send_query(count_command)
         elif command == "pressure" and parsed.value is not None:
             self._update_pressure(float(parsed.value), parsed.unit or "mbar", None)
+        elif command in {"spec_record_count", "ror_record_count", "rgd_record_count"} and parsed.value is not None:
+            record_command = {
+                "spec_record_count": "spec_record",
+                "ror_record_count": "ror_record",
+                "rgd_record_count": "rgd_record",
+            }.get(command)
+            if record_command is not None:
+                self._opg_record_counts[record_command] = int(parsed.value)
+        elif parsed.extra.get("pixel_data"):
+            pixel_data = parsed.extra["pixel_data"]
+            if self._pixel_data_has_signal(pixel_data):
+                self._ingest_live_spectrum(pixel_data)
+            elif command in self._RECORD_COMMANDS:
+                self._emit_opg_spectrum_diag(
+                    f"OPG550 {command} pixel payload is all zero; keeping plot unchanged"
+                )
+        if command == "rgd_record" and parsed.extra.get("partial_pressures"):
+            self._apply_rgd_partial_pressures(parsed.extra)
+        if command == "ror_record" and parsed.extra.get("pressure_rise_mtorr_per_min") is not None:
+            self._mode_status.setText(
+                f"RoR active; pressure rise {float(parsed.extra['pressure_rise_mtorr_per_min']):.4g} mTorr/min."
+            )
+
+        if command in self._telemetry_rows:
+            if parsed.formatted:
+                text = parsed.formatted
+            elif parsed.value is not None:
+                suffix = f" {parsed.unit}" if parsed.unit else ""
+                text = f"{parsed.value:.6g}{suffix}"
+            else:
+                text = "OK"
+            self._telemetry_rows[command].setText(text)
+
+    def _apply_rgd_partial_pressures(self, extra: dict[str, object]) -> None:
+        partials_obj = extra.get("partial_pressures")
+        if not isinstance(partials_obj, (list, tuple)):
+            return
+        gas_order = ("H2", "He", "N2", "O2", "Ar", "NH", "OH", "CH", "CO", "Fluor")
+        partial_map: dict[str, float] = {}
+        for gas, value in zip(gas_order, partials_obj):
+            try:
+                partial_map[gas] = max(float(value), 0.0)
+            except (TypeError, ValueError):
+                continue
+        pressure = extra.get("total_pressure_mbar", self._last_pressure_mbar)
+        try:
+            pressure_mbar = max(float(pressure), 1e-30)
+        except (TypeError, ValueError):
+            pressure_mbar = max(float(self._last_pressure_mbar or 0.0), 1e-30)
+        self._latest_gas_pct = {gas: 0.0 for gas in self._GASES}
+        for gas, partial in partial_map.items():
+            mapped = "CH4" if gas == "CH" else gas
+            if mapped in self._latest_gas_pct:
+                self._latest_gas_pct[mapped] = min(100.0, max(0.0, partial / pressure_mbar * 100.0))
+        visible = [
+            f"{gas} {convert_pressure(partial, 'mbar', self._display_unit):.2E} {self._display_unit}"
+            for gas, partial in partial_map.items()
+            if gas in self._latest_gas_pct or gas == "CH"
+        ]
+        if visible:
+            self._molecule_label.setText("RGD partial pressures: " + ", ".join(visible[:5]))
+        if self._last_pressure_mbar is None:
+            self._last_pressure_mbar = pressure_mbar
+        self._append_gas_history()
+        self._refresh_mode_plots()
 
     def set_display_unit(self, unit: str) -> None:
         if unit not in SUPPORTED_UNITS or unit == self._display_unit:
@@ -2181,20 +3439,43 @@ class OPG550ControlPanel(QWidget):
             converted = convert_pressure(value, old, unit)
             self._pressure_value.setText(f"{converted:.4E} {unit}")
         if self._trend_plot is not None:
-            # Avoid SI prefix scaling by building our own label
-            self._trend_plot.setLabel("left", f"Pressure ({unit})", units="")
+            self._trend_plot.getPlotItem().getAxis("right").setLabel(f"Pressure ({unit})", color="#43C5FF")
+            # Update RoR y-label if currently in Rate of Rise mode
+            if self._analysis_mode == "Rate of Rise":
+                self._trend_plot.setLabel("left", "Rate of rise", units=f"{unit}/s")
+        if self._spectrum_plot is not None:
+            self._spectrum_plot.getPlotItem().getAxis("right").setLabel(f"Pressure ({unit})", color="#43C5FF")
+        if self._gas_plot is not None:
+            self._gas_plot.getPlotItem().getAxis("right").setLabel(f"Pressure ({unit})", color="#43C5FF")
+            self._gas_plot.setLabel("left", "Partial pressure", units=unit)
+        if self._advanced_plot is not None:
+            self._advanced_plot.setLabel("left", f"Pressure ({unit})", units="")
+            # Update advanced right axis partial pressure label
+            if self._advanced_plot is not None and self._correlation_gas_combo is not None:
+                gas = self._correlation_gas_combo.currentData() or "OH"
+                self._advanced_plot.getPlotItem().getAxis("right").setLabel(
+                    f"{gas} partial pressure", units=unit, color="#FF5B5B"
+                )
         if self._trend_p:
             self._trend_p = deque(
                 [convert_pressure(v, old, unit) for v in self._trend_p],
-                maxlen=self._trend_p.maxlen,
             )
             self._refresh_trend()
+        for peer in self._peer_pressures.values():
+            values: deque = peer["p"]  # type: ignore[assignment]
+            peer_unit = str(peer.get("unit", old))
+            peer["p"] = deque(
+                [convert_pressure(v, peer_unit, unit) for v in values],
+            )
+            peer["unit"] = unit
+        self._refresh_mode_plots()
 
     def _update_pressure(
         self,
         value: float | None,
         unit: str,
         timestamp_mono: float | None,
+        timestamp_wall: datetime | None = None,
     ) -> None:
         if value is None:
             return
@@ -2204,6 +3485,22 @@ class OPG550ControlPanel(QWidget):
             value_mbar = float(convert_pressure(float(value), unit, "mbar"))
         else:
             value_mbar = float(value)
+
+        # Spike rejection: the OPG550 can momentarily report the raw Pirani
+        # saturation value (~1E-4 mbar) during plasma state transitions while
+        # the optical measurement is still warming up.  If the new reading is
+        # more than 2 orders of magnitude above the rolling median of the last
+        # five samples, discard it as a transient artifact.
+        if len(self._pressure_mbar_window) >= 3:
+            import statistics as _stats
+            _median = _stats.median(self._pressure_mbar_window)
+            if _median > 1e-12 and value_mbar > _median * 100:
+                logger.debug(
+                    "OPG550 pressure spike suppressed: %.3E mbar (median %.3E mbar)",
+                    value_mbar, _median,
+                )
+                return
+        self._pressure_mbar_window.append(value_mbar)
 
         self._pressure_value.setText(f"{value_display:.4E} {self._display_unit}")
         quality = self._vacuum_quality(value_mbar)
@@ -2221,8 +3518,121 @@ class OPG550ControlPanel(QWidget):
             t_rel = timestamp_mono - self._trend_t0
         self._trend_t.append(float(t_rel))
         self._trend_p.append(max(value_display, 1e-12))
-        self._refresh_trend()
-        self._update_spectrum_plot(value_mbar=value_mbar, timestamp_mono=timestamp_mono)
+        self._store_peer_pressure("_opg_self", "This OPG550", t_rel, value_display, self._display_unit)
+        # Coalesce all four per-sample plot refreshes through the 120 ms
+        # QTimer in _refresh_mode_plots so high-rate pressure streams from
+        # peer gauges (e.g. CDG at ~125 Hz) don't pile up redraws on the GUI
+        # thread.
+        self._refresh_mode_plots()
+        self._update_spectrum_plot(
+            value_mbar=value_mbar,
+            timestamp_mono=timestamp_mono,
+            timestamp_wall=timestamp_wall,
+        )
+
+    def _ingest_live_spectrum(self, pixel_data: object) -> None:
+        try:
+            y = np.asarray(list(pixel_data), dtype=float)
+        except (TypeError, ValueError):
+            return
+        if y.size < 2:
+            return
+        peak = float(np.max(y)) if y.size else 0.0
+        if peak > 0:
+            y = y / peak
+        x = np.linspace(303.05, 876.07, y.size, dtype=float)
+        self._live_spectrum_x = x
+        self._live_spectrum_y = y
+        if self._last_pressure_mbar is not None:
+            self._update_spectrum_plot(
+                value_mbar=self._last_pressure_mbar,
+                timestamp_mono=self._last_pressure_t or time.monotonic(),
+            )
+            return
+        self._plot_live_spectrum_without_pressure(x, y)
+
+    def _plot_live_spectrum_without_pressure(self, x: np.ndarray, y: np.ndarray) -> None:
+        if self._spectrum_curve is None:
+            return
+        self._spectrum_curve.setPen(pg.mkPen("#90D98E", width=2))
+        self._spectrum_curve.setBrush(pg.mkBrush(144, 217, 142, 90))
+        self._spectrum_curve.setData(x, y)
+        if self._spectrum_pressure_curve is not None:
+            self._spectrum_pressure_curve.setData([], [])
+        self._latest_spectrum_x = np.array(x, dtype=float)
+        self._latest_spectrum_y = np.array(y, dtype=float)
+        matches = identify_optical_species(
+            y.astype(float).tolist(),
+            wavelength_min_nm=float(x[0]),
+            wavelength_max_nm=float(x[-1]),
+            top_k=len(self._GASES),
+        )
+        if matches:
+            total_score = sum(max(m.score, 0.0) for m in matches) or 1.0
+            self._latest_gas_pct = {gas: 0.0 for gas in self._GASES}
+            for match in matches:
+                if match.name in self._latest_gas_pct:
+                    self._latest_gas_pct[match.name] = max(0.0, match.score) / total_score * 100.0
+            txt = ", ".join(
+                f"{m.name} ({self._latest_gas_pct.get(m.name, 0.0):.0f}%)"
+                for m in matches[:5]
+            )
+        else:
+            self._latest_gas_pct = {gas: 0.0 for gas in self._GASES}
+            txt = "No dominant optical signature"
+        self._molecule_label.setText(f"Likely optical gas signatures: {txt}")
+        self._refresh_spectrum_gas_markers()
+        self._refresh_advanced_plot()
+
+    def on_peer_reading(self, device_id: str, display_name: str, reading: DeviceReading) -> None:
+        if reading.value is None or reading.unit not in SUPPORTED_UNITS:
+            return
+        if self._peer_t0 is None:
+            self._peer_t0 = reading.timestamp_mono
+        t_rel = reading.timestamp_mono - self._peer_t0
+        value = float(convert_pressure(reading.value, reading.unit, self._display_unit))
+        source_id, source_name = self._peer_source_label(device_id, display_name, reading.command)
+        self._store_peer_pressure(source_id, source_name, t_rel, value, self._display_unit)
+        # Coalesce; peer gauges (e.g. CDG) can stream at >100 Hz, and a
+        # direct rebuild of the advanced plot per sample makes the UI
+        # unresponsive within seconds as the deques grow.
+        self._refresh_mode_plots()
+
+    @staticmethod
+    def _peer_source_label(device_id: str, display_name: str, command: str) -> tuple[str, str]:
+        if not command or command == "pressure":
+            return device_id, display_name
+        return f"{device_id}\x1f{command}", f"{display_name} - {command_display_name(command)}"
+
+    def _store_peer_pressure(
+        self,
+        device_id: str,
+        display_name: str,
+        t_rel: float,
+        value: float,
+        unit: str,
+    ) -> None:
+        peer = self._peer_pressures.get(device_id)
+        if peer is None:
+            # Bound peer history so that high-rate streaming gauges (e.g. a
+            # CDG sending ~125 frames/s) don't grow these deques without
+            # limit and starve the GUI thread when plots are rebuilt.
+            # ~30k samples is roughly 4 minutes at 125 Hz or 8 hours at 1 Hz.
+            peer = {
+                "name": display_name,
+                "unit": unit,
+                "t": deque(maxlen=_PEER_PRESSURE_MAXLEN),
+                "p": deque(maxlen=_PEER_PRESSURE_MAXLEN),
+            }
+            self._peer_pressures[device_id] = peer
+            self._refresh_peer_combos()
+        else:
+            peer["name"] = display_name
+            peer["unit"] = unit
+        peer_t: deque = peer["t"]  # type: ignore[assignment]
+        peer_p: deque = peer["p"]  # type: ignore[assignment]
+        peer_t.append(float(t_rel))
+        peer_p.append(max(float(value), 1e-12))
 
     def _update_temperature(self, value: float | None) -> None:
         if value is None:
@@ -2233,16 +3643,67 @@ class OPG550ControlPanel(QWidget):
     def _refresh_trend(self) -> None:
         if self._trend_curve is None or not self._trend_t:
             return
-        self._trend_curve.setData(
-            np.array(self._trend_t, dtype=float),
-            np.array(self._trend_p, dtype=float),
-        )
+        x = np.array(self._trend_t, dtype=float)
+        p = np.array(self._trend_p, dtype=float)
+        selected = self._selected_gases()
+
+        if self._analysis_mode == "Rate of Rise":
+            if selected:
+                self._trend_curve.setData([], [])
+                self._trend_curve.setVisible(False)
+                # Pre-compute the linear scale factor once. Pressure unit
+                # conversion is purely multiplicative, so a Python list-comp
+                # over the entire history per gas is wasted work that
+                # scales with N_selected_gases * N_samples and stalls the
+                # GUI thread when many track gases are enabled.
+                try:
+                    unit_factor = float(convert_pressure(1.0, "mbar", self._display_unit))
+                except Exception:
+                    unit_factor = 1.0
+                gas_t_arr = np.array(self._gas_t, dtype=float)
+                for gas, curve in self._trend_gas_curves.items():
+                    visible = gas in selected
+                    curve.setVisible(visible)
+                    if visible:
+                        rate_data = np.fromiter(
+                            self._gas_rate_mbar_s[gas],
+                            dtype=float,
+                            count=len(self._gas_rate_mbar_s[gas]),
+                        )
+                        n = min(len(gas_t_arr), len(rate_data))
+                        curve.setData(gas_t_arr[:n], rate_data[:n] * unit_factor)
+                    else:
+                        curve.setData([], [])
+            else:
+                rates = np.zeros_like(p)
+                if p.size > 1:
+                    dt = np.diff(x)
+                    dp = np.diff(p)
+                    rates[1:] = np.divide(dp, np.maximum(dt, 1e-9))
+                self._trend_curve.setVisible(True)
+                self._trend_curve.setData(x, rates)
+                for curve in self._trend_gas_curves.values():
+                    curve.setVisible(False)
+                    curve.setData([], [])
+            self._trend_plot.setLabel("left", "Rate of rise", units=f"{self._display_unit}/s")
+        else:
+            self._trend_curve.setVisible(True)
+            self._trend_curve.setData(x, p)
+            self._trend_plot.setLabel("left", f"Pressure ({self._display_unit})", units="")
+            for curve in self._trend_gas_curves.values():
+                curve.setVisible(False)
+                curve.setData([], [])
+
+        if self._trend_pressure_curve is not None:
+            self._trend_pressure_curve.setData(x, p)
+            self._clamp_right_view_to_gauge_range(self._trend_right_view)
 
     def _update_spectrum_plot(
         self,
         *,
         value_mbar: float | None = None,
         timestamp_mono: float | None = None,
+        timestamp_wall: datetime | None = None,
     ) -> None:
         if self._spectrum_curve is None:
             return
@@ -2263,34 +3724,71 @@ class OPG550ControlPanel(QWidget):
         if self._trend_t0 is not None:
             elapsed = max(0.0, timestamp_mono - self._trend_t0)
 
-        spectrum = simulate_optical_spectrum(
-            pressure_mbar=max(p_mbar, 1e-12),
-            trend_mbar_per_s=trend,
-            elapsed_s=elapsed,
-            mode=self._spectrum_mode,
-            wavelength_min_nm=380.0,
-            wavelength_max_nm=780.0,
-            samples=401,
-        )
-        x = np.linspace(380.0, 780.0, len(spectrum), dtype=float)
-        y = np.array(spectrum, dtype=float)
+        if self._spectrum_mode is SpectrumMode.AUTO:
+            self._request_live_spec_if_due()
+            if self._live_spectrum_x is None or self._live_spectrum_y is None:
+                self._spectrum_curve.setData([], [])
+                self._latest_spectrum_x = None
+                self._latest_spectrum_y = None
+                self._molecule_label.setText("Likely optical gas signatures: waiting for live spectrum data")
+                self._last_pressure_mbar = max(p_mbar, 1e-12)
+                self._last_pressure_t = float(timestamp_mono)
+                self._refresh_advanced_plot()
+                return
+            x = self._live_spectrum_x
+            y = self._live_spectrum_y
+            spectrum = y.astype(float).tolist()
+            self._spectrum_curve.setPen(pg.mkPen("#90D98E", width=2))
+            self._spectrum_curve.setBrush(pg.mkBrush(144, 217, 142, 90))
+        else:
+            spectrum = simulate_optical_spectrum(
+                pressure_mbar=max(p_mbar, 1e-12),
+                trend_mbar_per_s=trend,
+                elapsed_s=elapsed,
+                mode=self._spectrum_mode,
+                wavelength_min_nm=303.05,
+                wavelength_max_nm=876.07,
+                samples=288,
+            )
+            x = np.linspace(303.05, 876.07, len(spectrum), dtype=float)
+            y = np.array(spectrum, dtype=float)
+            self._spectrum_curve.setPen(pg.mkPen(self._CLAUDE_ORANGE, width=2))
+            self._spectrum_curve.setBrush(pg.mkBrush(217, 119, 47, 80))
         if self._spectrum_user_zoomed:
             self._spectrum_plot.disableAutoRange()
         self._spectrum_curve.setData(x, y)
+        if self._spectrum_pressure_curve is not None:
+            pressure_display = convert_pressure(max(p_mbar, 1e-12), "mbar", self._display_unit)
+            self._spectrum_pressure_curve.setData(x, np.full(len(x), float(pressure_display)))
+            self._clamp_right_view_to_gauge_range(self._spectrum_right_view)
+        self._latest_spectrum_x = np.array(x, dtype=float)
+        self._latest_spectrum_y = np.array(y, dtype=float)
 
         if p_mbar <= OPG_ANALYSIS_MAX_PRESSURE_MBAR:
             matches = identify_optical_species(
                 spectrum,
-                wavelength_min_nm=380.0,
-                wavelength_max_nm=780.0,
-                top_k=4,
+                wavelength_min_nm=float(x[0]),
+                wavelength_max_nm=float(x[-1]),
+                top_k=len(self._GASES),
             )
             if matches:
-                txt = ", ".join(f"{m.name} ({m.score * 100:.0f}%)" for m in matches)
+                total_score = sum(max(m.score, 0.0) for m in matches) or 1.0
+                self._latest_gas_pct = {
+                    gas: 0.0 for gas in self._GASES
+                }
+                for match in matches:
+                    if match.name in self._latest_gas_pct:
+                        self._latest_gas_pct[match.name] = max(0.0, match.score) / total_score * 100.0
+                txt = ", ".join(
+                    f"{m.name} ({self._latest_gas_pct.get(m.name, 0.0):.0f}%)"
+                    for m in matches[:5]
+                )
             else:
+                self._latest_gas_pct = {gas: 0.0 for gas in self._GASES}
                 txt = "No dominant optical signature"
             self._molecule_label.setText(f"Likely optical gas signatures: {txt}")
         else:
+            self._latest_gas_pct = {gas: 0.0 for gas in self._GASES}
             self._molecule_label.setText(
                 "Gas analysis unavailable above "
                 f"{OPG_ANALYSIS_MAX_PRESSURE_MBAR:.1E} mbar "
@@ -2299,6 +3797,592 @@ class OPG550ControlPanel(QWidget):
 
         self._last_pressure_mbar = max(p_mbar, 1e-12)
         self._last_pressure_t = float(timestamp_mono)
+        self._append_gas_history()
+        self._capture_opg_export_sample(timestamp_wall)
+        self._evaluate_auto_plasma()
+        self._refresh_mode_plots()
+
+    def _append_gas_history(self) -> None:
+        if not self._trend_t:
+            return
+        # Don't push an all-zero sample onto the partial-pressure plot. This
+        # used to happen on every pressure poll between two genuine spectrum
+        # frames (e.g. AUTO-mode requests SPEC every 2 s but pressure polls
+        # every 1 s; total pressure briefly above OPG_ANALYSIS_MAX_PRESSURE_MBAR
+        # also wipes _latest_gas_pct to zero). The result was the periodic
+        # vertical drops to ~0 visible in Tracked Gas Analysis.
+        if not any(self._latest_gas_pct.get(gas, 0.0) > 0.0 for gas in self._GASES):
+            return
+        t_rel = self._trend_t[-1]
+        # If we already wrote a sample at this timestamp (same pressure poll
+        # firing twice), keep the most recent values rather than appending a
+        # duplicate timestamp.
+        if self._gas_t and abs(self._gas_t[-1] - float(t_rel)) < 1e-9:
+            for gas in self._GASES:
+                pct = float(self._latest_gas_pct.get(gas, 0.0))
+                partial = max(float(self._last_pressure_mbar or 0.0), 0.0) * pct / 100.0
+                if self._gas_pct[gas]:
+                    self._gas_pct[gas][-1] = pct
+                if self._gas_partial_mbar[gas]:
+                    self._gas_partial_mbar[gas][-1] = partial
+            return
+        self._gas_t.append(float(t_rel))
+        for gas in self._GASES:
+            pct = float(self._latest_gas_pct.get(gas, 0.0))
+            partial = max(float(self._last_pressure_mbar or 0.0), 0.0) * pct / 100.0
+            previous_t = self._gas_t[-2] if len(self._gas_t) > 1 else None
+            previous_partial = self._gas_partial_mbar[gas][-1] if self._gas_partial_mbar[gas] else None
+            rate = 0.0
+            if previous_t is not None and previous_partial is not None:
+                dt = max(1e-9, float(t_rel) - float(previous_t))
+                rate = (partial - float(previous_partial)) / dt
+            self._gas_pct[gas].append(pct)
+            self._gas_partial_mbar[gas].append(partial)
+            self._gas_rate_mbar_s[gas].append(rate)
+
+    def _selected_gases(self) -> set[str]:
+        return {gas for gas, check in self._gas_checks.items() if check.isChecked()}
+
+    def _refresh_gas_plot(self) -> None:
+        if self._gas_plot is None:
+            return
+        x = np.array(self._gas_t, dtype=float)
+        selected = self._selected_gases()
+        # Pre-compute the linear scale factor once per refresh instead of doing
+        # a per-sample call to convert_pressure inside a list comprehension.
+        # Pressure unit conversion is purely multiplicative, so this is safe.
+        try:
+            unit_factor = float(convert_pressure(1.0, "mbar", self._display_unit))
+        except Exception:
+            unit_factor = 1.0
+        self._gas_plot.setLabel("left", "Partial pressure", units=self._display_unit)
+        for gas, curve in self._gas_curves.items():
+            visible = gas in selected
+            if visible and self._gas_partial_mbar[gas]:
+                raw = np.fromiter(self._gas_partial_mbar[gas], dtype=float, count=len(self._gas_partial_mbar[gas]))
+                # Length of raw may differ from x if histories drifted; trim to min.
+                n = min(len(x), len(raw))
+                curve.setData(x[:n], raw[:n] * unit_factor)
+            elif not visible:
+                # Skip data update for hidden curves to save time when many
+                # gases are tracked but only a few are selected.
+                pass
+            else:
+                curve.setData([], [])
+            curve.setVisible(bool(visible))
+        if self._gas_pressure_curve is not None:
+            self._gas_pressure_curve.setData(
+                np.array(self._trend_t, dtype=float),
+                np.array(self._trend_p, dtype=float),
+            )
+            self._clamp_right_view_to_gauge_range(self._gas_right_view)
+
+    def _refresh_spectrum_gas_markers(self) -> None:
+        if self._spectrum_plot is None:
+            return
+        for marker in self._spectrum_gas_markers:
+            self._spectrum_plot.removeItem(marker)
+        self._spectrum_gas_markers.clear()
+        if self._analysis_mode != "Raw Spectrum":
+            return
+        for gas in sorted(self._selected_gases()):
+            color = self._GAS_COLORS.get(gas, "#FFFFFF")
+            for wavelength in optical_signature_wavelengths(gas):
+                marker = pg.InfiniteLine(
+                    pos=wavelength,
+                    angle=90,
+                    pen=pg.mkPen(color, width=1, style=Qt.PenStyle.DotLine),
+                    movable=False,
+                )
+                marker.setToolTip(f"{gas} {wavelength:g} nm")
+                self._spectrum_plot.addItem(marker)
+                self._spectrum_gas_markers.append(marker)
+
+    def _capture_opg_export_sample(self, timestamp_wall: datetime | None) -> None:
+        if self._latest_spectrum_x is None or self._latest_spectrum_y is None:
+            return
+        if self._last_pressure_mbar is None:
+            return
+        if timestamp_wall is None:
+            timestamp_wall = datetime.now(tz=timezone.utc)
+        elapsed = float(self._trend_t[-1]) if self._trend_t else 0.0
+        self._opg_export_samples.append({
+            "timestamp": timestamp_wall,
+            "time_s": elapsed,
+            "pressure_mbar": float(self._last_pressure_mbar),
+            "spectrum_x": np.array(self._latest_spectrum_x, dtype=float),
+            "spectrum_y": np.array(self._latest_spectrum_y, dtype=float),
+            "gas_pct": dict(self._latest_gas_pct),
+        })
+        # Note: no max-length trim. Per user request, the full session is
+        # retained so any export reflects everything captured so far.
+
+    # ------------------------------------------------------------------
+    # Per-chart CSV export helpers
+    # ------------------------------------------------------------------
+    def _ask_csv_path(self, default_name: str, title: str) -> Path | None:
+        path, _ = QFileDialog.getSaveFileName(self, title, default_name, "CSV (*.csv)")
+        if not path:
+            return None
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        return Path(path)
+
+    def _export_trend_csv(self) -> None:
+        if not self._trend_t:
+            QMessageBox.warning(self, "No trend data", "The trend chart has no samples to export yet.")
+            return
+        path = self._ask_csv_path("OPG550_trend.csv", "Export trend chart CSV")
+        if path is None:
+            return
+        try:
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["time_s", f"pressure_{self._display_unit}"])
+                for t, p in zip(self._trend_t, self._trend_p):
+                    writer.writerow([f"{float(t):.6f}", f"{float(p):.6e}"])
+        except Exception as exc:
+            logger.exception("Trend CSV export failed")
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(self, "Export complete", f"Saved {len(self._trend_t)} samples to:\n{path}")
+
+    def _export_spectrum_csv(self) -> None:
+        if self._latest_spectrum_x is None or self._latest_spectrum_y is None:
+            QMessageBox.warning(self, "No spectrum", "No spectrum data is available to export yet.")
+            return
+        path = self._ask_csv_path("OPG550_spectrum.csv", "Export spectrum CSV")
+        if path is None:
+            return
+        try:
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["wavelength_nm", "intensity_counts"])
+                for x, y in zip(self._latest_spectrum_x, self._latest_spectrum_y):
+                    writer.writerow([f"{float(x):.4f}", f"{float(y):.6e}"])
+        except Exception as exc:
+            logger.exception("Spectrum CSV export failed")
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(self, "Export complete", f"Saved {len(self._latest_spectrum_x)} points to:\n{path}")
+
+    def _export_gas_csv(self) -> None:
+        if not self._gas_t:
+            QMessageBox.warning(self, "No tracked-gas data", "No partial-pressure samples are available yet.")
+            return
+        path = self._ask_csv_path("OPG550_tracked_gases.csv", "Export tracked gases CSV")
+        if path is None:
+            return
+        try:
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                header = ["time_s"]
+                for gas in self._GASES:
+                    header.append(f"{gas}_partial_mbar")
+                    header.append(f"{gas}_pct")
+                writer.writerow(header)
+                n = len(self._gas_t)
+                for i in range(n):
+                    row: list[str] = [f"{float(self._gas_t[i]):.6f}"]
+                    for gas in self._GASES:
+                        partial = self._gas_partial_mbar[gas][i] if i < len(self._gas_partial_mbar[gas]) else 0.0
+                        pct = self._gas_pct[gas][i] if i < len(self._gas_pct[gas]) else 0.0
+                        row.append(f"{float(partial):.6e}")
+                        row.append(f"{float(pct):.4f}")
+                    writer.writerow(row)
+        except Exception as exc:
+            logger.exception("Gas CSV export failed")
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(self, "Export complete", f"Saved {len(self._gas_t)} samples to:\n{path}")
+
+    def _export_advanced_csv(self) -> None:
+        if not self._peer_pressures and not self._trend_t:
+            QMessageBox.warning(self, "No advanced data", "The advanced chart has no series to export yet.")
+            return
+        path = self._ask_csv_path("OPG550_advanced.csv", "Export advanced correlation CSV")
+        if path is None:
+            return
+        try:
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["series", "time_s", f"pressure_{self._display_unit}"])
+                # OPG own pressure trace (converted to display unit)
+                for t, p_disp in zip(self._trend_t, self._trend_p):
+                    writer.writerow(["OPG550", f"{float(t):.6f}", f"{float(p_disp):.6e}"])
+                for peer in self._peer_pressures.values():
+                    name = str(peer.get("name", "peer"))
+                    peer_unit = str(peer.get("unit", "mbar"))
+                    times = peer["t"]
+                    values = peer["p"]
+                    for t, p in zip(times, values):
+                        # Convert to current display unit for a consistent column.
+                        p_disp = convert_pressure(float(p), peer_unit, self._display_unit)
+                        writer.writerow([name, f"{float(t):.6f}", f"{float(p_disp):.6e}"])
+        except Exception as exc:
+            logger.exception("Advanced CSV export failed")
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(self, "Export complete", f"Saved advanced chart data to:\n{path}")
+
+    # ------------------------------------------------------------------
+    # Auto-plasma controls
+    # ------------------------------------------------------------------
+    def _persist_setting(self, key: str, value: object) -> None:
+        try:
+            QSettings("CustomSerialCommunicator", "CustomSerialCommunicator").setValue(key, value)
+        except Exception:
+            logger.debug("Failed to persist setting %s", key, exc_info=True)
+
+    def _on_auto_plasma_toggled(self, checked: bool) -> None:
+        self._auto_plasma_enabled = bool(checked)
+        self._persist_setting("opg/auto_plasma_enabled", self._auto_plasma_enabled)
+        # When enabling, evaluate immediately so the user gets a reaction without
+        # waiting for the next pressure poll.
+        if self._auto_plasma_enabled:
+            self._send_query("plasma_state")
+            if self._last_pressure_mbar is not None:
+                self._evaluate_auto_plasma()
+
+    def _on_auto_plasma_min_changed(self, value: float) -> None:
+        self._auto_plasma_min_mbar = float(value)
+        self._persist_setting("opg/min_ignition_pressure_mbar", self._auto_plasma_min_mbar)
+
+    def _on_auto_plasma_max_changed(self, value: float) -> None:
+        self._auto_plasma_max_mbar = float(value)
+        self._persist_setting("opg/max_safe_pressure_mbar", self._auto_plasma_max_mbar)
+
+    def _evaluate_auto_plasma(self) -> None:
+        """Decide whether to ignite or extinguish the plasma based on pressure.
+
+        Called from `_update_pressure` after `_last_pressure_mbar` is set.
+        Uses a 5 s cooldown between actions to avoid command thrashing if the
+        pressure dithers around a threshold.
+        """
+        if not self._auto_plasma_enabled:
+            return
+        if "plasma_enable" not in self._spec.commands:
+            return
+        if self._last_pressure_mbar is None or self._last_plasma_state is None:
+            return
+        now = time.monotonic()
+        if (now - self._auto_plasma_last_action_t) < 5.0:
+            return
+        p = float(self._last_pressure_mbar)
+        # Ignited == 2; "on but not ignited" == 1; off == 0.
+        plasma_currently_on = int(self._last_plasma_state) >= 1
+        if p > self._auto_plasma_max_mbar and plasma_currently_on:
+            self._auto_plasma_last_action_t = now
+            self._on_action("_plasma_off")
+            self._mode_status.setText(
+                f"Auto-plasma: pressure {p:.2e} mbar > max safe "
+                f"{self._auto_plasma_max_mbar:.2e} mbar — switching plasma OFF"
+            )
+        elif p < self._auto_plasma_min_mbar and not plasma_currently_on:
+            self._auto_plasma_last_action_t = now
+            self._on_action("_plasma_on")
+            self._mode_status.setText(
+                f"Auto-plasma: pressure {p:.2e} mbar < min ignite "
+                f"{self._auto_plasma_min_mbar:.2e} mbar — switching plasma ON"
+            )
+
+    # ------------------------------------------------------------------
+    def _on_panel_shown(self) -> None:
+        """Called when the Spectrum Studio panel becomes the active inner tab.
+
+        Issues a one-time read of plasma_state and pressure so the UI shows
+        live values immediately on entry instead of waiting for the next poll.
+        """
+        try:
+            if "pressure" in self._spec.commands:
+                self._send_query("pressure")
+            if "plasma_state" in self._spec.commands:
+                self._send_query("plasma_state")
+        except Exception:
+            logger.debug("Failed to issue panel-show queries", exc_info=True)
+        self._initial_plasma_read_done = True
+
+    def _export_opg_csv(self) -> None:
+        if not self._opg_export_samples:
+            QMessageBox.warning(self, "No OPG data", "No spectrum samples are available to export yet.")
+            return
+        export_type = "ror" if self._analysis_mode == "Rate of Rise" else "rgd"
+        default_name = "OPG550_RoR.csv" if export_type == "ror" else "OPG550_RGD.csv"
+        path, _ = QFileDialog.getSaveFileName(self, "Export OPG CSV", default_name, "CSV (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        try:
+            self._write_opg_csv(Path(path), export_type)
+        except Exception as exc:
+            logger.exception("OPG CSV export failed")
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(self, "Export complete", f"Exported {len(self._opg_export_samples)} OPG samples to:\n{path}")
+
+    def _write_opg_csv(self, path: Path, export_type: str) -> None:
+        samples = list(self._opg_export_samples)
+        first_ts = samples[0]["timestamp"]
+        if not isinstance(first_ts, datetime):
+            first_ts = datetime.now(tz=timezone.utc)
+        serial = "".join(ch for ch in self._sn_value.text() if ch.isdigit())[-9:].rjust(9, "0")
+        bootloader = self._telemetry_rows.get("bootloader_version")
+        boot_text = bootloader.text() if bootloader is not None else "03.01.00.0063"
+        app_text = self._fw_value.text() if self._fw_value.text() != "-" else "01.00.28.0184"
+        if export_type == "ror":
+            measurement_type = "RoR Leak Detection Measurement"
+            headers, units, block_sizes = self._opg_ror_header(samples[0])
+        else:
+            measurement_type = "RGD Measurement"
+            headers, units, block_sizes = self._opg_rgd_header(samples[0])
+
+        lines = [
+            f"Timestamp,{first_ts.strftime('%Y%m%d_%H%M')}",
+            f"Measurement Type,{measurement_type}",
+            f"serial number,{serial}",
+            f"bootloader version,{boot_text}",
+            f"application version,{app_text}",
+            "",
+            ",".join(headers),
+            ",".join(units),
+        ]
+        previous_sample: dict[str, object] | None = None
+        for sample in samples:
+            values = (
+                self._opg_ror_row(sample, previous_sample)
+                if export_type == "ror"
+                else self._opg_rgd_row(sample)
+            )
+            lines.append(self._join_opg_blocks(values, block_sizes))
+            previous_sample = sample
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _spectrum_values_288(self, sample: dict[str, object], wavelength_min: float, wavelength_max: float) -> tuple[list[float], list[float]]:
+        x = np.asarray(sample["spectrum_x"], dtype=float)
+        y = np.asarray(sample["spectrum_y"], dtype=float)
+        out_x = np.linspace(wavelength_min, wavelength_max, 288, dtype=float)
+        out_y = np.interp(out_x, x, y) * 10000.0
+        return out_x.tolist(), out_y.tolist()
+
+    def _opg_rgd_header(self, sample: dict[str, object]) -> tuple[list[str], list[str], list[int]]:
+        wavelengths, _ = self._spectrum_values_288(sample, 303.05, 876.07)
+        species = ["Hydrogen", "Helium", "Nitrogen", "Oxygen", "Argon", "NH", "OH", "CH", "CO", "Fluor"]
+        ratios = [
+            "391nm N2+ vs  311nm OH", "336nm N2 vs 311nm OH", "391nm N2+ vs 656nm H",
+            "336nm N2 vs 656nm H", "391nm N2+ vs 810nm Ar", "777nm O vs 810nm Ar",
+            "502nm He vs 336nm N2", "777nm O vs 336nm N2",
+        ]
+        headers = ["Timestamp", "Time", "TotalPressure", "AnalogOut", "IntegrationTime"]
+        headers += [f"{wl:.2f}" for wl in wavelengths]
+        headers += species + species + ratios
+        units = ["[timestamp]", "[sec]", "[mbar]", "[mV]", "[ms]"]
+        units += ["[counts/sec]"] * 288
+        units += ["[counts/sec]"] * 10
+        units += ["mbar"] + [" mbar"] * 9
+        units += ["--"] * 8
+        return headers, units, [5, 288, 10, 10, 8]
+
+    def _opg_ror_header(self, sample: dict[str, object]) -> tuple[list[str], list[str], list[int]]:
+        wavelengths, _ = self._spectrum_values_288(sample, 305.53, 878.56)
+        headers = ["Timestamp", "Time", "TotalPressure", "AnalogOut", "IntegrationTime"]
+        headers += [f"{wl:.2f}" for wl in wavelengths]
+        headers += ["O2 777nm", "Ar 812nm", "N2 822nm", "N2 870nm", "N2 337nm", "H 656nm", "pressure Rise"]
+        units = ["[timestamp]", "[sec]", "[mbar]", "[mV]", "[ms]"]
+        units += ["[counts/sec]"] * 288
+        units += ["-"] * 6 + ["[mTorr/min]"]
+        return headers, units, [5, 288, 6, 1]
+
+    def _opg_rgd_row(self, sample: dict[str, object]) -> list[object]:
+        _, spectrum = self._spectrum_values_288(sample, 303.05, 876.07)
+        pressure = float(sample["pressure_mbar"])
+        gas_pct = sample.get("gas_pct", {})
+        if not isinstance(gas_pct, dict):
+            gas_pct = {}
+        species_pct = [
+            float(gas_pct.get("H2", 0.0)), float(gas_pct.get("He", 0.0)), float(gas_pct.get("N2", 0.0)),
+            float(gas_pct.get("O2", 0.0)), float(gas_pct.get("Ar", 0.0)), 0.0,
+            float(gas_pct.get("OH", 0.0)), float(gas_pct.get("CH4", 0.0)), float(gas_pct.get("CO", 0.0)), 0.0,
+        ]
+        raw_counts = [pct * 100.0 for pct in species_pct]
+        partials = [pressure * pct / 100.0 for pct in species_pct]
+        ratios = self._opg_ratio_values(gas_pct)
+        return self._opg_common_row(sample) + spectrum + raw_counts + partials + ratios
+
+    def _opg_ror_row(self, sample: dict[str, object], previous_sample: dict[str, object] | None) -> list[object]:
+        wavelengths, spectrum = self._spectrum_values_288(sample, 305.53, 878.56)
+        lines = [777.0, 812.0, 822.0, 870.0, 337.0, 656.0]
+        intensities = [self._interp_line(wavelengths, spectrum, wl) for wl in lines]
+        pressure_rise = self._pressure_rise_mtorr_per_min(sample, previous_sample)
+        return self._opg_common_row(sample) + spectrum + intensities + [pressure_rise]
+
+    @staticmethod
+    def _opg_common_row(sample: dict[str, object]) -> list[object]:
+        ts = sample["timestamp"]
+        if not isinstance(ts, datetime):
+            ts = datetime.now(tz=timezone.utc)
+        return [
+            ts.strftime("%Y-%m-%d %H:%M:%S.%f"),
+            float(sample["time_s"]),
+            float(sample["pressure_mbar"]),
+            0,
+            0.0,
+        ]
+
+    @staticmethod
+    def _join_opg_blocks(values: list[object], block_sizes: list[int]) -> str:
+        fields = [str(value) for value in values]
+        blocks: list[str] = []
+        pos = 0
+        for size in block_sizes:
+            block = fields[pos:pos + size]
+            blocks.append(", ".join(block))
+            pos += size
+        return ",".join(blocks)
+
+    @staticmethod
+    def _interp_line(wavelengths: list[float], spectrum: list[float], wavelength: float) -> float:
+        return float(np.interp([wavelength], np.asarray(wavelengths), np.asarray(spectrum))[0])
+
+    @staticmethod
+    def _safe_ratio(num: float, den: float) -> float:
+        return float(num / den) if den > 1e-12 else 0.0
+
+    def _opg_ratio_values(self, gas_pct: dict[object, object]) -> list[float]:
+        n2 = float(gas_pct.get("N2", 0.0))
+        oh = float(gas_pct.get("OH", 0.0))
+        h2 = float(gas_pct.get("H2", 0.0))
+        ar = float(gas_pct.get("Ar", 0.0))
+        o2 = float(gas_pct.get("O2", 0.0))
+        he = float(gas_pct.get("He", 0.0))
+        return [
+            self._safe_ratio(n2, oh), self._safe_ratio(n2, oh), self._safe_ratio(n2, h2),
+            self._safe_ratio(n2, h2), self._safe_ratio(n2, ar), self._safe_ratio(o2, ar),
+            self._safe_ratio(he, n2), self._safe_ratio(o2, n2),
+        ]
+
+    def _pressure_rise_mtorr_per_min(
+        self,
+        sample: dict[str, object],
+        previous_sample: dict[str, object] | None,
+    ) -> float:
+        if previous_sample is None:
+            return 0.0
+        dt = float(sample["time_s"]) - float(previous_sample["time_s"])
+        if dt <= 0:
+            return 0.0
+        dp_mbar = float(sample["pressure_mbar"]) - float(previous_sample["pressure_mbar"])
+        return dp_mbar * 750.062 * 60.0 / dt
+
+    def _refresh_peer_combos(self) -> None:
+        combos = [self._compare_a_combo, self._compare_b_combo]
+        if any(combo is None for combo in combos):
+            return
+        items = [(device_id, str(peer.get("name", device_id))) for device_id, peer in self._peer_pressures.items()]
+        items.sort(key=lambda item: item[1])
+        for combo in combos:
+            if combo is None:
+                continue
+            current = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("-", "")
+            for device_id, name in items:
+                combo.addItem(name, device_id)
+            if current:
+                idx = combo.findData(current)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+        if self._compare_a_combo is not None and self._compare_a_combo.currentIndex() <= 0 and items:
+            self._compare_a_combo.setCurrentIndex(1)
+        if self._compare_b_combo is not None and self._compare_b_combo.currentIndex() <= 0 and len(items) > 1:
+            self._compare_b_combo.setCurrentIndex(2)
+
+    def _refresh_advanced_plot(self) -> None:
+        if self._advanced_plot is None:
+            return
+        source_a = self._compare_a_combo.currentData() if self._compare_a_combo is not None else ""
+        source_b = self._compare_b_combo.currentData() if self._compare_b_combo is not None else ""
+        peer_a = self._peer_pressures.get(str(source_a)) if source_a else None
+        peer_b = self._peer_pressures.get(str(source_b)) if source_b else None
+
+        # Resolve human-readable names for A/B and keep the legend in sync.
+        name_a = (
+            str(peer_a.get("name", source_a)) if peer_a else
+            (self._compare_a_combo.currentText() if self._compare_a_combo is not None else "Source A")
+        )
+        name_b = (
+            str(peer_b.get("name", source_b)) if peer_b else
+            (self._compare_b_combo.currentText() if self._compare_b_combo is not None else "Source B")
+        )
+        if self._advanced_legend is not None and self._advanced_curve_a is not None and self._advanced_curve_b is not None:
+            self._advanced_legend.removeItem(self._advanced_curve_a)
+            self._advanced_legend.removeItem(self._advanced_curve_b)
+            self._advanced_legend.addItem(self._advanced_curve_a, name_a)
+            self._advanced_legend.addItem(self._advanced_curve_b, name_b)
+
+        if peer_a is not None and self._advanced_curve_a is not None:
+            self._advanced_curve_a.setData(
+                np.array(peer_a["t"], dtype=float),
+                np.array(peer_a["p"], dtype=float),
+            )
+        elif self._advanced_curve_a is not None:
+            self._advanced_curve_a.setData([], [])
+
+        if peer_b is not None and self._advanced_curve_b is not None:
+            self._advanced_curve_b.setData(
+                np.array(peer_b["t"], dtype=float),
+                np.array(peer_b["p"], dtype=float),
+            )
+        elif self._advanced_curve_b is not None:
+            self._advanced_curve_b.setData([], [])
+
+        if peer_a is not None and peer_b is not None:
+            latest_a = float(peer_a["p"][-1]) if peer_a["p"] else math.nan
+            latest_b = float(peer_b["p"][-1]) if peer_b["p"] else math.nan
+            if math.isfinite(latest_a) and math.isfinite(latest_b):
+                delta = latest_a - latest_b
+                self._delta_label.setText(
+                    f"<span style='color:#43C5FF'><b>{name_a}</b></span>"
+                    f" \u2212 <span style='color:#E8D74C'><b>{name_b}</b></span>:  "
+                    f"\u0394 = {delta:+.4E} {self._display_unit}  |  "
+                    f"ratio = {latest_a / max(latest_b, 1e-30):.4g}"
+                )
+            else:
+                self._delta_label.setText("Delta: -")
+        else:
+            self._delta_label.setText("Delta: select two pressure sources")
+
+        gas = self._correlation_gas_combo.currentData() if self._correlation_gas_combo is not None else "OH"
+        # Pre-compute linear unit factor; pressure conversion is purely
+        # multiplicative, so vectorized numpy ops avoid an O(N) Python
+        # list-comp per refresh.
+        try:
+            unit_factor = float(convert_pressure(1.0, "mbar", self._display_unit))
+        except Exception:
+            unit_factor = 1.0
+        gas_values: np.ndarray | None = None
+        if self._advanced_gas_curve is not None and gas in self._gas_partial_mbar:
+            partial = self._gas_partial_mbar[str(gas)]
+            gas_values = np.fromiter(partial, dtype=float, count=len(partial)) * unit_factor
+            gas_t_arr = np.array(self._gas_t, dtype=float)
+            n = min(len(gas_t_arr), len(gas_values))
+            self._advanced_gas_curve.setData(gas_t_arr[:n], gas_values[:n])
+            if self._advanced_plot is not None:
+                axis = self._advanced_plot.getPlotItem().getAxis("right")
+                axis.setLabel(
+                    f"{gas} partial pressure (linear scale, right axis)",
+                    units=self._display_unit,
+                    color="#FF5B5B",
+                )
+
+        if self._advanced_right_view is not None:
+            if gas_values is not None and gas_values.size:
+                ymax = float(gas_values.max())
+            else:
+                ymax = 1e-12
+            self._advanced_right_view.setYRange(0, max(ymax * 1.2, 1e-12))
 
     @staticmethod
     def _vacuum_score(pressure_mbar: float) -> int:
@@ -2326,11 +4410,12 @@ class OPG550ControlPanel(QWidget):
 # ---------------------------------------------------------------------------
 
 class GaugeTab(QWidget):
-    """One gauge's live view + terminal tab."""
+    """One gauge's live view, command displays, settings, and terminal tabs."""
 
     #: Emitted when the user picks a new colour via the header swatch.
     #: Payload: (device_id, hex_color)
     color_changed = pyqtSignal(str, str)
+    poll_commands_changed = pyqtSignal(str, object)
 
     def __init__(
         self,
@@ -2353,11 +4438,13 @@ class GaugeTab(QWidget):
         self._gauge_color: str = color
 
         self._all_readings: list[DeviceReading] = []
-        self._opg_panel: OPG550ControlPanel | None = None
+        self._opg_panel: OPG550SpectrumStudio | None = None
+        self._command_panel: CommandDisplayPanel | None = None
 
         self._build_ui()
         # Push current display-unit into the plot so its axes match the table.
         self._plot_panel.set_display_unit(self._display_unit)
+        self.apply_theme()
 
         # Wire terminal/settings signal fan-out
         worker.terminal_response.connect(self._on_terminal_response)
@@ -2398,6 +4485,7 @@ class GaugeTab(QWidget):
 
         self._status_label = QLabel("Connecting…")
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        header.addStretch()
         header.addWidget(self._status_label)
         root.addLayout(header)
 
@@ -2410,6 +4498,25 @@ class GaugeTab(QWidget):
         live = QWidget()
         live_layout = QVBoxLayout(live)
         live_layout.setContentsMargins(0, 4, 0, 0)
+
+        live_actions = QHBoxLayout()
+        live_actions.setContentsMargins(2, 0, 2, 0)
+        live_actions.setSpacing(6)
+        live_actions.addWidget(QLabel("Live Data"))
+        live_actions.addStretch()
+        self._poll_commands_btn = QPushButton("Commands")
+        self._poll_commands_btn.setToolTip("Change the commands polled in the background for this tab")
+        self._poll_commands_btn.setFixedSize(92, 24)
+        self._poll_commands_btn.setObjectName("CompactActionButton")
+        self._poll_commands_btn.clicked.connect(self._edit_poll_commands)
+        live_actions.addWidget(self._poll_commands_btn)
+        self._export_plot_btn = QPushButton("Export Plot")
+        self._export_plot_btn.setToolTip("Export readings shown by this gauge tab")
+        self._export_plot_btn.setFixedSize(92, 24)
+        self._export_plot_btn.setObjectName("CompactActionButton")
+        self._export_plot_btn.clicked.connect(self._export_live_plot)
+        live_actions.addWidget(self._export_plot_btn)
+        live_layout.addLayout(live_actions)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
@@ -2426,10 +4533,18 @@ class GaugeTab(QWidget):
         self._table.setMaximumHeight(220)
         splitter.addWidget(self._table)
 
-        splitter.setSizes([400, 130])
+        splitter.setSizes([420, 140])
         self._live_splitter = splitter
         live_layout.addWidget(splitter)
         self._tabs.addTab(live, "Live View")
+
+        # ── Command Displays tab ──
+        self._command_panel = CommandDisplayPanel(
+            spec=self._spec,
+            initial_commands=list(getattr(self.worker, "_commands", [])),
+            trace_color=self._gauge_color,
+        )
+        self._tabs.addTab(self._command_panel, "Command Displays")
 
         # ── Terminal tab ──
         self._terminal = TerminalWidget(
@@ -2443,13 +4558,39 @@ class GaugeTab(QWidget):
         self._tabs.addTab(self._settings, "Settings")
 
         if self._spec.model.upper() == "OPG550":
-            self._opg_panel = OPG550ControlPanel(spec=self._spec, worker=self.worker)
+            self._opg_panel = OPG550SpectrumStudio(spec=self._spec, worker=self.worker)
             self._opg_panel.set_display_unit(self._display_unit)
-            self._tabs.addTab(self._opg_panel, "OPG550 Studio")
+            self._tabs.addTab(self._opg_panel, "Spectrum Studio")
+
+    def apply_theme(self) -> None:
+        theme = current_theme(self)
+        title_model = self.display_name if self.is_simulated else self._spec.model
+        self._title_label.setText(
+            f"<b>{title_model}</b>&nbsp;&nbsp;"
+            f"<span style='color:{theme.muted}'>{self.device_id}</span>"
+        )
+        compact_action_style = (
+            f"QPushButton#CompactActionButton {{ background:{theme.control}; color:{theme.text};"
+            f" border:1px solid {theme.border}; border-radius:5px; padding:2px 8px; font-weight:600; }}"
+            f"QPushButton#CompactActionButton:hover {{ background:{theme.control_hover}; }}"
+        )
+        self._poll_commands_btn.setStyleSheet(compact_action_style)
+        self._export_plot_btn.setStyleSheet(compact_action_style)
+        for panel in (self._plot_panel, self._command_panel, self._terminal, self._settings, self._opg_panel):
+            hook = getattr(panel, "apply_theme", None)
+            if callable(hook):
+                hook()
+        for plot in self.findChildren(pg.PlotWidget):
+            themed_plot(plot)
 
     def _on_inner_tab_changed(self, index: int) -> None:
-        if self._tabs.tabText(index) == "Settings":
+        tab_text = self._tabs.tabText(index)
+        if tab_text == "Settings":
             self._settings.refresh_setpoints()
+        elif tab_text == "Spectrum Studio" and self._opg_panel is not None:
+            # Fire a one-shot read of pressure + plasma_state so the user sees
+            # live values immediately on entering the tab.
+            self._opg_panel._on_panel_shown()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -2466,6 +4607,8 @@ class GaugeTab(QWidget):
         if reading.value is not None:
             value = self._to_display(reading.value, reading.unit)
             self._plot_panel.feed(reading.command, reading.timestamp_mono, value)
+        if self._command_panel is not None:
+            self._command_panel.on_reading(reading)
         self._settings.on_reading(reading)
         if self._opg_panel is not None:
             self._opg_panel.on_reading(reading)
@@ -2489,8 +4632,57 @@ class GaugeTab(QWidget):
     def _on_terminal_response(self, entry) -> None:
         self._terminal.on_terminal_response(entry)
         self._settings.on_terminal_response(entry)
+        if self._command_panel is not None:
+            parsed = None
+            protocol = getattr(self.worker, "_protocol", None)
+            command = entry.command or ""
+            if command and entry.response and protocol is not None:
+                try:
+                    parsed = protocol.parse_response(entry.response, command)
+                except Exception:
+                    logger.exception("Failed to parse terminal response for command panel")
+            self._command_panel.on_terminal_response(entry, parsed)
         if self._opg_panel is not None:
             self._opg_panel.on_terminal_response(entry)
+
+    def _edit_poll_commands(self) -> None:
+        current = self.current_poll_commands()
+        dlg = PollCommandsDialog(self._spec, current, self)
+        if not dlg.exec():
+            return
+        commands = dlg.selected_commands()
+        self.apply_poll_commands(commands)
+
+    def current_poll_commands(self) -> list[str]:
+        return list(getattr(self.worker, "_commands", []))
+
+    def apply_poll_commands(self, commands: list[str]) -> None:
+        if not commands:
+            return
+        setter = getattr(self.worker, "set_commands", None)
+        if callable(setter):
+            setter(commands)
+        else:
+            self.worker._commands = list(commands)
+        if self._command_panel is not None:
+            self._command_panel.set_polled_commands(commands)
+        self.poll_commands_changed.emit(self.device_id, commands)
+
+    def edit_poll_commands(self) -> None:
+        self._edit_poll_commands()
+
+    def _export_live_plot(self) -> None:
+        if not self._all_readings:
+            return
+        commands = set(getattr(self.worker, "_commands", [])) or None
+        dlg = ExportDialog(
+            self._all_readings,
+            self,
+            title=f"Export {self.display_name} Plot",
+            preselected_devices={self.device_id},
+            preselected_commands=commands,
+        )
+        dlg.exec()
 
     # ------------------------------------------------------------------
     # Table
@@ -2567,6 +4759,8 @@ class GaugeTab(QWidget):
         self._gauge_color = color
         self._plot_panel.set_trace_base_color(color)
         self._terminal.set_rx_color(color)
+        if self._command_panel is not None:
+            self._command_panel.set_trace_color(color)
 
     # ------------------------------------------------------------------
     # Data access

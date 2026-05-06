@@ -88,6 +88,7 @@ class GaugeWorker(QThread):
         self._transport: SerialTransport | None = None
         self._terminal_queue: _queue.SimpleQueue = _queue.SimpleQueue()
         self._polling_enabled = True
+        self._stop_requested = False
 
     # ------------------------------------------------------------------
     # Public control API  (call from GUI thread)
@@ -95,6 +96,7 @@ class GaugeWorker(QThread):
 
     def stop(self) -> None:
         """Request the worker to exit cleanly.  Returns immediately."""
+        self._stop_requested = True
         self.requestInterruption()
 
     def send_terminal_command(self, frame: bytes, command: str = "") -> None:
@@ -109,11 +111,19 @@ class GaugeWorker(QThread):
         """Enable/disable automatic worker polling (terminal commands still run)."""
         self._polling_enabled = bool(enabled)
 
+    def set_commands(self, commands: Sequence[str]) -> None:
+        """Replace the automatic polling command list."""
+        self._commands = [
+            command for command in commands
+            if command in self._spec.commands and self._spec.commands[command].read
+        ]
+
     # ------------------------------------------------------------------
     # QThread.run — everything below runs in the worker thread
     # ------------------------------------------------------------------
 
     def run(self) -> None:
+        self._stop_requested = False
         transport = SerialTransport(self._transport_cfg)
         self._transport = transport
 
@@ -144,7 +154,7 @@ class GaugeWorker(QThread):
         consecutive_errors = 0
         silent_cycles = 0  # full cycles where every command got only an echo or no data
 
-        while not self.isInterruptionRequested():
+        while not self._should_stop():
             # Drain any terminal commands queued by the GUI thread first
             self._drain_terminal_queue(transport)
 
@@ -155,8 +165,8 @@ class GaugeWorker(QThread):
             cycle_start = time.monotonic()
             cycle_saw_response = False
 
-            for command in self._commands:
-                if self.isInterruptionRequested():
+            for command in tuple(self._commands):
+                if self._should_stop():
                     break
                 try:
                     reading, saw_any_bytes = self._poll_one(transport, command)
@@ -229,6 +239,15 @@ class GaugeWorker(QThread):
             self._emit_error(f"Parse error ({command}): {result.error}", recoverable=True)
             return None, saw_any_bytes
 
+        if result.extra.get("pixel_data"):
+            self.terminal_response.emit(TerminalEntry(
+                request=request,
+                response=result.raw,
+                timestamp=datetime.now(tz=timezone.utc),
+                command=command,
+                auto_poll=True,
+            ))
+
         if result.value is None:
             return None, saw_any_bytes
 
@@ -250,6 +269,7 @@ class GaugeWorker(QThread):
         from serial_comm.protocols.pfeiffer_ascii import TERMINATOR as PA_TERM
         from serial_comm.protocols.pfeiffer_binary import PfeifferBinaryProtocol
         from serial_comm.protocols.cdg_serial import RESPONSE_LENGTH, RESPONSE_SYNC
+        from serial_comm.protocols.inficon_p3_v02 import InficonP3V02Protocol
 
         proto = self._protocol
         if isinstance(proto, PfeifferBinaryProtocol):
@@ -260,6 +280,14 @@ class GaugeWorker(QThread):
             msg_len = header[3]
             rest = transport.read_bytes(msg_len + 2)  # payload + 2 CRC bytes
             return header + rest
+        if isinstance(proto, InficonP3V02Protocol):
+            header = transport.read_bytes(5)
+            if len(header) < 5:
+                return header
+            apdu_len = (header[3] << 8) | header[4]
+            if apdu_len < 5 or apdu_len > 4096:
+                return header
+            return header + transport.read_bytes(apdu_len + 2)
         if self._spec.protocol == "ppg_ascii":
             return transport.read_until(PPG_TERM)
         if self._spec.protocol in ("pfeiffer_ascii", "inficon_ascii"):
@@ -289,7 +317,7 @@ class GaugeWorker(QThread):
 
         consecutive_errors = 0
 
-        while not self.isInterruptionRequested():
+        while not self._should_stop():
             self._drain_terminal_queue(transport)
 
             if not self._polling_enabled:
@@ -376,6 +404,7 @@ class GaugeWorker(QThread):
         from serial_comm.protocols.pfeiffer_ascii import TERMINATOR as PA_TERM
         from serial_comm.protocols.pfeiffer_binary import PfeifferBinaryProtocol
         from serial_comm.protocols.cdg_serial import RESPONSE_LENGTH, RESPONSE_SYNC
+        from serial_comm.protocols.inficon_p3_v02 import InficonP3V02Protocol
 
         proto = self._protocol
         if self._spec.protocol == "ppg_ascii":
@@ -388,6 +417,14 @@ class GaugeWorker(QThread):
                 return header
             msg_len = header[3]
             return header + transport.read_bytes(msg_len + 2)
+        if isinstance(proto, InficonP3V02Protocol):
+            header = transport.read_bytes(5)
+            if len(header) < 5:
+                return header
+            apdu_len = (header[3] << 8) | header[4]
+            if apdu_len < 5 or apdu_len > 4096:
+                return header
+            return header + transport.read_bytes(apdu_len + 2)
         if self._spec.protocol == "cdg_serial":
             return transport.read_frame(RESPONSE_SYNC, RESPONSE_LENGTH)
         return transport.read_bytes(64)
@@ -415,6 +452,9 @@ class GaugeWorker(QThread):
         """Sleep for *seconds* total, waking every *chunk* to check for stop request."""
         end = time.monotonic() + seconds
         while time.monotonic() < end:
-            if self.isInterruptionRequested():
+            if self._should_stop():
                 break
             time.sleep(min(chunk, end - time.monotonic()))
+
+    def _should_stop(self) -> bool:
+        return self._stop_requested or self.isInterruptionRequested()
