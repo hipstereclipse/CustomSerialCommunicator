@@ -84,7 +84,11 @@ class ExportDialog(QDialog):
         form.addRow("Pressure unit:", self._unit_combo)
 
         self._csv_shape = QComboBox()
-        self._csv_shape.addItems(["Long table", "Wide by command"])
+        self._csv_shape.addItems(["Wide by command", "Long table"])
+        self._csv_shape.setToolTip(
+            "Wide by command: each series gets its own pair of (timestamp, value) "
+            "columns side-by-side.\nLong table: a single row per reading."
+        )
         form.addRow("CSV layout:", self._csv_shape)
 
         layout.addLayout(form)
@@ -271,14 +275,45 @@ class ExportDialog(QDialog):
                 writer.writerow([r.device_id, r.timestamp_wall.isoformat(), r.command, val, out_unit, r.raw.hex()])
 
     def _export_csv_wide(self, fh, readings: list[DeviceReading], factor: float, unit: str) -> None:
+        """Write a CSV with each series as its own pair of adjacent columns.
+
+        Layout::
+
+            <series1>_timestamp_utc, <series1>_<unit>, <series2>_timestamp_utc, <series2>_<unit>, ...
+
+        Each series fills its two columns top-to-bottom independently, so
+        timestamps from different series are NOT forced into a single shared
+        timeline.  Rows past a given series' length are left blank.  This is
+        the layout users typically want for plotting/analysis tools where
+        each curve has its own (t, y) pairs.
+        """
         import csv
-        keys = sorted({f"{r.device_id}:{r.command}" for r in readings})
-        writer = csv.writer(fh)
-        writer.writerow(["timestamp_utc", *keys])
+        from collections import defaultdict
+
+        series: dict[str, list[DeviceReading]] = defaultdict(list)
         for r in readings:
-            val, _ = self._convert_value(r, factor, unit)
-            row = [r.timestamp_wall.isoformat(), *("" for _ in keys)]
-            row[keys.index(f"{r.device_id}:{r.command}") + 1] = val
+            series[f"{r.device_id}:{r.command}"].append(r)
+        keys = sorted(series.keys())
+        for k in keys:
+            series[k].sort(key=lambda r: r.timestamp_wall)
+
+        writer = csv.writer(fh)
+        header: list[str] = []
+        for k in keys:
+            header.extend([f"{k}_timestamp_utc", f"{k}_{unit}"])
+        writer.writerow(header)
+
+        max_len = max((len(series[k]) for k in keys), default=0)
+        for i in range(max_len):
+            row: list[object] = []
+            for k in keys:
+                bucket = series[k]
+                if i < len(bucket):
+                    r = bucket[i]
+                    val, _ = self._convert_value(r, factor, unit)
+                    row.extend([r.timestamp_wall.isoformat(), val])
+                else:
+                    row.extend(["", ""])
             writer.writerow(row)
 
     def _export_parquet(self, readings: list[DeviceReading], factor: float, unit: str) -> None:

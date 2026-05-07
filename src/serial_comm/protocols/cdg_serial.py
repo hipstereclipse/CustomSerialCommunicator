@@ -23,9 +23,12 @@ Wire format (per INFICON "Communication Protocol RS232C Interface", TIRA49E1):
 
   Pressure (engineering units):
 
-        p = signed_int16(bytes[4:6]) / 16384 * Full_Scale
+        ratio   = signed_int16(bytes[4:6]) / 16384
+        pressure = clamp(ratio, -0.024, +1.024) * Full_Scale
 
-  Callers supply ``full_scale_mbar`` when the factory range is known.
+  The clamp matches the CDG's analog output, which saturates at 10.24 V
+  (= 1.024 × FS) and -0.24 V (= -0.024 × FS).  Callers supply
+  ``full_scale_mbar`` when the factory range is known.
 
 Error byte bits:
     0x01  underrange          (soft)
@@ -209,7 +212,17 @@ class CDGProtocol(GaugeProtocol):
             return self._err(f"Gauge fault (error byte 0x{err_byte:02X})", raw)
 
         meas = int.from_bytes(raw[4:6], byteorder="big", signed=True)
-        ratio = meas / 16384.0
+        raw_ratio = meas / 16384.0
+        # The CDG's analog output is clipped at 10.24 V, which corresponds to
+        # 1.024 × Full_Scale.  In digital mode the meas word can saturate at
+        # the signed-int16 maximum (≈ +2.0 × FS), which is not a physically
+        # meaningful pressure — it is just the digital saturation marker.
+        # Clamp the reported ratio so callers never see values above the
+        # gauge's true measurement ceiling, and likewise clamp negative
+        # underrange below -0.024 × FS.
+        _CDG_RATIO_MAX = 1.024
+        _CDG_RATIO_MIN = -0.024
+        ratio = max(_CDG_RATIO_MIN, min(_CDG_RATIO_MAX, raw_ratio))
         pressure = ratio * self.full_scale_mbar
 
         sensor_code = raw[7]
@@ -220,6 +233,13 @@ class CDGProtocol(GaugeProtocol):
             warnings.append("underrange")
         if err_byte & 0x02:
             warnings.append("overrange")
+        # The error byte may not flag overrange in every firmware revision —
+        # promote a saturated raw ratio to an overrange warning so the GUI
+        # can still annotate the trace correctly.
+        if raw_ratio >= _CDG_RATIO_MAX and "overrange" not in warnings:
+            warnings.append("overrange")
+        if raw_ratio <= _CDG_RATIO_MIN and "underrange" not in warnings:
+            warnings.append("underrange")
         if err_byte & 0x04:
             warnings.append("zero adjust running")
         if err_byte & 0x08:
@@ -242,6 +262,7 @@ class CDGProtocol(GaugeProtocol):
                 "status": status,
                 "error_byte": err_byte,
                 "ratio": ratio,
+                "raw_ratio": raw_ratio,
                 "full_scale_mbar": self.full_scale_mbar,
                 "warnings": warnings,
             },

@@ -19,7 +19,7 @@ import logging
 from copy import deepcopy
 
 import serial.tools.list_ports
-from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QButtonGroup, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QComboBox, QGroupBox, QHBoxLayout, QLabel,
@@ -34,6 +34,10 @@ from serial_comm.command_utils import (
     is_pressure_command,
     is_primary_pressure_command,
 )
+from serial_comm.simulation_models import (
+    CDGFullScaleOption,
+    cdg_full_scale_options,
+)
 from GUI.gauge_workspace.port_scanner import PortScanner
 from GUI.theme import current_theme, list_style
 
@@ -46,13 +50,37 @@ _MODEL_ALIASES = {
 
 
 class _ScanResultWidget(QWidget):
-    """Compact two-line scan result card."""
+    """Compact two-line scan result card.
 
-    def __init__(self, port: str, model_hint: str, description: str, parent: QWidget | None = None) -> None:
+    For CDG gauges the card additionally shows two combo boxes (full-scale
+    and native unit). The user picks the actual head's full-scale, which
+    overrides the protocol's full_scale_mbar so pressure readings are
+    correctly scaled for that specific physical gauge.
+    """
+
+    full_scale_changed = pyqtSignal(float)  # emits selected full_scale_mbar
+
+    def __init__(
+        self,
+        port: str,
+        model_hint: str,
+        description: str,
+        *,
+        is_cdg: bool = False,
+        cdg_model: str = "",
+        initial_full_scale_mbar: float | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._port = port
         self._model_hint = model_hint
         self._description = description
+        self._is_cdg = is_cdg
+        self._cdg_model = cdg_model or ""
+        self._cdg_options: tuple[CDGFullScaleOption, ...] = (
+            cdg_full_scale_options(cdg_model) if is_cdg else ()
+        )
+        self._suppress_signals = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 6, 10, 6)
@@ -69,13 +97,158 @@ class _ScanResultWidget(QWidget):
         self._detail_label.setWordWrap(True)
         layout.addWidget(self._detail_label)
 
+        # Labels are mouse-transparent so clicks fall through to the list.
         self._model_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._detail_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        # CDG-only override row: native-unit + full-scale combos.
+        self._fs_row: QWidget | None = None
+        self._unit_combo: QComboBox | None = None
+        self._fs_combo: QComboBox | None = None
+        if is_cdg:
+            self._fs_row = QWidget(self)
+            # Empty space in the row should still let clicks fall through to
+            # the QListWidget so users can select the row by clicking outside
+            # the combo boxes. Children (combos) override this individually.
+            self._fs_row.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            row = QHBoxLayout(self._fs_row)
+            row.setContentsMargins(0, 2, 0, 0)
+            row.setSpacing(6)
+
+            row.addWidget(self._make_caption("Full Scale:"))
+
+            self._fs_combo = QComboBox(self._fs_row)
+            self._fs_combo.setToolTip(
+                "Choose the actual full-scale of the installed CDG head.\n"
+                "Pressure readings are scaled by this value."
+            )
+            row.addWidget(self._fs_combo, 2)
+
+            row.addWidget(self._make_caption("Unit:"))
+
+            self._unit_combo = QComboBox(self._fs_row)
+            self._unit_combo.addItems(["Torr", "mbar"])
+            self._unit_combo.setToolTip(
+                "Native calibration unit of the head (Torr-native or mbar-native).\n"
+                "Filters the full-scale options shown."
+            )
+            row.addWidget(self._unit_combo, 1)
+
+            row.addStretch()
+            layout.addWidget(self._fs_row)
+
+            # Default unit/FS based on detected value.
+            initial_unit = self._guess_unit_from_mbar(initial_full_scale_mbar)
+            idx = self._unit_combo.findText(initial_unit)
+            if idx >= 0:
+                self._unit_combo.setCurrentIndex(idx)
+            self._refill_fs_combo()
+            if initial_full_scale_mbar is not None:
+                self._select_fs_mbar(initial_full_scale_mbar)
+
+            self._unit_combo.currentIndexChanged.connect(self._on_unit_changed)
+            self._fs_combo.currentIndexChanged.connect(self._on_fs_changed)
+
+            # Make the card itself click-through so the QListWidget receives
+            # selection events on empty space; the combos remain interactive
+            # because WA_TransparentForMouseEvents only applies to the widget
+            # it is set on, not its children.
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        else:
+            # Non-CDG widget: fully transparent so clicks select the row.
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(50)
+        self.setMinimumHeight(70 if is_cdg else 50)
         self.apply_theme()
+
+    # ------------------------------------------------------------------
+    # CDG helpers
+    # ------------------------------------------------------------------
+
+    def _make_caption(self, text: str) -> QLabel:
+        lbl = QLabel(text, self)
+        lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        lbl.setStyleSheet("font-size:11px;")
+        return lbl
+
+    @staticmethod
+    def _guess_unit_from_mbar(fs_mbar: float | None) -> str:
+        """Heuristic: round full-scale to a clean Torr value picks Torr."""
+        if fs_mbar is None or fs_mbar <= 0:
+            return "Torr"
+        for torr in (0.1, 0.25, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000):
+            if abs(fs_mbar - torr * 1.33322) <= max(0.001, torr * 1.33322 * 0.01):
+                return "Torr"
+        return "mbar"
+
+    def _filtered_options(self) -> list[CDGFullScaleOption]:
+        if not self._unit_combo:
+            return list(self._cdg_options)
+        unit = self._unit_combo.currentText()
+        if unit == "Torr":
+            return [o for o in self._cdg_options if "Torr" in o.label]
+        return [o for o in self._cdg_options if "Torr" not in o.label]
+
+    def _refill_fs_combo(self) -> None:
+        if self._fs_combo is None:
+            return
+        self._suppress_signals = True
+        try:
+            self._fs_combo.clear()
+            for opt in self._filtered_options():
+                self._fs_combo.addItem(opt.label, float(opt.mbar))
+            if self._fs_combo.count() == 0 and self._cdg_options:
+                # No options for this unit — fall back to all.
+                for opt in self._cdg_options:
+                    self._fs_combo.addItem(opt.label, float(opt.mbar))
+        finally:
+            self._suppress_signals = False
+
+    def _select_fs_mbar(self, fs_mbar: float) -> None:
+        if self._fs_combo is None:
+            return
+        best_idx, best_err = -1, float("inf")
+        for i in range(self._fs_combo.count()):
+            try:
+                val = float(self._fs_combo.itemData(i))
+            except (TypeError, ValueError):
+                continue
+            err = abs(val - fs_mbar) / max(val, 1e-12)
+            if err < best_err:
+                best_err = err
+                best_idx = i
+        if best_idx >= 0 and best_err <= 0.05:
+            self._suppress_signals = True
+            try:
+                self._fs_combo.setCurrentIndex(best_idx)
+            finally:
+                self._suppress_signals = False
+
+    def _on_unit_changed(self, _idx: int) -> None:
+        if self._suppress_signals:
+            return
+        prev = self.current_full_scale_mbar()
+        self._refill_fs_combo()
+        if prev is not None:
+            # Try to keep an equivalent full-scale across unit switches.
+            self._select_fs_mbar(prev)
+        self._on_fs_changed(self._fs_combo.currentIndex() if self._fs_combo else 0)
+
+    def _on_fs_changed(self, _idx: int) -> None:
+        if self._suppress_signals:
+            return
+        fs = self.current_full_scale_mbar()
+        if fs is not None:
+            self.full_scale_changed.emit(fs)
+
+    def current_full_scale_mbar(self) -> float | None:
+        if self._fs_combo is None or self._fs_combo.count() == 0:
+            return None
+        try:
+            return float(self._fs_combo.currentData())
+        except (TypeError, ValueError):
+            return None
 
     def apply_theme(self) -> None:
         theme = current_theme(self)
@@ -466,18 +639,87 @@ class AddGaugeDialog(QDialog):
 
     @pyqtSlot(str, str, str, object)
     def _on_port_found(self, port: str, description: str, model_hint: str, metadata: object) -> None:
+        # Wrap the entire slot so an unexpected error in the per-row CDG
+        # widget can NEVER swallow a real detection. The gauge must still
+        # appear in the list — just without the FS controls if construction
+        # fails for some reason.
+        try:
+            self._add_scan_result(port, description, model_hint, metadata)
+        except Exception:
+            logger.exception(
+                "Failed to render scan result for %s (model=%r); falling back to plain row",
+                port, model_hint,
+            )
+            try:
+                self._add_scan_result_fallback(port, description, model_hint, metadata)
+            except Exception:
+                logger.exception("Even fallback scan-row insert failed for %s", port)
+
+    def _add_scan_result(self, port: str, description: str, model_hint: str, metadata: object) -> None:
         details = description.strip()
+        meta_dict = metadata if isinstance(metadata, dict) else {}
+        is_cdg = str(meta_dict.get("family", "")).lower() == "cdg_serial"
+        cdg_model = str(meta_dict.get("model", "") or "") if is_cdg else ""
+        try:
+            initial_fs = float(meta_dict.get("full_scale_mbar")) if meta_dict.get("full_scale_mbar") is not None else None
+        except (TypeError, ValueError):
+            initial_fs = None
+
         item = QListWidgetItem()
         payload = {
             "port": port,
             "model_hint": model_hint,
-            "metadata": metadata if isinstance(metadata, dict) else {},
+            "metadata": dict(meta_dict),
         }
         item.setData(Qt.ItemDataRole.UserRole, payload)
-        widget = _ScanResultWidget(port, model_hint, details, self._scan_list)
+        widget = _ScanResultWidget(
+            port,
+            model_hint,
+            details,
+            is_cdg=is_cdg,
+            cdg_model=cdg_model,
+            initial_full_scale_mbar=initial_fs,
+            parent=self._scan_list,
+        )
+        widget_fs = widget.current_full_scale_mbar()
+        if widget_fs is not None:
+            payload["metadata"]["full_scale_mbar"] = widget_fs
+            item.setData(Qt.ItemDataRole.UserRole, payload)
+        if is_cdg:
+            widget.full_scale_changed.connect(
+                lambda fs, it=item: self._update_item_full_scale(it, fs)
+            )
         item.setSizeHint(widget.sizeHint())
         self._scan_list.addItem(item)
         self._scan_list.setItemWidget(item, widget)
+
+    def _add_scan_result_fallback(self, port: str, description: str, model_hint: str, metadata: object) -> None:
+        """Plain-row fallback if the rich CDG widget fails to construct."""
+        meta_dict = metadata if isinstance(metadata, dict) else {}
+        item = QListWidgetItem(f"{model_hint or 'Unknown'} — {port}  |  {description}")
+        item.setData(
+            Qt.ItemDataRole.UserRole,
+            {"port": port, "model_hint": model_hint, "metadata": dict(meta_dict)},
+        )
+        self._scan_list.addItem(item)
+
+    def _update_item_full_scale(self, item: QListWidgetItem, fs_mbar: float) -> None:
+        try:
+            data = item.data(Qt.ItemDataRole.UserRole)
+        except RuntimeError:
+            return
+        if not isinstance(data, dict):
+            return
+        meta = dict(data.get("metadata", {}) or {})
+        meta["full_scale_mbar"] = float(fs_mbar)
+        data["metadata"] = meta
+        item.setData(Qt.ItemDataRole.UserRole, data)
+        # If this row is currently selected, also push into the dialog's CDG
+        # combo so the manual-config fallback path stays in sync.
+        if item.isSelected() and self._cdg_fs_combo.isVisible():
+            idx = self._index_for_fs(fs_mbar)
+            if idx >= 0:
+                self._cdg_fs_combo.setCurrentIndex(idx)
 
     @pyqtSlot()
     def _on_scan_complete(self) -> None:
@@ -647,7 +889,10 @@ class AddGaugeDialog(QDialog):
             return None
 
         spec = self._clone_spec_with_scan_overrides(spec, metadata)
-        spec = self._apply_cdg_full_scale_override(spec)
+        # Only the manual-config path should let the dialog's CDG full-scale
+        # combo override the spec — scanned rows already carry per-row picks.
+        if not from_scan:
+            spec = self._apply_cdg_full_scale_override(spec)
 
         if from_scan:
             selected_cmds = list(default_poll_commands(spec))
@@ -674,7 +919,7 @@ class AddGaugeDialog(QDialog):
         else:
             rs485_enabled = self._rs485_radio.isChecked()
 
-        address = self._address_spin.value()
+        address = spec.default_address if from_scan else self._address_spin.value()
         protocol = self._registry.make_protocol(spec, address=address)
         return {
             "spec": spec,

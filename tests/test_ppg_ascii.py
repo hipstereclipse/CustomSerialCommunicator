@@ -19,6 +19,37 @@ def ppg_rs485() -> PPGProtocol:
     return PPGProtocol(address=12, gauge_type="PPG550")
 
 
+@pytest.fixture
+def ppg570() -> PPGProtocol:
+    return PPGProtocol(
+        address=254,
+        gauge_type="PPG570",
+        param_table={
+            "pressure": {
+                "mnemonic": "P",
+                "read": True,
+                "write": False,
+                "unit": "mbar",
+            },
+            "pressure_combined": {
+                "mnemonic": "P",
+                "query_param": "CMB",
+                "read": True,
+                "write": False,
+                "unit": "mbar",
+            },
+            "setpoint_1": {
+                "mnemonic": "SPV",
+                "query_param": "1",
+                "write_prefix": "1,",
+                "read": True,
+                "write": True,
+                "unit": "mbar",
+            },
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # build_request
 # ---------------------------------------------------------------------------
@@ -55,6 +86,14 @@ class TestBuildRequest:
     def test_write_to_readonly_raises(self, ppg):
         with pytest.raises(ValueError, match="read-only"):
             ppg.build_request("pressure", value="1E-3")
+
+    def test_ppg570_query_param_is_encoded(self, ppg570):
+        cmd = ppg570.build_request("pressure_combined")
+        assert cmd == b"@254P?CMB\\"
+
+    def test_ppg570_write_prefix_is_encoded(self, ppg570):
+        cmd = ppg570.build_request("setpoint_1", value="2.00E-2")
+        assert cmd == b"@254SPV!1,2.00E-2\\"
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +174,12 @@ class TestParseResponseErrors:
         reading = ppg.parse_response(raw, "pressure")
         assert not reading.success
 
+    def test_address_prefixed_ack_is_accepted(self, ppg):
+        raw = b"@253ACK1.00E-3\\"
+        reading = ppg.parse_response(raw, "pressure")
+        assert reading.success
+        assert abs(reading.value - 1.0e-3) < 1e-12
+
     def test_pressure_unknown_command_switches_to_ppg570_mnemonic(self, ppg):
         assert ppg.build_request("pressure") == b"@254PR3?\\"
         reading = ppg.parse_response(b"@NAKUNKNOWNCOMMAND\\", "pressure")
@@ -146,3 +191,9 @@ class TestParseResponseErrors:
         reading = ppg.parse_response(b"@NAKWAIT\\", "pressure")
         assert not reading.success
         assert ppg.build_request("pressure") == b"@254PR3?\\"
+
+    def test_pressure_combined_unknown_command_falls_back_to_plain_pressure(self, ppg570):
+        assert ppg570.build_request("pressure_combined") == b"@254P?CMB\\"
+        reading = ppg570.parse_response(b"@NAKUNKNOWNCOMMAND\\", "pressure_combined")
+        assert not reading.success
+        assert ppg570.build_request("pressure_combined") == b"@254P?\\"

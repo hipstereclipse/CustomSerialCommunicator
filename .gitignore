@@ -9,3 +9,5 @@ build/
 venv/
 .env
 *.log
+.idea/
+.tmp_web/

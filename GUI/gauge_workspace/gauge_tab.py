@@ -117,6 +117,17 @@ class PlotPanel(QWidget):
         self._cmd_toggles: dict[str, QPushButton] = {}
         self._plot_paused: bool = False
 
+        # Coalesce setData() calls — high-rate streams (e.g. CDG continuous
+        # output, multiple gauges polling concurrently) used to trigger one
+        # GUI repaint per sample, which made the main thread freeze. The
+        # redraw timer batches dirty curves into a single repaint pass.
+        self._dirty_cmds: set[str] = set()
+        self._redraw_timer = QTimer(self)
+        self._redraw_timer.setInterval(100)  # ~10 Hz
+        self._redraw_timer.setSingleShot(False)
+        self._redraw_timer.timeout.connect(self._flush_dirty)
+        self._redraw_timer.start()
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -214,15 +225,29 @@ class PlotPanel(QWidget):
         if self._plot_paused:
             return
 
-        curve = self._curves.get(command)
-        if curve is None or not curve.isVisible():
-            return
+        # Mark dirty; the redraw timer will coalesce setData() calls so a
+        # burst of incoming samples does not flood the GUI thread.
+        self._dirty_cmds.add(command)
 
-        t_arr = np.array(tb, dtype=float)
-        v_arr = np.array(vb, dtype=float)
-        if self._is_pressure(command):
-            v_arr = np.where(v_arr > 0, v_arr, 1e-12)
-        curve.setData(t_arr, v_arr)
+    def _flush_dirty(self) -> None:
+        if not self._dirty_cmds or self._plot_paused:
+            return
+        # Snapshot then clear so feed() during paint cannot drop samples.
+        commands = tuple(self._dirty_cmds)
+        self._dirty_cmds.clear()
+        for command in commands:
+            curve = self._curves.get(command)
+            if curve is None or not curve.isVisible():
+                continue
+            tb = self._time_bufs.get(command)
+            vb = self._val_bufs.get(command)
+            if not tb or not vb:
+                continue
+            t_arr = np.array(tb, dtype=float)
+            v_arr = np.array(vb, dtype=float)
+            if self._is_pressure(command):
+                v_arr = np.where(v_arr > 0, v_arr, 1e-12)
+            curve.setData(t_arr, v_arr)
 
     # ------------------------------------------------------------------
     # Layout
@@ -4613,10 +4638,35 @@ class GaugeTab(QWidget):
         if self._opg_panel is not None:
             self._opg_panel.on_reading(reading)
         self._update_table(reading)
-        self._status_label.setText(
-            f"<span style='color:#4CE87A'>●</span>&nbsp;"
-            f"{reading.timestamp_wall.strftime('%H:%M:%S')}"
-        )
+
+        # CDG range warnings — make over/underrange visible to the user. The
+        # gauge clamps the analog reading to ±2× FS when the diaphragm
+        # bottoms out, so a saturated trace will otherwise read as a
+        # plausible-but-meaningless number (e.g. 0.2 Torr on a 0.1 Torr head
+        # at atmospheric pressure).
+        warnings = []
+        try:
+            warnings = list(reading.extra.get("warnings", []) or [])
+        except (AttributeError, TypeError):
+            warnings = []
+
+        if "overrange" in warnings:
+            self._status_label.setText(
+                f"<span style='color:#E84C4C'>●</span>&nbsp;"
+                f"<b>OVER RANGE</b> — pressure exceeds gauge full-scale "
+                f"({reading.timestamp_wall.strftime('%H:%M:%S')})"
+            )
+        elif "underrange" in warnings:
+            self._status_label.setText(
+                f"<span style='color:#E8D74C'>●</span>&nbsp;"
+                f"<b>UNDER RANGE</b> — pressure below gauge minimum "
+                f"({reading.timestamp_wall.strftime('%H:%M:%S')})"
+            )
+        else:
+            self._status_label.setText(
+                f"<span style='color:#4CE87A'>●</span>&nbsp;"
+                f"{reading.timestamp_wall.strftime('%H:%M:%S')}"
+            )
         self._status_label.setTextFormat(Qt.TextFormat.RichText)
 
     @pyqtSlot(object)

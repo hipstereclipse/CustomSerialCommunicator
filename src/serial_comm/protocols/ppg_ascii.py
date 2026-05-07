@@ -77,6 +77,7 @@ class PPGProtocol(GaugeProtocol):
         # write_prefix is prepended to write payloads, e.g. SPV!"1," + <value>
         self._cmd_table: dict[str, tuple[str, bool, str, str, str]] = {}
         self._runtime_mnemonic_override: dict[str, str] = {}
+        self._runtime_query_param_override: dict[str, str] = {}
         self._pressure_fallback_tried: set[str] = set()
         if param_table:
             for name, info in param_table.items():
@@ -103,6 +104,7 @@ class PPGProtocol(GaugeProtocol):
             raise ValueError(f"PPGProtocol: unknown command '{command}'")
         mnemonic, writable, _, query_param, write_prefix = entry
         mnemonic = self._runtime_mnemonic_override.get(command, mnemonic)
+        query_param = self._runtime_query_param_override.get(command, query_param)
         if value is not None and not writable:
             raise ValueError(f"PPGProtocol: command '{command}' is read-only")
         if value is None:
@@ -167,6 +169,44 @@ class PPGProtocol(GaugeProtocol):
         except Exception as exc:
             return self._err(f"Parse error for '{command}': {exc}", raw)
 
+    def _maybe_adapt_on_unknown_command(self, command: str, reason: str) -> None:
+        """
+        Auto-recover from pressure command variant mismatches.
+
+        Recovery paths:
+        - pressure: alternate mnemonic (PR3 <-> P)
+        - pressure_combined: downgrade from P?CMB to P?
+        """
+        if command not in ("pressure", "pressure_combined"):
+            return
+        normalized = reason.replace(" ", "").upper()
+        if "UNKNOWNCOMMAND" not in normalized:
+            return
+
+        if command == "pressure_combined":
+            if self._runtime_query_param_override.get("pressure_combined") != "":
+                self._runtime_query_param_override["pressure_combined"] = ""
+                self._runtime_mnemonic_override["pressure_combined"] = "P"
+                logger.warning(
+                    "PPGProtocol switched pressure_combined from 'P?CMB' to 'P?' after UNKNOWNCOMMAND"
+                )
+            return
+
+        base = self._cmd_table.get("pressure")
+        if base is None:
+            return
+        current = self._runtime_mnemonic_override.get("pressure", base[0]).upper()
+
+        if current == "PR3" and "P" not in self._pressure_fallback_tried:
+            self._runtime_mnemonic_override["pressure"] = "P"
+            self._pressure_fallback_tried.add("P")
+            logger.warning("PPGProtocol switched pressure mnemonic to 'P' after UNKNOWNCOMMAND")
+            return
+        if current == "P" and "PR3" not in self._pressure_fallback_tried:
+            self._runtime_mnemonic_override["pressure"] = "PR3"
+            self._pressure_fallback_tried.add("PR3")
+            logger.warning("PPGProtocol switched pressure mnemonic to 'PR3' after UNKNOWNCOMMAND")
+
     @staticmethod
     def _decode_pressure(data: str, raw: bytes, unit: str = "mbar") -> GaugeReading:
         upper = data.strip().upper()
@@ -188,31 +228,3 @@ class PPGProtocol(GaugeProtocol):
             formatted=f"{v:.3E} {unit}",
             raw=raw,
         )
-
-    def _maybe_adapt_on_unknown_command(self, command: str, reason: str) -> None:
-        """
-        Auto-recover between PPG550 and PPG570 pressure mnemonics.
-
-        If a pressure read fails with UNKNOWNCOMMAND, try the alternate mnemonic
-        on subsequent polls (PR3 <-> P).
-        """
-        if command != "pressure":
-            return
-        normalized = reason.replace(" ", "").upper()
-        if "UNKNOWNCOMMAND" not in normalized:
-            return
-
-        base = self._cmd_table.get("pressure")
-        if base is None:
-            return
-        current = self._runtime_mnemonic_override.get("pressure", base[0]).upper()
-
-        if current == "PR3" and "P" not in self._pressure_fallback_tried:
-            self._runtime_mnemonic_override["pressure"] = "P"
-            self._pressure_fallback_tried.add("P")
-            logger.warning("PPGProtocol switched pressure mnemonic to 'P' after UNKNOWNCOMMAND")
-            return
-        if current == "P" and "PR3" not in self._pressure_fallback_tried:
-            self._runtime_mnemonic_override["pressure"] = "PR3"
-            self._pressure_fallback_tried.add("PR3")
-            logger.warning("PPGProtocol switched pressure mnemonic to 'PR3' after UNKNOWNCOMMAND")
