@@ -42,7 +42,7 @@ from serial_comm.command_utils import command_display_name
 from serial_comm.units import SUPPORTED_UNITS, convert_pressure
 from GUI.gauge_workspace.command_display_panel import CommandDisplayPanel
 from GUI.gauge_workspace.export_dialog import ExportDialog
-from GUI.gauge_workspace.poll_commands_dialog import PollCommandsDialog
+from GUI.gauge_workspace.poll_commands_dialog import PollCommandsDialog, PollCommandsTarget
 from GUI.gauge_workspace.terminal_widget import TerminalWidget
 from GUI.settings_dialog import (
     display_signals,
@@ -1821,6 +1821,22 @@ class GaugeSettingsPanel(QWidget):
             self._apply_status_ui("Setpoint 2", sp2_trig, "2", sp2_region)
 
 
+class _ScientificPressureSpinBox(QDoubleSpinBox):
+    """Pressure spinbox that renders values in scientific notation."""
+
+    def textFromValue(self, value: float) -> str:  # type: ignore[override]
+        return f"{float(value):.2e}"
+
+    def valueFromText(self, text: str) -> float:  # type: ignore[override]
+        clean = text.strip()
+        if clean.endswith("mbar"):
+            clean = clean[:-4].strip()
+        try:
+            return float(clean)
+        except ValueError:
+            return super().valueFromText(text)
+
+
 class OPG550SpectrumStudio(QWidget):
     """Advanced OPG550 analysis workspace built around the P3 V02 command set."""
 
@@ -2357,22 +2373,22 @@ class OPG550SpectrumStudio(QWidget):
         thresh_row.setHorizontalSpacing(6)
         thresh_row.setVerticalSpacing(4)
         thresh_row.addWidget(QLabel("Min ignite (mbar)"), 0, 0)
-        self._auto_plasma_min_spin = QDoubleSpinBox()
-        self._auto_plasma_min_spin.setDecimals(2)
+        self._auto_plasma_min_spin = _ScientificPressureSpinBox()
         self._auto_plasma_min_spin.setRange(1e-12, 1e3)
         self._auto_plasma_min_spin.setStepType(
             QDoubleSpinBox.StepType.AdaptiveDecimalStepType
         )
+        self._auto_plasma_min_spin.setSuffix(" mbar")
         self._auto_plasma_min_spin.setValue(self._auto_plasma_min_mbar)
         self._auto_plasma_min_spin.valueChanged.connect(self._on_auto_plasma_min_changed)
         thresh_row.addWidget(self._auto_plasma_min_spin, 0, 1)
         thresh_row.addWidget(QLabel("Max safe (mbar)"), 1, 0)
-        self._auto_plasma_max_spin = QDoubleSpinBox()
-        self._auto_plasma_max_spin.setDecimals(2)
+        self._auto_plasma_max_spin = _ScientificPressureSpinBox()
         self._auto_plasma_max_spin.setRange(1e-12, 1e3)
         self._auto_plasma_max_spin.setStepType(
             QDoubleSpinBox.StepType.AdaptiveDecimalStepType
         )
+        self._auto_plasma_max_spin.setSuffix(" mbar")
         self._auto_plasma_max_spin.setValue(self._auto_plasma_max_mbar)
         self._auto_plasma_max_spin.valueChanged.connect(self._on_auto_plasma_max_changed)
         thresh_row.addWidget(self._auto_plasma_max_spin, 1, 1)
@@ -4697,14 +4713,29 @@ class GaugeTab(QWidget):
 
     def _edit_poll_commands(self) -> None:
         current = self.current_poll_commands()
-        dlg = PollCommandsDialog(self._spec, current, self)
+        dlg = PollCommandsDialog(
+            [
+                PollCommandsTarget(
+                    device_id=self.device_id,
+                    label=self.display_name,
+                    spec=self._spec,
+                    selected_commands=current,
+                    poll_interval=self.current_poll_interval(),
+                )
+            ],
+            parent=self,
+        )
         if not dlg.exec():
             return
         commands = dlg.selected_commands()
         self.apply_poll_commands(commands)
+        self.apply_poll_interval(dlg.selected_poll_interval())
 
     def current_poll_commands(self) -> list[str]:
         return list(getattr(self.worker, "_commands", []))
+
+    def current_poll_interval(self) -> float:
+        return float(getattr(self.worker, "_poll_interval", 0.1))
 
     def apply_poll_commands(self, commands: list[str]) -> None:
         if not commands:
@@ -4717,6 +4748,14 @@ class GaugeTab(QWidget):
         if self._command_panel is not None:
             self._command_panel.set_polled_commands(commands)
         self.poll_commands_changed.emit(self.device_id, commands)
+
+    def apply_poll_interval(self, interval_s: float) -> None:
+        interval = max(float(interval_s), 0.01)
+        setter = getattr(self.worker, "set_poll_interval", None)
+        if callable(setter):
+            setter(interval)
+        else:
+            self.worker._poll_interval = interval
 
     def edit_poll_commands(self) -> None:
         self._edit_poll_commands()

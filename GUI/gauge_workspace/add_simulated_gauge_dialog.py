@@ -99,9 +99,9 @@ class AddSimulatedGaugeDialog(QDialog):
         form.addRow("Display name:", self._name_edit)
 
         self._poll_spin = QDoubleSpinBox()
-        self._poll_spin.setRange(0.1, 10.0)
+        self._poll_spin.setRange(0.01, 600.0)
         self._poll_spin.setDecimals(2)
-        self._poll_spin.setValue(1.0)
+        self._poll_spin.setValue(0.1)
         self._poll_spin.setSuffix(" s")
         form.addRow("Poll interval:", self._poll_spin)
         root.addWidget(general)

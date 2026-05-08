@@ -38,6 +38,7 @@ from serial_comm.simulation_models import (
     CDGFullScaleOption,
     cdg_full_scale_options,
 )
+from GUI.settings_dialog import get_setting
 from GUI.gauge_workspace.port_scanner import PortScanner
 from GUI.theme import current_theme, list_style
 
@@ -400,10 +401,10 @@ class AddGaugeDialog(QDialog):
         bottom_form = QFormLayout()
         bottom_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         self._interval_spin = QDoubleSpinBox()
-        self._interval_spin.setRange(0.1, 60.0)
-        self._interval_spin.setSingleStep(0.1)
-        self._interval_spin.setDecimals(1)
-        self._interval_spin.setValue(1.0)
+        self._interval_spin.setRange(0.01, 600.0)
+        self._interval_spin.setSingleStep(0.01)
+        self._interval_spin.setDecimals(2)
+        self._interval_spin.setValue(float(get_setting("acquisition/default_poll_interval")))
         self._interval_spin.setSuffix(" s")
         bottom_form.addRow("Poll interval:", self._interval_spin)
         layout.addLayout(bottom_form)

@@ -175,7 +175,7 @@ class SimulatedGaugeConfig:
     recipe_steps: list[RecipeStep] = field(default_factory=_default_recipe)
     base_pressure_mbar: float = 1e-6
     leak_rate_mbar_l_s: float = 0.0
-    poll_interval_s: float = 1.0
+    poll_interval_s: float = 0.1
     cdg_full_scale_mbar: float | None = None
     humidity_level: HumidityLevel = HumidityLevel.MEDIUM
     gas_type: GasType = GasType.N2
@@ -227,7 +227,7 @@ class SimulatedGaugeConfig:
             recipe_steps=steps or _default_recipe(),
             base_pressure_mbar=float(data.get("base_pressure_mbar", 1e-6)),
             leak_rate_mbar_l_s=float(data.get("leak_rate_mbar_l_s", 0.0)),
-            poll_interval_s=float(data.get("poll_interval_s", 1.0)),
+            poll_interval_s=float(data.get("poll_interval_s", 0.1)),
             cdg_full_scale_mbar=(
                 float(data["cdg_full_scale_mbar"])
                 if data.get("cdg_full_scale_mbar") is not None

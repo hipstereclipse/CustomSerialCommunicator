@@ -354,7 +354,7 @@ class MainWindow(QMainWindow):
             protocol=protocol,
             transport_config=transport_cfg,
             commands=cfg.get("commands", ["pressure"]),
-            poll_interval=cfg.get("poll_interval", 1.0),
+            poll_interval=cfg.get("poll_interval", 0.1),
             device_id=device_id,
         )
 
@@ -869,6 +869,7 @@ class MainWindow(QMainWindow):
                 label=self._poll_commands_label_for_tab(tab),
                 spec=tab._spec,
                 selected_commands=tab.current_poll_commands(),
+                poll_interval=tab.current_poll_interval(),
             )
             for tab in targets
         ]
@@ -876,9 +877,11 @@ class MainWindow(QMainWindow):
         if not dlg.exec():
             return
         selected_by_device = dlg.selected_commands_by_device()
+        intervals_by_device = dlg.selected_poll_intervals_by_device()
         for tab in targets:
             commands = selected_by_device.get(tab.device_id, [])
             tab.apply_poll_commands(commands)
+            tab.apply_poll_interval(intervals_by_device.get(tab.device_id, tab.current_poll_interval()))
 
     def _poll_commands_label_for_tab(self, tab: GaugeTab) -> str:
         if tab.is_simulated:

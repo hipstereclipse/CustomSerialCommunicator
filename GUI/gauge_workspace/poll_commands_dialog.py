@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QDoubleSpinBox,
     QDialog,
     QDialogButtonBox,
     QLabel,
@@ -33,6 +34,7 @@ class PollCommandsTarget:
     label: str
     spec: DeviceSpec
     selected_commands: list[str]
+    poll_interval: float = 0.1
 
 
 class _PollCommandsEditor(QWidget):
@@ -42,6 +44,7 @@ class _PollCommandsEditor(QWidget):
         self,
         spec: DeviceSpec,
         selected_commands: list[str] | None = None,
+        poll_interval: float = 0.1,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -79,6 +82,19 @@ class _PollCommandsEditor(QWidget):
         self.apply_theme()
         layout.addWidget(self._tree, 1)
 
+        interval_row = QHBoxLayout()
+        interval_row.addWidget(QLabel("Poll interval:"))
+        self._interval_spin = QDoubleSpinBox()
+        self._interval_spin.setRange(0.01, 600.0)
+        self._interval_spin.setSingleStep(0.01)
+        self._interval_spin.setDecimals(2)
+        self._interval_spin.setSuffix(" s")
+        self._interval_spin.setValue(max(float(poll_interval), 0.01))
+        self._interval_spin.setToolTip("Seconds between polling cycles for this gauge")
+        interval_row.addWidget(self._interval_spin)
+        interval_row.addStretch()
+        layout.addLayout(interval_row)
+
         groups: dict[str, QTreeWidgetItem] = {}
         for name, command in self._spec.commands.items():
             if not command.read:
@@ -111,6 +127,9 @@ class _PollCommandsEditor(QWidget):
             name for name, command in self._spec.commands.items()
             if name in checked and command.read
         ]
+
+    def poll_interval(self) -> float:
+        return float(self._interval_spin.value())
 
     def _checked_commands(self) -> list[str]:
         commands: list[str] = []
@@ -200,6 +219,7 @@ class PollCommandsDialog(QDialog):
                     label=spec.model,
                     spec=spec,
                     selected_commands=selected_commands or [],
+                    poll_interval=0.1,
                 )
             ]
 
@@ -225,7 +245,12 @@ class PollCommandsDialog(QDialog):
 
         if len(self._targets) == 1:
             target = self._targets[0]
-            editor = _PollCommandsEditor(target.spec, target.selected_commands, self)
+            editor = _PollCommandsEditor(
+                target.spec,
+                target.selected_commands,
+                target.poll_interval,
+                self,
+            )
             self._editors[target.device_id] = editor
             layout.addWidget(editor, 1)
         else:
@@ -233,7 +258,12 @@ class PollCommandsDialog(QDialog):
             tabs.setDocumentMode(True)
             self._tabs = tabs
             for target in self._targets:
-                editor = _PollCommandsEditor(target.spec, target.selected_commands, tabs)
+                editor = _PollCommandsEditor(
+                    target.spec,
+                    target.selected_commands,
+                    target.poll_interval,
+                    tabs,
+                )
                 self._editors[target.device_id] = editor
                 tabs.addTab(editor, self._tab_label(target))
                 tabs.setTabToolTip(tabs.count() - 1, f"{target.label}\n{target.device_id}")
@@ -254,6 +284,16 @@ class PollCommandsDialog(QDialog):
     def selected_commands_by_device(self) -> dict[str, list[str]]:
         return {
             target.device_id: self._editors[target.device_id].selected_commands()
+            for target in self._targets
+        }
+
+    def selected_poll_interval(self) -> float:
+        target = self._targets[0]
+        return self._editors[target.device_id].poll_interval()
+
+    def selected_poll_intervals_by_device(self) -> dict[str, float]:
+        return {
+            target.device_id: self._editors[target.device_id].poll_interval()
             for target in self._targets
         }
 

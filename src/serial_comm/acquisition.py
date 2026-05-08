@@ -75,7 +75,7 @@ class GaugeWorker(QThread):
         protocol: GaugeProtocol,
         transport_config: TransportConfig,
         commands: Sequence[str],
-        poll_interval: float = 1.0,
+        poll_interval: float = 0.1,
         device_id: str = "",
     ) -> None:
         super().__init__()
@@ -117,6 +117,10 @@ class GaugeWorker(QThread):
             command for command in commands
             if command in self._spec.commands and self._spec.commands[command].read
         ]
+
+    def set_poll_interval(self, interval_s: float) -> None:
+        """Update the automatic polling interval in seconds."""
+        self._poll_interval = max(float(interval_s), 0.01)
 
     # ------------------------------------------------------------------
     # QThread.run — everything below runs in the worker thread
@@ -454,7 +458,8 @@ class GaugeWorker(QThread):
         while time.monotonic() < end:
             if self._should_stop():
                 break
-            time.sleep(min(chunk, end - time.monotonic()))
+            remaining = end - time.monotonic()
+            time.sleep(min(chunk, max(0.0, remaining)))
 
     def _should_stop(self) -> bool:
         return self._stop_requested or self.isInterruptionRequested()

@@ -320,6 +320,22 @@ class TestWorkerStop:
         worker = _make_worker(ppg_spec, ppg_protocol, transport_config)
         worker.stop()  # must not raise
 
+    def test_sleep_interruptible_clamps_negative_duration(
+        self, ppg_spec, ppg_protocol, transport_config
+    ):
+        worker = _make_worker(ppg_spec, ppg_protocol, transport_config)
+
+        with (
+            patch(
+                "serial_comm.acquisition.time.monotonic",
+                side_effect=[10.0, 10.05, 10.11, 10.11],
+            ),
+            patch("serial_comm.acquisition.time.sleep") as sleep_mock,
+        ):
+            worker._sleep_interruptible(0.1)
+
+        sleep_mock.assert_called_once_with(0.0)
+
     def test_stop_exits_within_reasonable_time(
         self, qtbot, ppg_spec, ppg_protocol, transport_config
     ):

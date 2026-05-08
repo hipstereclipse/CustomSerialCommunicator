@@ -181,6 +181,11 @@ class SimulatedGaugeWorker(QThread):
             if cmd in self._spec.commands and getattr(self._spec.commands[cmd], "read", False)
         ]
 
+    def set_poll_interval(self, interval_s: float) -> None:
+        """Update the automatic polling interval in seconds."""
+        self._poll_interval = max(float(interval_s), 0.01)
+        self._mock_terminal_every = max(1, round(2.0 / max(self._poll_interval, 0.05)))
+
     # ------------------------------------------------------------------
     # QThread.run — runs on the worker thread
     # ------------------------------------------------------------------

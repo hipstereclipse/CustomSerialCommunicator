@@ -40,7 +40,7 @@ DEFAULTS: dict[str, object] = {
     "logging/max_terminal_messages": 500,
     "logging/log_to_file": False,
     "logging/log_file_path": "",
-    "acquisition/default_poll_interval": 1.0,
+    "acquisition/default_poll_interval": 0.1,
     "serial/default_timeout": 2.0,
     "display/pressure_unit": "mbar",
     "diagnostics/opg_spectrum_verbose": False,
@@ -55,11 +55,45 @@ DEFAULTS: dict[str, object] = {
 _LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 
+class ScientificPressureSpinBox(QDoubleSpinBox):
+    """Pressure spinbox that renders values in scientific notation."""
+
+    def textFromValue(self, value: float) -> str:  # type: ignore[override]
+        return f"{float(value):.2e}"
+
+    def valueFromText(self, text: str) -> float:  # type: ignore[override]
+        clean = text.strip()
+        if clean.endswith("mbar"):
+            clean = clean[:-4].strip()
+        try:
+            return float(clean)
+        except ValueError:
+            return super().valueFromText(text)
+
+
 # ── Public helpers used by other modules ─────────────────────────────────────
 
 def get_setting(key: str) -> object:
     """Return a setting value, using the default if not yet persisted."""
     s = QSettings()
+    if key == "acquisition/default_poll_interval":
+        migrated = s.value("acquisition/default_poll_interval_migrated_v2", False)
+        migrated_flag = (
+            migrated.lower() in ("true", "1", "yes")
+            if isinstance(migrated, str)
+            else bool(migrated)
+        )
+        if not migrated_flag:
+            try:
+                raw_existing = s.value(key, None)
+                existing = float(raw_existing) if raw_existing is not None else None
+            except (TypeError, ValueError):
+                existing = None
+            # Upgrade legacy default from older builds.
+            if existing is None or abs(existing - 1.0) < 1e-12:
+                s.setValue(key, float(DEFAULTS["acquisition/default_poll_interval"]))
+            s.setValue("acquisition/default_poll_interval_migrated_v2", True)
+
     default = DEFAULTS.get(key)
     raw = s.value(key, default)
     # QSettings may return strings for bools/ints; coerce to the default type.
@@ -230,9 +264,9 @@ class SettingsDialog(QDialog):
         form = QFormLayout(grp)
 
         self._poll_spin = QDoubleSpinBox()
-        self._poll_spin.setRange(0.1, 60.0)
-        self._poll_spin.setSingleStep(0.5)
-        self._poll_spin.setDecimals(1)
+        self._poll_spin.setRange(0.01, 600.0)
+        self._poll_spin.setSingleStep(0.01)
+        self._poll_spin.setDecimals(2)
         self._poll_spin.setSuffix(" s")
         self._poll_spin.setToolTip("Default polling interval applied when adding a new gauge.")
         form.addRow("Default poll interval:", self._poll_spin)
@@ -278,8 +312,7 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Auto plasma (default):", self._opg_auto_plasma_chk)
 
-        self._opg_min_p_spin = QDoubleSpinBox()
-        self._opg_min_p_spin.setDecimals(2)
+        self._opg_min_p_spin = ScientificPressureSpinBox()
         self._opg_min_p_spin.setRange(1e-12, 1e3)
         self._opg_min_p_spin.setSingleStep(1.0)
         self._opg_min_p_spin.setSuffix(" mbar")
@@ -291,8 +324,7 @@ class SettingsDialog(QDialog):
         self._opg_min_p_spin.setStepType(QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
         form.addRow("Min ignition pressure:", self._opg_min_p_spin)
 
-        self._opg_max_p_spin = QDoubleSpinBox()
-        self._opg_max_p_spin.setDecimals(2)
+        self._opg_max_p_spin = ScientificPressureSpinBox()
         self._opg_max_p_spin.setRange(1e-12, 1e3)
         self._opg_max_p_spin.setSingleStep(1.0)
         self._opg_max_p_spin.setSuffix(" mbar")
