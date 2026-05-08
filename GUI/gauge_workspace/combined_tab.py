@@ -40,8 +40,8 @@ from GUI.theme import current_theme, line_edit_style, style_plot_item, themed_gr
 
 logger = logging.getLogger(__name__)
 
-_MAX_POINTS = 200_000
 _AXIS_REFRESH_MS = 120
+_CURVE_REFRESH_MS = 80
 _CONTROL_PANEL_WIDTH = 270
 _CONTROL_PANEL_MIN_WIDTH = 245
 _CONTROL_PANEL_MAX_WIDTH = 310
@@ -96,8 +96,14 @@ class CombinedTab(QWidget):
         self._sync_hover: bool = True
         self._comparison_enabled: bool = False
         self._plot_paused: bool = False
+        self._pending_curve_series: set[str] = set()
         self._pending_x_refresh: bool = False
         self._pending_y_refresh: bool = False
+
+        self._curve_refresh_timer = QTimer(self)
+        self._curve_refresh_timer.setSingleShot(True)
+        self._curve_refresh_timer.setInterval(_CURVE_REFRESH_MS)
+        self._curve_refresh_timer.timeout.connect(self._flush_pending_curves)
 
         self._axis_refresh_timer = QTimer(self)
         self._axis_refresh_timer.setSingleShot(True)
@@ -506,8 +512,8 @@ class CombinedTab(QWidget):
             "name": device["name"],
             "label": label,
             "color": color,
-            "time_buf": deque(maxlen=_MAX_POINTS),
-            "val_buf": deque(maxlen=_MAX_POINTS),
+            "time_buf": deque(),
+            "val_buf": deque(),
             "curve": None,
             "color_btn": None,
             "toggle_btn": None,
@@ -542,12 +548,7 @@ class CombinedTab(QWidget):
         if self._plot_paused:
             return
 
-        curve = g.get("curve")
-        if curve is not None:
-            t_arr = np.array(tb, dtype=float)
-            v_arr = np.where(np.array(vb, dtype=float) > 0, np.array(vb, dtype=float), 1e-12)
-            curve.setData(t_arr, v_arr)
-            curve.setVisible(self._visible.get(series_id, True))
+        self._queue_curve_refresh(series_id)
 
         self._request_axis_refresh(x=True, y=self._y_mode == "auto_center")
 
@@ -570,17 +571,41 @@ class CombinedTab(QWidget):
         if refresh_y:
             self._refresh_y_axis()
 
+    def _queue_curve_refresh(self, series_id: str) -> None:
+        self._pending_curve_series.add(series_id)
+        if not self._curve_refresh_timer.isActive():
+            self._curve_refresh_timer.start()
+
+    def _flush_pending_curves(self) -> None:
+        if self._plot_paused:
+            return
+        series_ids = tuple(self._pending_curve_series)
+        self._pending_curve_series.clear()
+        for series_id in series_ids:
+            self._set_series_curve_data(series_id)
+
+    def _set_series_curve_data(self, series_id: str) -> None:
+        g = self._gauges.get(series_id)
+        if g is None:
+            return
+        curve = g.get("curve")
+        if curve is None:
+            return
+        tb: deque = g["time_buf"]
+        vb: deque = g["val_buf"]
+        sample_count = min(len(tb), len(vb))
+        if sample_count <= 0:
+            curve.setData([], [])
+            return
+        t_arr = np.fromiter(tb, dtype=float, count=sample_count)
+        v_arr = np.fromiter(vb, dtype=float, count=sample_count)
+        v_arr = np.where(v_arr > 0, v_arr, 1e-12)
+        curve.setData(t_arr, v_arr)
+        curve.setVisible(self._visible.get(series_id, True))
+
     def _refresh_all_curves(self) -> None:
-        for series_id, g in self._gauges.items():
-            curve = g.get("curve")
-            if curve is None:
-                continue
-            tb: deque = g["time_buf"]
-            vb: deque = g["val_buf"]
-            t_arr = np.array(tb, dtype=float)
-            v_arr = np.where(np.array(vb, dtype=float) > 0, np.array(vb, dtype=float), 1e-12)
-            curve.setData(t_arr, v_arr)
-            curve.setVisible(self._visible.get(series_id, True))
+        for series_id in self._gauges:
+            self._set_series_curve_data(series_id)
 
     def _on_pause_plot_clicked(self) -> None:
         self._plot_paused = not self._plot_paused
@@ -1120,19 +1145,7 @@ class CombinedTab(QWidget):
             self._value_bar.hide()
 
     def _replay_all(self) -> None:
-        for did, g in self._gauges.items():
-            curve = g.get("curve")
-            tb: deque = g["time_buf"]
-            vb: deque = g["val_buf"]
-            if curve is None:
-                continue
-            if not tb:
-                curve.setData([], [])
-                continue
-            t_arr = np.array(tb, dtype=float)
-            v_arr = np.where(np.array(vb, dtype=float) > 0, np.array(vb, dtype=float), 1e-12)
-            curve.setData(t_arr, v_arr)
-            curve.setVisible(self._visible.get(did, True))
+        self._refresh_all_curves()
 
 
 # ---------------------------------------------------------------------------

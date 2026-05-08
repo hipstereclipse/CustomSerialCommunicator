@@ -149,11 +149,14 @@ Simulation is first-class and designed for realistic operator practice and UI te
 - In-app terminal traffic viewer: [GUI/gauge_workspace/terminal_widget.py](GUI/gauge_workspace/terminal_widget.py)
 
 Combined plotting supports overlay/stacked/grid layouts, visibility toggles, per-device color assignment, and synchronized chart navigation.
+Combined plots keep the full collected session history for each pressure series, so gauges with different polling rates still share comparable timestamp axes instead of losing older data by sample count.
 
 Spectrum Studio (OPG550 advanced workspace) also includes a shared bottom hover-information bar with stable positioning:
 
 - The cursor X value is always rendered first at the far left of the info bar, so time/wavelength stays in a fixed location while hovering.
-- In Advanced Analysis mode, the hover bar shows the instantaneous pressure delta between comparison sources at the same cursor time: $\Delta(A-B)$.
+- In Advanced Analysis mode, the hover bar shows the instantaneous pressure delta and signed percent delta between comparison sources at the same cursor time: $\Delta(A-B)$ and $\Delta\%$.
+- OPG550 Advanced Analysis keeps the full collected peer-pressure history for correlation plots, preserving meaningful comparison windows when gauges poll at different speeds.
+- OPG550 auto-plasma ignition thresholds display in the active pressure unit while continuing to store and evaluate the safety limits internally in mbar.
 
 ## Session and Export
 

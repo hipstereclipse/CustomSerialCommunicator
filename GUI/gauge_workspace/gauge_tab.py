@@ -65,11 +65,8 @@ _TRACE_COLOURS = [
 _PRESSURE_UNITS = {"mbar", "Torr", "torr", "Pa", "hPa", "psi"}
 _PLOT_HISTORY_S = 120.0
 _MAX_POINTS = 2000
-# Maximum samples retained per peer-pressure trace inside the OPG550
-# Spectrum Studio panel. Streaming gauges such as the CDG can emit >100
-# frames per second, so an unbounded deque previously grew large enough
-# to make every advanced-plot redraw block the GUI thread.
-_PEER_PRESSURE_MAXLEN = 30000
+# Peer-pressure traces in Spectrum Studio intentionally keep the full session
+# history so gauges with different polling rates remain comparable by time.
 
 
 # ---------------------------------------------------------------------------
@@ -1829,8 +1826,10 @@ class _ScientificPressureSpinBox(QDoubleSpinBox):
 
     def valueFromText(self, text: str) -> float:  # type: ignore[override]
         clean = text.strip()
-        if clean.endswith("mbar"):
-            clean = clean[:-4].strip()
+        for unit in sorted(SUPPORTED_UNITS, key=len, reverse=True):
+            if clean.endswith(unit):
+                clean = clean[:-len(unit)].strip()
+                break
         try:
             return float(clean)
         except ValueError:
@@ -1967,6 +1966,7 @@ class OPG550SpectrumStudio(QWidget):
         self._advanced_right_view: pg.ViewBox | None = None
         self._advanced_gas_curve: pg.PlotDataItem | None = None
         self._advanced_legend: pg.LegendItem | None = None
+        self._advanced_legend_labels: tuple[str, str] | None = None
 
         self._analysis_combo: QComboBox | None = None
         self._compare_a_label: QLabel | None = None
@@ -2021,6 +2021,12 @@ class OPG550SpectrumStudio(QWidget):
         self._refresh_timer.timeout.connect(self._do_refresh_mode_plots)
         self._refresh_pending: bool = False
 
+        self._advanced_refresh_timer = QTimer(self)
+        self._advanced_refresh_timer.setSingleShot(True)
+        self._advanced_refresh_timer.setInterval(80)
+        self._advanced_refresh_timer.timeout.connect(self._do_scheduled_advanced_refresh)
+        self._advanced_refresh_pending: bool = False
+
         # Auto-plasma state. Defaults are loaded from QSettings ("opg/...")
         # and the user can override them per-session via the Spectrum Studio
         # "Plasma Ignition" panel.
@@ -2031,7 +2037,10 @@ class OPG550SpectrumStudio(QWidget):
         self._auto_plasma_last_action_t: float = 0.0
         self._initial_plasma_read_done: bool = False
         self._pending_plasma_target: int | None = None
+        self._auto_plasma_threshold_unit: str = self._display_unit
         self._auto_plasma_chk: QCheckBox | None = None
+        self._auto_plasma_min_label: QLabel | None = None
+        self._auto_plasma_max_label: QLabel | None = None
         self._auto_plasma_min_spin: QDoubleSpinBox | None = None
         self._auto_plasma_max_spin: QDoubleSpinBox | None = None
 
@@ -2276,12 +2285,12 @@ class OPG550SpectrumStudio(QWidget):
         self._compare_a_label = QLabel("Compare A")
         mode_layout.addWidget(self._compare_a_label, 1, 0)
         self._compare_a_combo = QComboBox()
-        self._compare_a_combo.currentIndexChanged.connect(self._refresh_advanced_plot)
+        self._compare_a_combo.currentIndexChanged.connect(self._schedule_advanced_refresh)
         mode_layout.addWidget(self._compare_a_combo, 1, 1)
         self._compare_b_label = QLabel("Compare B")
         mode_layout.addWidget(self._compare_b_label, 2, 0)
         self._compare_b_combo = QComboBox()
-        self._compare_b_combo.currentIndexChanged.connect(self._refresh_advanced_plot)
+        self._compare_b_combo.currentIndexChanged.connect(self._schedule_advanced_refresh)
         mode_layout.addWidget(self._compare_b_combo, 2, 1)
         self._correlation_gas_label = QLabel("Right axis gas")
         mode_layout.addWidget(self._correlation_gas_label, 3, 0)
@@ -2289,7 +2298,7 @@ class OPG550SpectrumStudio(QWidget):
         for gas in self._GASES:
             self._correlation_gas_combo.addItem(gas, gas)
         self._correlation_gas_combo.setCurrentText("OH")
-        self._correlation_gas_combo.currentIndexChanged.connect(self._refresh_advanced_plot)
+        self._correlation_gas_combo.currentIndexChanged.connect(self._schedule_advanced_refresh)
         mode_layout.addWidget(self._correlation_gas_combo, 3, 1)
         self._mode_status.setWordWrap(True)
         self._mode_status.setStyleSheet("font-size:11px;")
@@ -2372,26 +2381,23 @@ class OPG550SpectrumStudio(QWidget):
         thresh_row = QGridLayout()
         thresh_row.setHorizontalSpacing(6)
         thresh_row.setVerticalSpacing(4)
-        thresh_row.addWidget(QLabel("Min ignite (mbar)"), 0, 0)
+        self._auto_plasma_min_label = QLabel("Min ignite")
+        thresh_row.addWidget(self._auto_plasma_min_label, 0, 0)
         self._auto_plasma_min_spin = _ScientificPressureSpinBox()
-        self._auto_plasma_min_spin.setRange(1e-12, 1e3)
         self._auto_plasma_min_spin.setStepType(
             QDoubleSpinBox.StepType.AdaptiveDecimalStepType
         )
-        self._auto_plasma_min_spin.setSuffix(" mbar")
-        self._auto_plasma_min_spin.setValue(self._auto_plasma_min_mbar)
-        self._auto_plasma_min_spin.valueChanged.connect(self._on_auto_plasma_min_changed)
         thresh_row.addWidget(self._auto_plasma_min_spin, 0, 1)
-        thresh_row.addWidget(QLabel("Max safe (mbar)"), 1, 0)
+        self._auto_plasma_max_label = QLabel("Max safe")
+        thresh_row.addWidget(self._auto_plasma_max_label, 1, 0)
         self._auto_plasma_max_spin = _ScientificPressureSpinBox()
-        self._auto_plasma_max_spin.setRange(1e-12, 1e3)
         self._auto_plasma_max_spin.setStepType(
             QDoubleSpinBox.StepType.AdaptiveDecimalStepType
         )
-        self._auto_plasma_max_spin.setSuffix(" mbar")
-        self._auto_plasma_max_spin.setValue(self._auto_plasma_max_mbar)
-        self._auto_plasma_max_spin.valueChanged.connect(self._on_auto_plasma_max_changed)
         thresh_row.addWidget(self._auto_plasma_max_spin, 1, 1)
+        self._refresh_auto_plasma_threshold_controls()
+        self._auto_plasma_min_spin.valueChanged.connect(self._on_auto_plasma_min_changed)
+        self._auto_plasma_max_spin.valueChanged.connect(self._on_auto_plasma_max_changed)
         plasma_layout.addLayout(thresh_row)
 
         right.insertWidget(0, self._plasma_box)
@@ -2807,8 +2813,15 @@ class OPG550SpectrumStudio(QWidget):
                     )
                 if value_a is not None and value_b is not None:
                     delta = value_a - value_b
+                    delta_percent = self._pressure_delta_percent(value_a, value_b)
+                    percent_text = (
+                        f", Δ% = {delta_percent:+.2f}%"
+                        if delta_percent is not None else
+                        ", Δ% = n/a"
+                    )
                     parts.append(
-                        f"<span style='color:#FF8C8C'><b>Δ(A−B)</b></span>: {delta:+.3E} {self._display_unit}"
+                        f"<span style='color:#FF8C8C'><b>Δ(A−B)</b></span>: "
+                        f"{delta:+.3E} {self._display_unit}{percent_text}"
                     )
                 # Gas partial pressure on the right axis
                 gas = self._correlation_gas_combo.currentData() if self._correlation_gas_combo is not None else None
@@ -3005,6 +3018,16 @@ class OPG550SpectrumStudio(QWidget):
             return
         self._refresh_pending = True
         self._refresh_timer.start()
+
+    def _schedule_advanced_refresh(self, *_args: object) -> None:
+        if self._advanced_refresh_pending:
+            return
+        self._advanced_refresh_pending = True
+        self._advanced_refresh_timer.start()
+
+    def _do_scheduled_advanced_refresh(self) -> None:
+        self._advanced_refresh_pending = False
+        self._refresh_advanced_plot()
 
     def _do_refresh_mode_plots(self) -> None:
         self._refresh_pending = False
@@ -3497,6 +3520,7 @@ class OPG550SpectrumStudio(QWidget):
                 self._advanced_plot.getPlotItem().getAxis("right").setLabel(
                     f"{gas} partial pressure", units=unit, color="#FF5B5B"
                 )
+        self._refresh_auto_plasma_threshold_controls()
         if self._trend_p:
             self._trend_p = deque(
                 [convert_pressure(v, old, unit) for v in self._trend_p],
@@ -3623,7 +3647,7 @@ class OPG550SpectrumStudio(QWidget):
             txt = "No dominant optical signature"
         self._molecule_label.setText(f"Likely optical gas signatures: {txt}")
         self._refresh_spectrum_gas_markers()
-        self._refresh_advanced_plot()
+        self._schedule_advanced_refresh()
 
     def on_peer_reading(self, device_id: str, display_name: str, reading: DeviceReading) -> None:
         if reading.value is None or reading.unit not in SUPPORTED_UNITS:
@@ -3655,15 +3679,11 @@ class OPG550SpectrumStudio(QWidget):
     ) -> None:
         peer = self._peer_pressures.get(device_id)
         if peer is None:
-            # Bound peer history so that high-rate streaming gauges (e.g. a
-            # CDG sending ~125 frames/s) don't grow these deques without
-            # limit and starve the GUI thread when plots are rebuilt.
-            # ~30k samples is roughly 4 minutes at 125 Hz or 8 hours at 1 Hz.
             peer = {
                 "name": display_name,
                 "unit": unit,
-                "t": deque(maxlen=_PEER_PRESSURE_MAXLEN),
-                "p": deque(maxlen=_PEER_PRESSURE_MAXLEN),
+                "t": deque(),
+                "p": deque(),
             }
             self._peer_pressures[device_id] = peer
             self._refresh_peer_combos()
@@ -3774,7 +3794,7 @@ class OPG550SpectrumStudio(QWidget):
                 self._molecule_label.setText("Likely optical gas signatures: waiting for live spectrum data")
                 self._last_pressure_mbar = max(p_mbar, 1e-12)
                 self._last_pressure_t = float(timestamp_mono)
-                self._refresh_advanced_plot()
+                self._schedule_advanced_refresh()
                 return
             x = self._live_spectrum_x
             y = self._live_spectrum_y
@@ -4069,6 +4089,32 @@ class OPG550SpectrumStudio(QWidget):
     # ------------------------------------------------------------------
     # Auto-plasma controls
     # ------------------------------------------------------------------
+    def _refresh_auto_plasma_threshold_controls(self) -> None:
+        if self._auto_plasma_min_spin is None or self._auto_plasma_max_spin is None:
+            return
+        unit = self._display_unit if self._display_unit in SUPPORTED_UNITS else "mbar"
+        min_range = float(convert_pressure(1e-12, "mbar", unit))
+        max_range = float(convert_pressure(1e3, "mbar", unit))
+        self._auto_plasma_threshold_unit = unit
+        for spin, value_mbar in (
+            (self._auto_plasma_min_spin, self._auto_plasma_min_mbar),
+            (self._auto_plasma_max_spin, self._auto_plasma_max_mbar),
+        ):
+            was_blocked = spin.blockSignals(True)
+            spin.setRange(min_range, max_range)
+            spin.setSuffix(f" {unit}")
+            spin.setValue(float(convert_pressure(value_mbar, "mbar", unit)))
+            spin.blockSignals(was_blocked)
+        if self._auto_plasma_min_label is not None:
+            self._auto_plasma_min_label.setText("Min ignite")
+        if self._auto_plasma_max_label is not None:
+            self._auto_plasma_max_label.setText("Max safe")
+
+    def _auto_plasma_display_text(self, value_mbar: float) -> str:
+        unit = self._display_unit if self._display_unit in SUPPORTED_UNITS else "mbar"
+        value = float(convert_pressure(value_mbar, "mbar", unit))
+        return f"{value:.2e} {unit}"
+
     def _persist_setting(self, key: str, value: object) -> None:
         try:
             QSettings("CustomSerialCommunicator", "CustomSerialCommunicator").setValue(key, value)
@@ -4086,11 +4132,15 @@ class OPG550SpectrumStudio(QWidget):
                 self._evaluate_auto_plasma()
 
     def _on_auto_plasma_min_changed(self, value: float) -> None:
-        self._auto_plasma_min_mbar = float(value)
+        self._auto_plasma_min_mbar = float(
+            convert_pressure(float(value), self._auto_plasma_threshold_unit, "mbar")
+        )
         self._persist_setting("opg/min_ignition_pressure_mbar", self._auto_plasma_min_mbar)
 
     def _on_auto_plasma_max_changed(self, value: float) -> None:
-        self._auto_plasma_max_mbar = float(value)
+        self._auto_plasma_max_mbar = float(
+            convert_pressure(float(value), self._auto_plasma_threshold_unit, "mbar")
+        )
         self._persist_setting("opg/max_safe_pressure_mbar", self._auto_plasma_max_mbar)
 
     def _evaluate_auto_plasma(self) -> None:
@@ -4116,15 +4166,17 @@ class OPG550SpectrumStudio(QWidget):
             self._auto_plasma_last_action_t = now
             self._on_action("_plasma_off")
             self._mode_status.setText(
-                f"Auto-plasma: pressure {p:.2e} mbar > max safe "
-                f"{self._auto_plasma_max_mbar:.2e} mbar — switching plasma OFF"
+                f"Auto-plasma: pressure {self._auto_plasma_display_text(p)} > max safe "
+                f"{self._auto_plasma_display_text(self._auto_plasma_max_mbar)} — "
+                f"switching plasma OFF"
             )
         elif p < self._auto_plasma_min_mbar and not plasma_currently_on:
             self._auto_plasma_last_action_t = now
             self._on_action("_plasma_on")
             self._mode_status.setText(
-                f"Auto-plasma: pressure {p:.2e} mbar < min ignite "
-                f"{self._auto_plasma_min_mbar:.2e} mbar — switching plasma ON"
+                f"Auto-plasma: pressure {self._auto_plasma_display_text(p)} < min ignite "
+                f"{self._auto_plasma_display_text(self._auto_plasma_min_mbar)} — "
+                f"switching plasma ON"
             )
 
     # ------------------------------------------------------------------
@@ -4340,9 +4392,38 @@ class OPG550SpectrumStudio(QWidget):
         if self._compare_b_combo is not None and self._compare_b_combo.currentIndex() <= 0 and len(items) > 1:
             self._compare_b_combo.setCurrentIndex(2)
 
+    @staticmethod
+    def _plot_series_arrays(
+        time_values,
+        data_values,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sample_count = min(len(time_values), len(data_values))
+        if sample_count <= 0:
+            return np.array([], dtype=float), np.array([], dtype=float)
+        time_array = np.fromiter(
+            time_values,
+            dtype=float,
+            count=sample_count,
+        )
+        data_array = np.fromiter(
+            data_values,
+            dtype=float,
+            count=sample_count,
+        )
+        return time_array, data_array
+
+    @staticmethod
+    def _pressure_delta_percent(value_a: float, value_b: float) -> float | None:
+        if not math.isfinite(value_a) or not math.isfinite(value_b) or value_b == 0.0:
+            return None
+        return (value_a - value_b) / abs(value_b) * 100.0
+
     def _refresh_advanced_plot(self) -> None:
         if self._advanced_plot is None:
             return
+        self._advanced_refresh_pending = False
+        if self._advanced_refresh_timer.isActive():
+            self._advanced_refresh_timer.stop()
         source_a = self._compare_a_combo.currentData() if self._compare_a_combo is not None else ""
         source_b = self._compare_b_combo.currentData() if self._compare_b_combo is not None else ""
         peer_a = self._peer_pressures.get(str(source_a)) if source_a else None
@@ -4357,25 +4438,28 @@ class OPG550SpectrumStudio(QWidget):
             str(peer_b.get("name", source_b)) if peer_b else
             (self._compare_b_combo.currentText() if self._compare_b_combo is not None else "Source B")
         )
-        if self._advanced_legend is not None and self._advanced_curve_a is not None and self._advanced_curve_b is not None:
+        legend_labels = (name_a, name_b)
+        if (
+            legend_labels != self._advanced_legend_labels
+            and self._advanced_legend is not None
+            and self._advanced_curve_a is not None
+            and self._advanced_curve_b is not None
+        ):
             self._advanced_legend.removeItem(self._advanced_curve_a)
             self._advanced_legend.removeItem(self._advanced_curve_b)
             self._advanced_legend.addItem(self._advanced_curve_a, name_a)
             self._advanced_legend.addItem(self._advanced_curve_b, name_b)
+            self._advanced_legend_labels = legend_labels
 
         if peer_a is not None and self._advanced_curve_a is not None:
-            self._advanced_curve_a.setData(
-                np.array(peer_a["t"], dtype=float),
-                np.array(peer_a["p"], dtype=float),
-            )
+            time_array, pressure_array = self._plot_series_arrays(peer_a["t"], peer_a["p"])
+            self._advanced_curve_a.setData(time_array, pressure_array)
         elif self._advanced_curve_a is not None:
             self._advanced_curve_a.setData([], [])
 
         if peer_b is not None and self._advanced_curve_b is not None:
-            self._advanced_curve_b.setData(
-                np.array(peer_b["t"], dtype=float),
-                np.array(peer_b["p"], dtype=float),
-            )
+            time_array, pressure_array = self._plot_series_arrays(peer_b["t"], peer_b["p"])
+            self._advanced_curve_b.setData(time_array, pressure_array)
         elif self._advanced_curve_b is not None:
             self._advanced_curve_b.setData([], [])
 
@@ -4384,10 +4468,17 @@ class OPG550SpectrumStudio(QWidget):
             latest_b = float(peer_b["p"][-1]) if peer_b["p"] else math.nan
             if math.isfinite(latest_a) and math.isfinite(latest_b):
                 delta = latest_a - latest_b
+                delta_percent = self._pressure_delta_percent(latest_a, latest_b)
+                percent_text = (
+                    f"  |  \u0394% = {delta_percent:+.2f}%"
+                    if delta_percent is not None else
+                    "  |  \u0394% = n/a"
+                )
                 self._delta_label.setText(
                     f"<span style='color:#43C5FF'><b>{name_a}</b></span>"
                     f" \u2212 <span style='color:#E8D74C'><b>{name_b}</b></span>:  "
-                    f"\u0394 = {delta:+.4E} {self._display_unit}  |  "
+                    f"\u0394 = {delta:+.4E} {self._display_unit}"
+                    f"{percent_text}  |  "
                     f"ratio = {latest_a / max(latest_b, 1e-30):.4g}"
                 )
             else:
@@ -4406,10 +4497,9 @@ class OPG550SpectrumStudio(QWidget):
         gas_values: np.ndarray | None = None
         if self._advanced_gas_curve is not None and gas in self._gas_partial_mbar:
             partial = self._gas_partial_mbar[str(gas)]
-            gas_values = np.fromiter(partial, dtype=float, count=len(partial)) * unit_factor
-            gas_t_arr = np.array(self._gas_t, dtype=float)
-            n = min(len(gas_t_arr), len(gas_values))
-            self._advanced_gas_curve.setData(gas_t_arr[:n], gas_values[:n])
+            gas_time_array, gas_partial_array = self._plot_series_arrays(self._gas_t, partial)
+            gas_values = gas_partial_array * unit_factor
+            self._advanced_gas_curve.setData(gas_time_array, gas_values)
             if self._advanced_plot is not None:
                 axis = self._advanced_plot.getPlotItem().getAxis("right")
                 axis.setLabel(

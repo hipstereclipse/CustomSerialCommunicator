@@ -21,16 +21,27 @@ Diagnostics
 from __future__ import annotations
 
 import logging
-import os
+from pathlib import Path
 
 from PyQt6.QtCore import QObject, QSettings, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QCheckBox, QComboBox,
-    QDoubleSpinBox, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
 )
 
-from serial_comm.units import SUPPORTED_UNITS
+from serial_comm.units import SUPPORTED_UNITS, convert_pressure
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +74,10 @@ class ScientificPressureSpinBox(QDoubleSpinBox):
 
     def valueFromText(self, text: str) -> float:  # type: ignore[override]
         clean = text.strip()
-        if clean.endswith("mbar"):
-            clean = clean[:-4].strip()
+        for unit in sorted(SUPPORTED_UNITS, key=len, reverse=True):
+            if clean.endswith(unit):
+                clean = clean[:-len(unit)].strip()
+                break
         try:
             return float(clean)
         except ValueError:
@@ -192,8 +205,10 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings")
         self.setMinimumWidth(420)
         self._settings = QSettings()
+        self._opg_threshold_unit = str(DEFAULTS["display/pressure_unit"])
         self._build_ui()
         self._load_values()
+        self._unit_combo.currentTextChanged.connect(self._on_display_unit_combo_changed)
 
     # ------------------------------------------------------------------
     # Build UI
@@ -313,11 +328,9 @@ class SettingsDialog(QDialog):
         form.addRow("Auto plasma (default):", self._opg_auto_plasma_chk)
 
         self._opg_min_p_spin = ScientificPressureSpinBox()
-        self._opg_min_p_spin.setRange(1e-12, 1e3)
         self._opg_min_p_spin.setSingleStep(1.0)
-        self._opg_min_p_spin.setSuffix(" mbar")
         self._opg_min_p_spin.setToolTip(
-            "Minimum total pressure required to allow plasma ignition (mbar).\n"
+            "Minimum total pressure required to allow plasma ignition.\n"
             "Below this pressure auto-plasma keeps the plasma OFF."
         )
         # Tiny step values won't fit a normal QDoubleSpinBox; allow scientific text.
@@ -325,11 +338,9 @@ class SettingsDialog(QDialog):
         form.addRow("Min ignition pressure:", self._opg_min_p_spin)
 
         self._opg_max_p_spin = ScientificPressureSpinBox()
-        self._opg_max_p_spin.setRange(1e-12, 1e3)
         self._opg_max_p_spin.setSingleStep(1.0)
-        self._opg_max_p_spin.setSuffix(" mbar")
         self._opg_max_p_spin.setToolTip(
-            "Maximum total pressure for safe plasma operation (mbar).\n"
+            "Maximum total pressure for safe plasma operation.\n"
             "Above this pressure auto-plasma forces the plasma OFF."
         )
         self._opg_max_p_spin.setStepType(QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
@@ -377,10 +388,14 @@ class SettingsDialog(QDialog):
             bool(get_setting("diagnostics/opg_spectrum_verbose"))
         )
         self._opg_auto_plasma_chk.setChecked(bool(get_setting("opg/auto_plasma_enabled")))
-        self._opg_min_p_spin.setValue(float(get_setting("opg/min_ignition_pressure_mbar")))
-        self._opg_max_p_spin.setValue(float(get_setting("opg/max_safe_pressure_mbar")))
+        self._apply_opg_threshold_unit(
+            unit,
+            float(get_setting("opg/min_ignition_pressure_mbar")),
+            float(get_setting("opg/max_safe_pressure_mbar")),
+        )
 
     def _save_values(self) -> None:
+        min_p_mbar, max_p_mbar = self._opg_thresholds_mbar()
         self._settings.setValue("logging/level", self._level_combo.currentText())
         self._settings.setValue("logging/max_terminal_messages", self._max_msg_spin.value())
         self._settings.setValue("logging/log_to_file", self._log_to_file_chk.isChecked())
@@ -393,12 +408,35 @@ class SettingsDialog(QDialog):
             self._opg_spectrum_diag_chk.isChecked(),
         )
         self._settings.setValue("opg/auto_plasma_enabled", self._opg_auto_plasma_chk.isChecked())
-        self._settings.setValue(
-            "opg/min_ignition_pressure_mbar", float(self._opg_min_p_spin.value())
+        self._settings.setValue("opg/min_ignition_pressure_mbar", min_p_mbar)
+        self._settings.setValue("opg/max_safe_pressure_mbar", max_p_mbar)
+
+    def _opg_thresholds_mbar(self) -> tuple[float, float]:
+        unit = self._opg_threshold_unit if self._opg_threshold_unit in SUPPORTED_UNITS else "mbar"
+        return (
+            float(convert_pressure(float(self._opg_min_p_spin.value()), unit, "mbar")),
+            float(convert_pressure(float(self._opg_max_p_spin.value()), unit, "mbar")),
         )
-        self._settings.setValue(
-            "opg/max_safe_pressure_mbar", float(self._opg_max_p_spin.value())
-        )
+
+    def _apply_opg_threshold_unit(
+        self,
+        unit: str,
+        min_p_mbar: float,
+        max_p_mbar: float,
+    ) -> None:
+        unit = unit if unit in SUPPORTED_UNITS else str(DEFAULTS["display/pressure_unit"])
+        min_range = float(convert_pressure(1e-12, "mbar", unit))
+        max_range = float(convert_pressure(1e3, "mbar", unit))
+        self._opg_threshold_unit = unit
+        for spin, value_mbar in (
+            (self._opg_min_p_spin, min_p_mbar),
+            (self._opg_max_p_spin, max_p_mbar),
+        ):
+            was_blocked = spin.blockSignals(True)
+            spin.setRange(min_range, max_range)
+            spin.setSuffix(f" {unit}")
+            spin.setValue(float(convert_pressure(value_mbar, "mbar", unit)))
+            spin.blockSignals(was_blocked)
 
     # ------------------------------------------------------------------
     # Slots
@@ -427,13 +465,23 @@ class SettingsDialog(QDialog):
         self._opg_spectrum_diag_chk.setChecked(
             bool(DEFAULTS["diagnostics/opg_spectrum_verbose"])
         )
+        self._opg_auto_plasma_chk.setChecked(bool(DEFAULTS["opg/auto_plasma_enabled"]))
+        self._apply_opg_threshold_unit(
+            self._unit_combo.currentText(),
+            float(DEFAULTS["opg/min_ignition_pressure_mbar"]),
+            float(DEFAULTS["opg/max_safe_pressure_mbar"]),
+        )
+
+    def _on_display_unit_combo_changed(self, unit: str) -> None:
+        min_p_mbar, max_p_mbar = self._opg_thresholds_mbar()
+        self._apply_opg_threshold_unit(unit, min_p_mbar, max_p_mbar)
 
     def _on_log_to_file_toggled(self, checked: bool) -> None:
         self._log_file_label.setEnabled(checked)
         self._browse_btn.setEnabled(checked)
 
     def _on_browse_log_file(self) -> None:
-        current = self._log_file_label.text() or os.path.expanduser("~")
+        current = self._log_file_label.text() or str(Path.home())
         path, _ = QFileDialog.getSaveFileName(
             self, "Choose log file", current, "Log files (*.log *.txt);;All files (*)"
         )
