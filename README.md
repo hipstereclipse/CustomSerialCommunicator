@@ -167,7 +167,24 @@ Sessions preserve model/port/protocol settings and can restore multiple gauges a
 
 ## Installation and Quick Start
 
-### 1) Create and activate a virtual environment
+### Option A: Install script (Windows)
+
+[scripts/install.ps1](scripts/install.ps1) sets up everything needed to run and develop the app in one step. It uses `uv` (matching the committed [uv.lock](uv.lock)) if installed, otherwise falls back to a standard `python -m venv` + `pip` workflow. It installs runtime dependencies plus the `[dev]` extras (pytest, ruff, mypy, pytest-qt) by default.
+
+```powershell
+.\scripts\install.ps1
+```
+
+Options:
+
+```powershell
+.\scripts\install.ps1 -SkipDev      # runtime dependencies only, skip test/lint tools
+.\scripts\install.ps1 -PreferPip    # use pip + venv even if uv is installed
+```
+
+### Option B: Manual setup
+
+1) Create and activate a virtual environment
 
 Windows PowerShell:
 
@@ -183,13 +200,13 @@ python -m venv .venv
 source .venv/Scripts/activate
 ```
 
-### 2) Install dependencies
+2) Install dependencies
 
 ```bash
 pip install -e .
 ```
 
-### 3) Launch the app
+### Launch the app
 
 ```bash
 python main.py
